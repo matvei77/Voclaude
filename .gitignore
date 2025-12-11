@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Models (downloaded at runtime)
+/models/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

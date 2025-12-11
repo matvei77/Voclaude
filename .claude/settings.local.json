@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\Users\\matvei\\Documents\\code\\voiceinput\")",
+      "Bash(cargo build:*)",
+      "Bash(taskkill:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(powershell -Command \"Stop-Process -Name voclaude -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; Write-Host ''Done''\")",
+      "Bash(timeout 120 ./target/release/voclaude.exe:*)",
+      "Bash(./target/release/voclaude.exe:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(dumpbin:*)",
+      "Bash(wc:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nWindows working version\n\nInitial commit with fully functional Windows speech-to-text application:\n- Whisper-based transcription with CUDA GPU acceleration\n- System tray integration with global hotkey (Win+C)\n- Auto-download of Whisper Medium model\n- Configurable idle unload to save VRAM\n- Audio capture via cpal with resampling to 16kHz\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

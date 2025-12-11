@@ -1,0 +1,10 @@
+# Build configuration for Voclaude
+# Sets CUDA environment for whisper-rs-sys cmake build
+
+[env]
+# Use CUDA 12.8 (not 13.1 which has linking issues)
+CUDA_PATH = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+
+# Use Ninja generator to avoid VS CUDA integration issues
+# (Nsight VS integration not installed, causes CudaToolkitDir errors)
+CMAKE_GENERATOR = "Ninja"
