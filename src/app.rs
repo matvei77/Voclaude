@@ -8,7 +8,7 @@ use crate::tray::TrayManager;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn, trace};
+use tracing::{debug, error, info, warn};
 
 /// Application events
 #[derive(Debug, Clone)]

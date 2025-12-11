@@ -8,7 +8,9 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
     Icon,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{debug, error, info};
 
 /// Embedded icons (will be replaced with actual assets)
@@ -23,9 +25,11 @@ const MENU_QUIT: &str = "quit";
 
 pub struct TrayManager {
     tray: TrayIcon,
+    #[allow(dead_code)]
     event_tx: Sender<AppEvent>,
     toggle_item: MenuItem,
     state: Arc<Mutex<AppState>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl TrayManager {
@@ -55,31 +59,56 @@ impl TrayManager {
             .build()?;
 
         let state = Arc::new(Mutex::new(AppState::Idle));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Spawn menu event handler
+        // Spawn menu event handler with shutdown signal
         let event_tx_clone = event_tx.clone();
-        let state_clone = state.clone();
+        let shutdown_clone = shutdown.clone();
         std::thread::spawn(move || {
+            info!("Tray menu event handler started");
             let receiver = MenuEvent::receiver();
+
             loop {
-                if let Ok(event) = receiver.recv() {
-                    match event.id.0.as_str() {
-                        MENU_TOGGLE => {
-                            debug!("Toggle recording clicked");
-                            let _ = event_tx_clone.send(AppEvent::HotkeyPressed);
+                // Check shutdown flag
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    info!("Tray menu handler received shutdown signal");
+                    break;
+                }
+
+                // Use recv_timeout to allow checking shutdown flag periodically
+                match receiver.recv_timeout(Duration::from_millis(100)) {
+                    Ok(event) => {
+                        match event.id.0.as_str() {
+                            MENU_TOGGLE => {
+                                debug!("Toggle recording clicked");
+                                if event_tx_clone.send(AppEvent::HotkeyPressed).is_err() {
+                                    info!("Event channel closed, shutting down tray handler");
+                                    break;
+                                }
+                            }
+                            MENU_SETTINGS => {
+                                debug!("Settings clicked");
+                                // TODO: Open settings window
+                            }
+                            MENU_QUIT => {
+                                debug!("Quit clicked");
+                                if event_tx_clone.send(AppEvent::Quit).is_err() {
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
-                        MENU_SETTINGS => {
-                            debug!("Settings clicked");
-                            // TODO: Open settings window
-                        }
-                        MENU_QUIT => {
-                            debug!("Quit clicked");
-                            let _ = event_tx_clone.send(AppEvent::Quit);
-                        }
-                        _ => {}
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        // Normal timeout, check shutdown flag and continue
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        info!("Tray menu receiver disconnected, exiting thread");
+                        break;
                     }
                 }
             }
+            info!("Tray menu event handler exited cleanly");
         });
 
         Ok(Self {
@@ -87,6 +116,7 @@ impl TrayManager {
             event_tx,
             toggle_item,
             state,
+            shutdown,
         })
     }
 
@@ -129,5 +159,13 @@ impl TrayManager {
 
         // Disable toggle during transcription
         self.toggle_item.set_enabled(state != AppState::Transcribing);
+    }
+}
+
+impl Drop for TrayManager {
+    fn drop(&mut self) {
+        // Signal shutdown to menu handler thread
+        self.shutdown.store(true, Ordering::Relaxed);
+        info!("TrayManager dropped, shutdown signaled");
     }
 }

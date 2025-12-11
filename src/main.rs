@@ -29,7 +29,9 @@ fn main() {
         let wav_path = if args.len() > 2 {
             &args[2]
         } else {
-            r"C:\Users\matvei\Documents\Sound Recordings\pedro_email.wav"
+            eprintln!("Usage: voclaude --test <path/to/audio.wav>");
+            eprintln!("No WAV file path provided");
+            std::process::exit(1);
         };
 
         if let Err(e) = run_test(wav_path) {

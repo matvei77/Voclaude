@@ -1,10 +1,17 @@
 # Build configuration for Voclaude
 # Sets CUDA environment for whisper-rs-sys cmake build
 
-[env]
+# Note: These environment variables are platform-specific.
+# On Linux, CUDA is typically found automatically at /usr/local/cuda
+# or via the system's pkg-config.
+
+[target.x86_64-pc-windows-msvc.env]
 # Use CUDA 12.8 (not 13.1 which has linking issues)
 CUDA_PATH = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
-
 # Use Ninja generator to avoid VS CUDA integration issues
-# (Nsight VS integration not installed, causes CudaToolkitDir errors)
 CMAKE_GENERATOR = "Ninja"
+
+[target.x86_64-unknown-linux-gnu.env]
+# Linux typically auto-detects CUDA at /usr/local/cuda
+# Uncomment if you have CUDA in a non-standard location:
+# CUDA_PATH = "/usr/local/cuda"

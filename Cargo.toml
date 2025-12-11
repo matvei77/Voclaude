@@ -11,8 +11,9 @@ repository = "https://github.com/matvei77/Voclaude"
 cpal = "0.15"
 hound = "3.5"              # WAV encoding
 
-# Whisper speech-to-text (whisper.cpp with CUDA)
-whisper-rs = { version = "0.14", features = ["cuda"] }
+# Whisper speech-to-text (whisper.cpp)
+# Use --features cuda for GPU acceleration
+whisper-rs = "0.14"
 
 # Audio processing
 rubato = "0.15"            # High-quality resampling
@@ -42,6 +43,7 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = []
+cuda = ["whisper-rs/cuda"]
 
 [profile.release]
 lto = true

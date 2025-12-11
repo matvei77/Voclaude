@@ -56,7 +56,7 @@ impl AudioCapture {
     }
 
     fn find_best_config(
-        mut configs: cpal::SupportedInputConfigs,
+        configs: cpal::SupportedInputConfigs,
     ) -> Result<StreamConfig, Box<dyn std::error::Error>> {
         // Try to find a config that supports our target sample rate
         let target_rate = SampleRate(WHISPER_SAMPLE_RATE);
@@ -115,7 +115,8 @@ impl AudioCapture {
         let stream = self.device.build_input_stream(
             &self.config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !is_recording.load(Ordering::Relaxed) {
+                // Use Acquire ordering to synchronize with Release in start()
+                if !is_recording.load(Ordering::Acquire) {
                     return;
                 }
 
@@ -143,14 +144,23 @@ impl AudioCapture {
             None,
         )?;
 
-        // CRITICAL: Set is_recording BEFORE starting stream
-        // Otherwise the callback will ignore samples until this flag is set
-        self.is_recording.store(true, Ordering::SeqCst);
+        // Store stream in mutex BEFORE starting, to prevent race condition
+        // where stop() is called before stream is stored
+        {
+            let mut stream_guard = self.stream.lock()
+                .map_err(|e| format!("Stream mutex poisoned: {}", e))?;
+            *stream_guard = Some(stream);
+        }
 
-        stream.play()?;
+        // Set recording flag with Release ordering (pairs with Acquire in callback)
+        self.is_recording.store(true, Ordering::Release);
 
-        // Store stream so we can stop it later
-        *self.stream.lock().unwrap() = Some(stream);
+        // Now start the stream (it's already stored, so stop() can find it)
+        if let Ok(stream_guard) = self.stream.lock() {
+            if let Some(ref stream) = *stream_guard {
+                stream.play()?;
+            }
+        }
 
         debug!("Recording started");
         Ok(())
@@ -158,30 +168,33 @@ impl AudioCapture {
 
     /// Stop recording and return captured samples
     pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        self.is_recording.store(false, Ordering::SeqCst);
+        // Use Release ordering to ensure callback sees the flag change
+        self.is_recording.store(false, Ordering::Release);
 
         // Small delay to ensure last samples are captured
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Stop and drop the stream
-        if let Ok(mut stream_guard) = self.stream.lock() {
-            if let Some(stream) = stream_guard.take() {
-                // Pause the stream before dropping
-                let _ = stream.pause();
-                drop(stream);
-                debug!("Stream stopped and dropped");
-            }
+        let mut stream_guard = self.stream.lock()
+            .map_err(|e| format!("Stream mutex poisoned: {}", e))?;
+        if let Some(stream) = stream_guard.take() {
+            // Pause the stream before dropping
+            let _ = stream.pause();
+            drop(stream);
+            debug!("Stream stopped and dropped");
         }
+        drop(stream_guard);
 
-        let samples = self.buffer.pop_all();
+        let samples = self.buffer.pop_all()?;
         debug!("Recording stopped, got {} samples", samples.len());
 
         Ok(samples)
     }
 
     /// Check if currently recording
+    #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
-        self.is_recording.load(Ordering::Relaxed)
+        self.is_recording.load(Ordering::Acquire)
     }
 
     /// Simple linear resampling

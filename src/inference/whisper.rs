@@ -93,59 +93,77 @@ impl WhisperEngine {
     }
 
     /// Download a file with progress
+    /// Cleans up temp file on error to prevent disk space leaks
     fn download_file(url: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::{Read, Write};
 
         info!("Downloading: {}", url);
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(7200))
-            .build()?;
-
-        let mut response = client.get(url).send()?;
-
-        if !response.status().is_success() {
-            return Err(format!("Download failed: HTTP {}", response.status()).into());
-        }
-
-        let total_size = response.content_length();
-        if let Some(size) = total_size {
-            info!("Download size: {:.1} MB", size as f64 / 1024.0 / 1024.0);
-        }
-
         let temp_path = dest.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path)?;
 
-        let mut downloaded: u64 = 0;
-        let mut last_progress = 0;
-        let mut buffer = [0u8; 131072];
+        // Use a closure to handle the download, allowing cleanup on any error
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(7200))
+                .build()?;
 
-        loop {
-            let bytes_read = response.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+            let mut response = client.get(url).send()?;
+
+            if !response.status().is_success() {
+                return Err(format!("Download failed: HTTP {}", response.status()).into());
             }
-            file.write_all(&buffer[..bytes_read])?;
-            downloaded += bytes_read as u64;
 
-            if let Some(total) = total_size {
-                let progress = (downloaded * 100 / total) as u32;
-                if progress >= last_progress + 5 {
-                    info!("Download progress: {}% ({:.1} MB / {:.1} MB)",
-                          progress,
-                          downloaded as f64 / 1024.0 / 1024.0,
-                          total as f64 / 1024.0 / 1024.0);
-                    last_progress = progress;
+            let total_size = response.content_length();
+            if let Some(size) = total_size {
+                info!("Download size: {:.1} MB", size as f64 / 1024.0 / 1024.0);
+            }
+
+            let mut file = fs::File::create(&temp_path)?;
+
+            let mut downloaded: u64 = 0;
+            let mut last_progress = 0;
+            let mut buffer = [0u8; 131072];
+
+            loop {
+                let bytes_read = response.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..bytes_read])?;
+                downloaded += bytes_read as u64;
+
+                if let Some(total) = total_size {
+                    let progress = (downloaded * 100 / total) as u32;
+                    if progress >= last_progress + 5 {
+                        info!("Download progress: {}% ({:.1} MB / {:.1} MB)",
+                              progress,
+                              downloaded as f64 / 1024.0 / 1024.0,
+                              total as f64 / 1024.0 / 1024.0);
+                        last_progress = progress;
+                    }
+                }
+            }
+
+            file.flush()?;
+            drop(file);
+            fs::rename(&temp_path, dest)?;
+
+            info!("Download complete: {}", dest.display());
+            Ok(())
+        })();
+
+        // Clean up temp file on error
+        if result.is_err() {
+            if temp_path.exists() {
+                if let Err(e) = fs::remove_file(&temp_path) {
+                    error!("Failed to clean up temp file {}: {}", temp_path.display(), e);
+                } else {
+                    info!("Cleaned up incomplete download: {}", temp_path.display());
                 }
             }
         }
 
-        file.flush()?;
-        drop(file);
-        fs::rename(&temp_path, dest)?;
-
-        info!("Download complete: {}", dest.display());
-        Ok(())
+        result
     }
 
     /// Ensure model is loaded
