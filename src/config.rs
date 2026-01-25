@@ -9,6 +9,10 @@ pub struct Config {
     /// Hotkey to toggle recording (e.g., "F4", "Ctrl+Alt+V")
     pub hotkey: String,
 
+    /// Hotkey to toggle the history window
+    #[serde(default = "default_history_hotkey")]
+    pub history_hotkey: String,
+
     /// Language for transcription (None = auto-detect)
     /// Note: Parakeet is English-only, this is for future multi-language support
     pub language: Option<String>,
@@ -24,17 +28,28 @@ pub struct Config {
 
     /// Show notifications
     pub show_notifications: bool,
+
+    /// Maximum number of history entries to retain
+    #[serde(default = "default_history_max_entries")]
+    pub history_max_entries: usize,
+
+    /// Enable GPU acceleration when available
+    #[serde(default = "default_use_gpu")]
+    pub use_gpu: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "F4".to_string(),
+            history_hotkey: default_history_hotkey(),
             language: None, // Parakeet is English-only for now
             add_trailing_space: true,
             capitalize_first: true,
             idle_unload_seconds: 300, // 5 minutes
             show_notifications: true,
+            history_max_entries: default_history_max_entries(),
+            use_gpu: true,
         }
     }
 }
@@ -85,4 +100,16 @@ impl Config {
         std::fs::write(&path, contents)?;
         Ok(())
     }
+}
+
+fn default_use_gpu() -> bool {
+    true
+}
+
+fn default_history_max_entries() -> usize {
+    500
+}
+
+fn default_history_hotkey() -> String {
+    "Ctrl+Shift+H".to_string()
 }

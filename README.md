@@ -5,18 +5,18 @@ Voice input anywhere — local-first, GPU-accelerated speech-to-text.
 ## Features
 
 - **Local-first**: Uses Whisper.cpp for on-device transcription
-- **GPU accelerated**: CUDA/Metal support for fast inference
-- **Tiered models**: Auto-selects model based on your hardware (tiny/base/small/medium)
+- **GPU optional**: CUDA acceleration with CPU fallback
 - **Lazy loading**: Model loads on first use, unloads after idle
 - **System tray**: Minimal UI, stays out of your way
-- **Global hotkey**: Win+C (configurable) to start/stop recording
+- **Global hotkey**: F4 (configurable) to start/stop recording
+- **History window**: Hidden UI with transcript + log history
 
 ## Installation
 
 ### Prerequisites
 
 - Rust 1.70+ (`rustup` recommended)
-- For GPU: CUDA toolkit (NVIDIA) or Metal (macOS)
+- For GPU: CUDA toolkit (NVIDIA)
 
 ### Build
 
@@ -24,11 +24,8 @@ Voice input anywhere — local-first, GPU-accelerated speech-to-text.
 # CPU only
 cargo build --release
 
-# With CUDA
+# With CUDA (make sure CUDA_PATH/CUDA_HOME is set)
 cargo build --release --features cuda
-
-# With Metal (macOS)
-cargo build --release --features metal
 ```
 
 ### Run
@@ -42,10 +39,11 @@ Or copy `target/release/voclaude.exe` to your preferred location.
 ## Usage
 
 1. Launch Voclaude — it appears in your system tray
-2. Press **Win+C** to start recording (or click tray icon → "Start Recording")
+2. Press **F4** to start recording (or click tray icon → "Start Recording")
 3. Speak
-4. Press **Win+C** again to stop and transcribe
+4. Press **F4** again to stop and transcribe
 5. Text is copied to clipboard — paste with Ctrl+V
+6. Press **Ctrl+Shift+H** or use tray menu → "Show History" for history
 
 ## Configuration
 
@@ -56,13 +54,10 @@ Config file location:
 
 ```toml
 # Hotkey to toggle recording
-hotkey = "Super+C"
+hotkey = "F4"
 
-# Model tier: tiny, base, small, medium
-model_tier = "base"
-
-# Auto-select model based on hardware
-auto_select_model = true
+# Hotkey to toggle the history window
+history_hotkey = "Ctrl+Shift+H"
 
 # Language (null = auto-detect)
 language = null
@@ -78,18 +73,17 @@ idle_unload_seconds = 300
 
 # Show system notifications
 show_notifications = true
+
+# Maximum number of history entries
+history_max_entries = 500
+
+# Enable GPU acceleration when available
+use_gpu = true
 ```
 
-## Model Tiers
+## Model
 
-| Tier | VRAM | Quality | Speed |
-|------|------|---------|-------|
-| tiny | ~75MB | Decent | ~1s |
-| base | ~150MB | Good | ~2s |
-| small | ~500MB | Great | ~3s |
-| medium | ~1.5GB | Excellent | ~5s |
-
-Models are downloaded automatically on first use from Hugging Face.
+Voclaude currently downloads the Whisper medium model (~1.5GB) automatically on first use.
 
 ## Architecture
 
@@ -112,7 +106,7 @@ Models are downloaded automatically on first use from Hugging Face.
 │      Inference Thread           │
 │  - whisper.cpp (via whisper-rs) │
 │  - Lazy model loading           │
-│  - Auto-tier selection          │
+│  - GPU optional + CPU fallback  │
 └─────────────────────────────────┘
 ```
 

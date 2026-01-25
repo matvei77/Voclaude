@@ -3,9 +3,10 @@
 //! Uses whisper-rs (whisper.cpp bindings) for fast, accurate transcription.
 
 use crate::config::Config;
+use crate::inference::{InferenceProgress, InferenceStage};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{debug, info, error};
+use tracing::{debug, info, warn};
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
 /// Whisper model size
@@ -39,16 +40,23 @@ pub struct WhisperEngine {
     context: Option<WhisperContext>,
     model: WhisperModel,
     is_loaded: bool,
+    use_gpu: bool,
 }
 
 impl WhisperEngine {
     /// Create a new Whisper engine (lazy loading)
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(use_gpu: bool) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             context: None,
             model: WhisperModel::Medium,
             is_loaded: false,
+            use_gpu,
         })
+    }
+
+    /// Create a new Whisper engine with config
+    pub fn new_with_config(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new(config.use_gpu)
     }
 
     /// Check if model is loaded
@@ -71,7 +79,10 @@ impl WhisperEngine {
     }
 
     /// Ensure model is downloaded
-    fn ensure_model(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fn ensure_model(
+        &self,
+        progress: &mut Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let models_dir = Self::models_dir().ok_or("Could not determine models directory")?;
         fs::create_dir_all(&models_dir)?;
 
@@ -82,18 +93,32 @@ impl WhisperEngine {
             return Ok(model_path);
         }
 
-        info!("Downloading Whisper {} model (~{}MB)...",
-              format!("{:?}", self.model).to_lowercase(),
-              self.model.size_mb());
+        let download_message = format!(
+            "Downloading Whisper {} model (~{}MB)...",
+            format!("{:?}", self.model).to_lowercase(),
+            self.model.size_mb()
+        );
+        info!("{}", download_message);
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(InferenceProgress {
+                stage: InferenceStage::DownloadingModel,
+                message: download_message,
+                percent: None,
+            });
+        }
 
-        Self::download_file(self.model.url(), &model_path)?;
+        Self::download_file(self.model.url(), &model_path, progress)?;
 
         info!("Model downloaded: {}", model_path.display());
         Ok(model_path)
     }
 
     /// Download a file with progress
-    fn download_file(url: &str, dest: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    fn download_file(
+        url: &str,
+        dest: &PathBuf,
+        progress: &mut Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use std::io::{Read, Write};
 
         info!("Downloading: {}", url);
@@ -129,13 +154,25 @@ impl WhisperEngine {
             downloaded += bytes_read as u64;
 
             if let Some(total) = total_size {
-                let progress = (downloaded * 100 / total) as u32;
-                if progress >= last_progress + 5 {
+                let progress_pct = (downloaded * 100 / total) as u32;
+                if progress_pct >= last_progress + 5 {
                     info!("Download progress: {}% ({:.1} MB / {:.1} MB)",
-                          progress,
+                          progress_pct,
                           downloaded as f64 / 1024.0 / 1024.0,
                           total as f64 / 1024.0 / 1024.0);
-                    last_progress = progress;
+                    last_progress = progress_pct;
+                    if let Some(cb) = progress.as_deref_mut() {
+                        cb(InferenceProgress {
+                            stage: InferenceStage::DownloadingModel,
+                            message: format!(
+                                "Downloading model... {}% ({:.1}/{:.1} MB)",
+                                progress_pct,
+                                downloaded as f64 / 1024.0 / 1024.0,
+                                total as f64 / 1024.0 / 1024.0
+                            ),
+                            percent: Some(progress_pct as u8),
+                        });
+                    }
                 }
             }
         }
@@ -149,23 +186,50 @@ impl WhisperEngine {
     }
 
     /// Ensure model is loaded
-    fn ensure_loaded(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn ensure_loaded(
+        &mut self,
+        progress: &mut Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_loaded {
             return Ok(());
         }
 
         info!("Loading Whisper model...");
 
-        let model_path = self.ensure_model()?;
+        let model_path = self.ensure_model(progress)?;
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(InferenceProgress {
+                stage: InferenceStage::LoadingModel,
+                message: "Loading Whisper model...".to_string(),
+                percent: None,
+            });
+        }
 
-        // Create context with GPU support
+        let mut prefer_gpu = self.use_gpu;
+        if prefer_gpu && !cfg!(feature = "cuda") {
+            info!("GPU requested but CUDA feature is disabled; falling back to CPU");
+            prefer_gpu = false;
+        }
+
         let mut params = WhisperContextParameters::default();
-        params.use_gpu(true);
+        params.use_gpu(prefer_gpu);
 
-        let ctx = WhisperContext::new_with_params(
+        let ctx = match WhisperContext::new_with_params(
             model_path.to_str().ok_or("Invalid model path")?,
             params,
-        ).map_err(|e| format!("Failed to load Whisper model: {}", e))?;
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) if prefer_gpu => {
+                warn!("GPU init failed ({}); retrying on CPU", e);
+                let mut cpu_params = WhisperContextParameters::default();
+                cpu_params.use_gpu(false);
+                WhisperContext::new_with_params(
+                    model_path.to_str().ok_or("Invalid model path")?,
+                    cpu_params,
+                ).map_err(|e| format!("Failed to load Whisper model on CPU: {}", e))?
+            }
+            Err(e) => return Err(format!("Failed to load Whisper model: {}", e).into()),
+        };
 
         self.context = Some(ctx);
         self.is_loaded = true;
@@ -178,7 +242,15 @@ impl WhisperEngine {
     /// Input: f32 samples at 16kHz mono
     /// Output: transcribed text
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
-        self.ensure_loaded()?;
+        self.transcribe_with_progress(samples, None)
+    }
+
+    pub fn transcribe_with_progress(
+        &mut self,
+        samples: &[f32],
+        mut progress: Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.ensure_loaded(&mut progress)?;
 
         let ctx = self.context.as_mut().ok_or("Whisper context not loaded")?;
 
@@ -212,6 +284,13 @@ impl WhisperEngine {
         params.set_suppress_nst(true);
 
         // Run inference
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(InferenceProgress {
+                stage: InferenceStage::Transcribing,
+                message: "Transcribing audio...".to_string(),
+                percent: None,
+            });
+        }
         let start = std::time::Instant::now();
         state.full(params, samples)
             .map_err(|e| format!("Whisper inference failed: {}", e))?;
@@ -239,6 +318,6 @@ impl WhisperEngine {
 
 impl Default for WhisperEngine {
     fn default() -> Self {
-        Self::new().expect("Failed to create WhisperEngine")
+        Self::new(true).expect("Failed to create WhisperEngine")
     }
 }

@@ -5,22 +5,27 @@
 mod app;
 mod audio;
 mod config;
+mod history;
 mod hotkey;
 mod inference;
 mod tray;
+mod ui;
 
 use app::App;
+use audio::resample_linear;
 use config::Config;
 use inference::WhisperEngine;
 use tracing::{info, error, Level};
-use tracing_subscriber::FmtSubscriber;
 
 fn main() {
-    // Initialize logging
-    let _subscriber = FmtSubscriber::builder()
+    let log_buffer = ui::LogBuffer::new(400);
+    let log_writer = log_buffer.make_writer();
+
+    tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
         .with_target(false)
         .compact()
+        .with_writer(log_writer)
         .init();
 
     // Check for --test argument
@@ -46,7 +51,10 @@ fn main() {
         Ok(c) => {
             info!("Config loaded successfully");
             info!("  hotkey: {}", c.hotkey);
+            info!("  history_hotkey: {}", c.history_hotkey);
             info!("  idle_unload_seconds: {}", c.idle_unload_seconds);
+            info!("  history_max_entries: {}", c.history_max_entries);
+            info!("  use_gpu: {}", c.use_gpu);
             c
         }
         Err(e) => {
@@ -56,7 +64,7 @@ fn main() {
     };
 
     // Run the app
-    if let Err(e) = App::run(config) {
+    if let Err(e) = App::run(config, log_buffer) {
         error!("Application error: {}", e);
         std::process::exit(1);
     }
@@ -101,7 +109,7 @@ fn run_test(wav_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Resample to 16kHz if needed
     let samples_16k = if spec.sample_rate != 16000 {
         info!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
-        resample(&mono_samples, spec.sample_rate, 16000)
+        resample_linear(&mono_samples, spec.sample_rate, 16000)
     } else {
         mono_samples
     };
@@ -113,7 +121,8 @@ fn run_test(wav_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create engine and transcribe
     info!("Creating Whisper engine...");
-    let mut engine = WhisperEngine::new()?;
+    let test_config = Config::load().unwrap_or_default();
+    let mut engine = WhisperEngine::new_with_config(&test_config)?;
 
     info!("Transcribing...");
     let start = std::time::Instant::now();
@@ -126,23 +135,4 @@ fn run_test(wav_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n>>> TRANSCRIPTION:\n{}\n", text);
 
     Ok(())
-}
-
-/// Simple linear resampling
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    let ratio = from_rate as f64 / to_rate as f64;
-    let new_len = (samples.len() as f64 / ratio) as usize;
-
-    (0..new_len)
-        .map(|i| {
-            let src_idx = i as f64 * ratio;
-            let idx = src_idx as usize;
-            let frac = src_idx - idx as f64;
-
-            let s0 = samples.get(idx).copied().unwrap_or(0.0);
-            let s1 = samples.get(idx + 1).copied().unwrap_or(s0);
-
-            s0 * (1.0 - frac as f32) + s1 * frac as f32
-        })
-        .collect()
 }

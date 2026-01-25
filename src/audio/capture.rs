@@ -1,9 +1,9 @@
 //! Audio capture using cpal.
 
-use super::RingBuffer;
+use super::{mono_from_interleaved, resample_linear, RingBuffer};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleRate, Stream, StreamConfig};
+use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -11,13 +11,17 @@ use tracing::{debug, error, info, warn};
 /// Target sample rate for Whisper (16kHz)
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
 
-/// Initial buffer capacity (grows as needed for unlimited recording)
+/// Initial buffer capacity.
 const INITIAL_BUFFER_SECONDS: usize = 60;
 const INITIAL_BUFFER_SIZE: usize = WHISPER_SAMPLE_RATE as usize * INITIAL_BUFFER_SECONDS;
+
+/// Guardrail to avoid runaway memory usage.
+const MAX_BUFFER_SECONDS: usize = 600;
 
 pub struct AudioCapture {
     device: Device,
     config: StreamConfig,
+    sample_format: SampleFormat,
     buffer: Arc<RingBuffer>,
     stream: Arc<Mutex<Option<Stream>>>,
     is_recording: Arc<AtomicBool>,
@@ -38,8 +42,10 @@ impl AudioCapture {
 
         let config = Self::find_best_config(supported_configs)?;
         info!(
-            "Audio config: {} Hz, {} channel(s)",
-            config.sample_rate.0, config.channels
+            "Audio config: {} Hz, {} channel(s), {:?}",
+            config.sample_rate().0,
+            config.channels(),
+            config.sample_format()
         );
 
         let buffer = Arc::new(RingBuffer::new(INITIAL_BUFFER_SIZE));
@@ -48,7 +54,8 @@ impl AudioCapture {
 
         Ok(Self {
             device,
-            config,
+            config: config.clone().into(),
+            sample_format: config.sample_format(),
             buffer,
             stream,
             is_recording,
@@ -56,8 +63,8 @@ impl AudioCapture {
     }
 
     fn find_best_config(
-        mut configs: cpal::SupportedInputConfigs,
-    ) -> Result<StreamConfig, Box<dyn std::error::Error>> {
+        configs: cpal::SupportedInputConfigs,
+    ) -> Result<SupportedStreamConfig, Box<dyn std::error::Error>> {
         // Try to find a config that supports our target sample rate
         let target_rate = SampleRate(WHISPER_SAMPLE_RATE);
 
@@ -70,7 +77,7 @@ impl AudioCapture {
                 && config.min_sample_rate() <= target_rate
                 && config.max_sample_rate() >= target_rate
             {
-                return Ok(config.with_sample_rate(target_rate).into());
+                return Ok(config.with_sample_rate(target_rate));
             }
         }
 
@@ -79,7 +86,7 @@ impl AudioCapture {
             if config.min_sample_rate() <= target_rate
                 && config.max_sample_rate() >= target_rate
             {
-                return Ok(config.with_sample_rate(target_rate).into());
+                return Ok(config.with_sample_rate(target_rate));
             }
         }
 
@@ -90,7 +97,7 @@ impl AudioCapture {
                 "Using non-ideal sample rate: {} Hz (will resample)",
                 rate.0
             );
-            return Ok(config.with_sample_rate(rate).into());
+            return Ok(config.with_sample_rate(rate));
         }
 
         Err("No supported audio config found".into())
@@ -110,38 +117,88 @@ impl AudioCapture {
         let channels = self.config.channels as usize;
         let source_rate = self.config.sample_rate.0;
         let target_rate = WHISPER_SAMPLE_RATE;
+        let max_samples = WHISPER_SAMPLE_RATE as usize * MAX_BUFFER_SECONDS;
+        let overflowed = Arc::new(AtomicBool::new(false));
+
+        let err_fn = |err| {
+            error!("Audio stream error: {}", err);
+        };
 
         // Build the stream
-        let stream = self.device.build_input_stream(
-            &self.config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !is_recording.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                // Convert to mono if needed
-                let mono: Vec<f32> = if channels > 1 {
-                    data.chunks(channels)
-                        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                        .collect()
-                } else {
-                    data.to_vec()
-                };
-
-                // Resample if needed (simple linear interpolation)
-                let samples = if source_rate != target_rate {
-                    Self::resample(&mono, source_rate, target_rate)
-                } else {
-                    mono
-                };
-
-                buffer.push(&samples);
-            },
-            |err| {
-                error!("Audio stream error: {}", err);
-            },
-            None,
-        )?;
+        let stream = match self.sample_format {
+            SampleFormat::F32 => {
+                let buffer = buffer.clone();
+                let is_recording = is_recording.clone();
+                let overflowed = overflowed.clone();
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        Self::handle_input(
+                            data,
+                            channels,
+                            source_rate,
+                            target_rate,
+                            &buffer,
+                            &is_recording,
+                            max_samples,
+                            &overflowed,
+                            |sample| sample,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            SampleFormat::I16 => {
+                let buffer = buffer.clone();
+                let is_recording = is_recording.clone();
+                let overflowed = overflowed.clone();
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        Self::handle_input(
+                            data,
+                            channels,
+                            source_rate,
+                            target_rate,
+                            &buffer,
+                            &is_recording,
+                            max_samples,
+                            &overflowed,
+                            Self::i16_to_f32,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            SampleFormat::U16 => {
+                let buffer = buffer.clone();
+                let is_recording = is_recording.clone();
+                let overflowed = overflowed.clone();
+                self.device.build_input_stream(
+                    &self.config,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        Self::handle_input(
+                            data,
+                            channels,
+                            source_rate,
+                            target_rate,
+                            &buffer,
+                            &is_recording,
+                            max_samples,
+                            &overflowed,
+                            Self::u16_to_f32,
+                        );
+                    },
+                    err_fn,
+                    None,
+                )?
+            }
+            other => {
+                return Err(format!("Unsupported audio sample format: {:?}", other).into());
+            }
+        };
 
         // CRITICAL: Set is_recording BEFORE starting stream
         // Otherwise the callback will ignore samples until this flag is set
@@ -184,32 +241,62 @@ impl AudioCapture {
         self.is_recording.load(Ordering::Relaxed)
     }
 
-    /// Simple linear resampling
-    fn resample(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-        if source_rate == target_rate {
-            return samples.to_vec();
+    fn handle_input<T, F>(
+        data: &[T],
+        channels: usize,
+        source_rate: u32,
+        target_rate: u32,
+        buffer: &RingBuffer,
+        is_recording: &AtomicBool,
+        max_samples: usize,
+        overflowed: &AtomicBool,
+        to_f32: F,
+    ) where
+        T: Copy,
+        F: Fn(T) -> f32 + Copy,
+    {
+        if !is_recording.load(Ordering::Relaxed) {
+            return;
         }
 
-        let ratio = source_rate as f64 / target_rate as f64;
-        let new_len = (samples.len() as f64 / ratio) as usize;
-        let mut output = Vec::with_capacity(new_len);
+        let mono = mono_from_interleaved(data, channels, to_f32);
+        let samples = if source_rate != target_rate {
+            resample_linear(&mono, source_rate, target_rate)
+        } else {
+            mono
+        };
 
-        for i in 0..new_len {
-            let src_idx = i as f64 * ratio;
-            let idx = src_idx as usize;
-            let frac = src_idx - idx as f64;
-
-            let sample = if idx + 1 < samples.len() {
-                samples[idx] * (1.0 - frac as f32) + samples[idx + 1] * frac as f32
-            } else if idx < samples.len() {
-                samples[idx]
-            } else {
-                0.0
-            };
-
-            output.push(sample);
+        let current_len = buffer.len();
+        if current_len >= max_samples {
+            Self::mark_overflow(is_recording, overflowed, max_samples);
+            return;
         }
 
-        output
+        let remaining = max_samples - current_len;
+        if samples.len() > remaining {
+            buffer.push(&samples[..remaining]);
+            Self::mark_overflow(is_recording, overflowed, max_samples);
+            return;
+        }
+
+        buffer.push(&samples);
+    }
+
+    fn mark_overflow(is_recording: &AtomicBool, overflowed: &AtomicBool, max_samples: usize) {
+        if !overflowed.swap(true, Ordering::Relaxed) {
+            warn!(
+                "Reached max recording duration ({:.1}s); pausing capture",
+                max_samples as f32 / WHISPER_SAMPLE_RATE as f32
+            );
+        }
+        is_recording.store(false, Ordering::SeqCst);
+    }
+
+    fn i16_to_f32(sample: i16) -> f32 {
+        sample as f32 / 32768.0
+    }
+
+    fn u16_to_f32(sample: u16) -> f32 {
+        (sample as f32 - 32768.0) / 32768.0
     }
 }

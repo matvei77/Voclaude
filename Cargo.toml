@@ -11,8 +11,8 @@ repository = "https://github.com/matvei77/Voclaude"
 cpal = "0.15"
 hound = "3.5"              # WAV encoding
 
-# Whisper speech-to-text (whisper.cpp with CUDA)
-whisper-rs = { version = "0.14", features = ["cuda"] }
+# Whisper speech-to-text (whisper.cpp)
+whisper-rs = { version = "0.14" }
 
 # Audio processing
 rubato = "0.15"            # High-quality resampling
@@ -21,11 +21,14 @@ rubato = "0.15"            # High-quality resampling
 tray-icon = "0.19"
 global-hotkey = "0.6"
 image = "0.25"
+eframe = { version = "0.27", default-features = true }
+winit = "0.29"
 
 # System
 arboard = "3.4"            # Clipboard
 directories = "5.0"        # Config paths
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 crossbeam-channel = "0.5"  # Fast MPSC channels
 
@@ -40,8 +43,12 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+notify-rust = "4.11"
+
 [features]
 default = []
+cuda = ["whisper-rs/cuda"]
 
 [profile.release]
 lto = true

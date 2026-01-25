@@ -16,7 +16,11 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
-    pub fn new(hotkey_str: &str, event_tx: Sender<AppEvent>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        hotkey_str: &str,
+        app_event: AppEvent,
+        event_tx: Sender<AppEvent>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("=== HOTKEY INITIALIZATION START ===");
 
         // Log Windows thread ID
@@ -52,6 +56,7 @@ impl HotkeyManager {
 
         // Spawn event handler thread
         let hotkey_id = hotkey.id();
+        let event_to_send = app_event.clone();
         info!("Hotkey ID: {}, spawning listener thread...", hotkey_id);
 
         std::thread::spawn(move || {
@@ -86,9 +91,9 @@ impl HotkeyManager {
                         if event.state == HotKeyState::Pressed {
                             info!("Event is PRESSED state");
                             if event.id == hotkey_id {
-                                info!("IDs MATCH! Sending AppEvent::HotkeyPressed...");
-                                match event_tx.send(AppEvent::HotkeyPressed) {
-                                    Ok(_) => info!("AppEvent::HotkeyPressed sent successfully!"),
+                                info!("IDs MATCH! Sending hotkey event...");
+                                match event_tx.send(event_to_send.clone()) {
+                                    Ok(_) => info!("Hotkey event sent successfully!"),
                                     Err(e) => error!("FAILED to send hotkey event: {}", e),
                                 }
                             } else {
