@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 //! Voclaude - Voice input anywhere
 //!
 //! Local-first, GPU-accelerated speech-to-text that runs in your system tray.
@@ -8,6 +9,7 @@ mod config;
 mod history;
 mod hotkey;
 mod inference;
+mod session;
 mod tray;
 mod ui;
 

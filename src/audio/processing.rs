@@ -55,6 +55,69 @@ pub fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> V
     output
 }
 
+/// Streaming linear resampler for incremental processing.
+pub struct LinearResampler {
+    ratio: f64,
+    pos: f64,
+    src_offset: u64,
+    prev: Option<f32>,
+}
+
+impl LinearResampler {
+    pub fn new(source_rate: u32, target_rate: u32) -> Self {
+        let ratio = source_rate as f64 / target_rate as f64;
+        Self {
+            ratio,
+            pos: 0.0,
+            src_offset: 0,
+            prev: None,
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+
+        if (self.ratio - 1.0).abs() < f64::EPSILON {
+            return input.to_vec();
+        }
+
+        let start = self.src_offset as f64;
+        let end = start + input.len() as f64;
+        let estimate = ((input.len() as f64) / self.ratio).ceil() as usize + 2;
+        let mut output = Vec::with_capacity(estimate);
+
+        while self.pos + 1.0 < end {
+            let idx = self.pos.floor() as u64;
+            let frac = self.pos - idx as f64;
+
+            let s0 = if idx < self.src_offset {
+                self.prev.unwrap_or(input[0])
+            } else {
+                input[(idx - self.src_offset) as usize]
+            };
+
+            let s1_idx = idx + 1;
+            let s1 = if s1_idx < self.src_offset {
+                self.prev.unwrap_or(input[0])
+            } else {
+                input[(s1_idx - self.src_offset) as usize]
+            };
+
+            let sample = s0 + (s1 - s0) * frac as f32;
+            output.push(sample);
+
+            self.pos += self.ratio;
+        }
+
+        self.src_offset += input.len() as u64;
+        self.prev = Some(*input.last().unwrap());
+
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{mono_from_interleaved, resample_linear};

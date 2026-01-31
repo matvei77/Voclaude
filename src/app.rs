@@ -1,17 +1,22 @@
 //! Main application orchestration.
 
-use crate::audio::AudioCapture;
-use crate::audio::WHISPER_SAMPLE_RATE;
+use crate::audio::{AudioCapture, WHISPER_SAMPLE_RATE};
 use crate::config::Config;
 use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
 use crate::inference::{InferenceProgress, InferenceStage, WhisperEngine};
 use crate::tray::TrayManager;
-use crate::ui::{LogBuffer, UiManager};
+use crate::ui::{HudManager, HudState, LogBuffer, UiManager, UiStatus};
+use crate::session::SessionStore;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use directories::ProjectDirs;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn, trace};
 
 #[cfg(not(target_os = "windows"))]
@@ -26,12 +31,22 @@ pub enum AppEvent {
     ToggleHistoryWindow,
     /// Show history window
     ShowHistoryWindow,
+    /// Open transcripts folder
+    OpenTranscriptsFolder,
+    /// Open last transcript
+    OpenLastTranscript,
     /// Quit requested
     Quit,
     /// Inference progress update
     InferenceProgress(InferenceProgress),
     /// Transcription completed
     TranscriptionComplete(Result<String, String>),
+    /// Inference engine info
+    InferenceEngineInfo {
+        using_gpu: bool,
+        model: String,
+        model_size_mb: u64,
+    },
     /// History updated (for UI listeners)
     HistoryUpdated(HistoryEntry),
 }
@@ -44,9 +59,12 @@ pub enum AppState {
     Transcribing,
 }
 
+const LONG_RECORDING_MS: u64 = 10 * 60 * 1000;
+const LONG_TRANSCRIPT_CHARS: usize = 20000;
+
 #[derive(Debug)]
 enum InferenceCommand {
-    Transcribe(Vec<f32>),
+    TranscribeFile(PathBuf),
     Unload,
     Shutdown,
 }
@@ -111,7 +129,7 @@ pub struct App {
 impl App {
     /// Run the application
     pub fn run(config: Config, log_buffer: LogBuffer) -> Result<(), Box<dyn std::error::Error>> {
-        let (event_tx, event_rx) = bounded::<AppEvent>(32);
+        let (event_tx, event_rx) = unbounded::<AppEvent>();
         let ui = UiManager::new(log_buffer)?;
 
         let mut app = App {
@@ -160,6 +178,8 @@ impl App {
 
         let mut notifications = NotificationManager::new(self.config.show_notifications);
 
+        let hud = HudManager::new(self.config.use_gpu && cfg!(feature = "cuda"))?;
+
         // History storage
         let (history_update_tx, history_update_rx) = bounded::<HistoryEntry>(32);
         let mut history = HistoryStore::load(self.config.history_max_entries, history_update_tx)?;
@@ -168,11 +188,78 @@ impl App {
             self.ui.push_history(entry.text.clone());
         }
 
+        let mut ui_status = UiStatus::new(
+            self.config.hotkey.clone(),
+            self.config.use_gpu && cfg!(feature = "cuda"),
+            "whisper-medium".to_string(),
+            Some(1533),
+        );
+        ui_status.history_count = history.len();
+        if self.config.use_gpu && !cfg!(feature = "cuda") {
+            ui_status.use_gpu = false;
+            ui_status.last_message = Some("GPU requested but CUDA build is disabled".to_string());
+        }
+        self.ui.set_status(ui_status.clone());
+
+        let mut session_store = SessionStore::load()?;
+
         // Track last activity for idle unload
         let mut last_activity = Instant::now();
         let mut idle_unload_requested = false;
         let mut pending_audio_metadata: Option<AudioMetadata> = None;
         let mut last_progress_stage: Option<InferenceStage> = None;
+        let mut transcribe_started_at: Option<Instant> = None;
+        let mut last_transcript_path: Option<PathBuf> = None;
+
+        if let Some(session) = session_store.current().cloned() {
+            if session.is_recoverable() {
+                if let Some(path) = session.audio_path() {
+                    if path.exists() {
+                        info!("Recovering previous session: {}", session.id);
+                        if let Some(audio) = session.audio.clone() {
+                            pending_audio_metadata = Some(audio);
+                        } else if let Ok(metadata) = std::fs::metadata(&path) {
+                            let sample_count = (metadata.len() / 4) as usize;
+                            pending_audio_metadata = Some(AudioMetadata::from_samples(
+                                sample_count,
+                                WHISPER_SAMPLE_RATE,
+                            ));
+                        }
+
+                        if let Some(audio) = pending_audio_metadata.clone() {
+                            let _ = session_store.mark_transcribing(audio);
+                        }
+
+                        self.state = AppState::Transcribing;
+                        _tray.set_state(AppState::Transcribing);
+                        hud.set_state(HudState::Transcribing {
+                            message: "Recovering recording...".to_string(),
+                            percent: None,
+                        });
+                        transcribe_started_at = Some(Instant::now());
+                        ui_status.state = "Recovering".to_string();
+                        ui_status.last_message = Some("Recovering recording...".to_string());
+                        self.ui.set_status(ui_status.clone());
+
+                        if let Err(err) = inference_tx.send(InferenceCommand::TranscribeFile(path)) {
+                            warn!("Failed to start recovery transcription: {}", err);
+                            let _ = session_store.mark_failed(
+                                "Failed to start recovery transcription".to_string(),
+                            );
+                            self.state = AppState::Idle;
+                            _tray.set_state(AppState::Idle);
+                            hud.set_state(HudState::Idle);
+                            ui_status.state = "Idle".to_string();
+                            ui_status.last_message = Some("Recovery failed".to_string());
+                            self.ui.set_status(ui_status.clone());
+                        }
+                    } else {
+                        warn!("Recovery audio file missing; marking session failed");
+                        let _ = session_store.mark_failed("Recovery audio file missing".to_string());
+                    }
+                }
+            }
+        }
 
         info!("=== VOCLAUDE READY ===");
         info!("Press {} to start recording", self.config.hotkey);
@@ -252,44 +339,85 @@ impl App {
                                     if let Err(e) = audio.start() {
                                         error!("Failed to start recording: {}", e);
                                         _tray.set_state(AppState::Idle);
+                                        notifications.notify("Failed to start recording");
+                                        ui_status.state = "Idle".to_string();
+                                        ui_status.last_message = Some("Failed to start recording".to_string());
+                                        self.ui.set_status(ui_status.clone());
                                         continue;
+                                    }
+                                    if let Err(err) = session_store.start() {
+                                        warn!("Failed to start session metadata: {}", err);
                                     }
                                     self.state = AppState::Recording;
                                     pending_audio_metadata = None;
                                     last_progress_stage = None;
                                     _tray.set_state(AppState::Recording);
+                                    hud.set_state(HudState::Recording);
+                                    ui_status.state = "Recording".to_string();
+                                    ui_status.last_message = Some("Recording...".to_string());
+                                    self.ui.set_status(ui_status.clone());
                                 }
                                 AppState::Recording => {
                                     info!("Stopping recording...");
                                     match audio.stop() {
-                                        Ok(samples) => {
-                                            if samples.is_empty() {
+                                        Ok(recording) => {
+                                            if recording.is_empty() {
                                                 warn!("No audio recorded");
+                                                let _ = session_store.mark_aborted(Some("no_audio".to_string()));
                                                 self.state = AppState::Idle;
                                                 _tray.set_state(AppState::Idle);
+                                                hud.set_state(HudState::Idle);
+                                                ui_status.state = "Idle".to_string();
+                                                ui_status.last_message = Some("No audio captured".to_string());
+                                                self.ui.set_status(ui_status.clone());
                                                 continue;
                                             }
 
-                                            let sample_count = samples.len();
+                                            let sample_count = recording.sample_count;
                                             info!("Got {} samples, transcribing...", sample_count);
                                             self.state = AppState::Transcribing;
-                                            pending_audio_metadata = Some(AudioMetadata::from_samples(
+                                            let metadata = AudioMetadata::from_samples(
                                                 sample_count,
-                                                WHISPER_SAMPLE_RATE,
-                                            ));
+                                                recording.sample_rate,
+                                            );
+                                            pending_audio_metadata = Some(metadata.clone());
+                                            let _ = session_store.mark_transcribing(metadata);
                                             _tray.set_state(AppState::Transcribing);
+                                            hud.set_state(HudState::Transcribing {
+                                                message: "Transcribing audio...".to_string(),
+                                                percent: None,
+                                            });
+                                            transcribe_started_at = Some(Instant::now());
+                                            ui_status.state = "Transcribing".to_string();
+                                            ui_status.last_message = Some("Transcribing audio...".to_string());
+                                            self.ui.set_status(ui_status.clone());
 
-                                            if let Err(err) = inference_tx.send(InferenceCommand::Transcribe(samples)) {
+                                            if let Err(err) = inference_tx.send(
+                                                InferenceCommand::TranscribeFile(recording.path),
+                                            ) {
                                                 error!("Failed to start transcription: {}", err);
+                                                let _ = session_store.mark_failed(
+                                                    "Failed to start transcription".to_string(),
+                                                );
                                                 self.state = AppState::Idle;
                                                 pending_audio_metadata = None;
                                                 _tray.set_state(AppState::Idle);
+                                                hud.set_state(HudState::Idle);
+                                                ui_status.state = "Idle".to_string();
+                                                ui_status.last_message = Some("Transcription failed to start".to_string());
+                                                self.ui.set_status(ui_status.clone());
                                             }
                                         }
                                         Err(e) => {
                                             error!("Failed to stop recording: {}", e);
+                                            let _ = session_store
+                                                .mark_failed("Failed to stop recording".to_string());
                                             self.state = AppState::Idle;
                                             _tray.set_state(AppState::Idle);
+                                            hud.set_state(HudState::Idle);
+                                            ui_status.state = "Idle".to_string();
+                                            ui_status.last_message = Some("Failed to stop recording".to_string());
+                                            self.ui.set_status(ui_status.clone());
                                         }
                                     }
                                 }
@@ -304,10 +432,34 @@ impl App {
                                 _tray.set_progress(&progress.message);
                             }
 
+                            if self.state == AppState::Transcribing {
+                                let _ = hud.set_state(HudState::Transcribing {
+                                    message: progress.message.clone(),
+                                    percent: progress.percent,
+                                });
+                                ui_status.last_message = Some(progress.message.clone());
+                                self.ui.set_status(ui_status.clone());
+                            }
+
                             if last_progress_stage != Some(progress.stage) {
                                 notifications.notify(&progress.message);
                                 last_progress_stage = Some(progress.stage);
                             }
+                        }
+                        AppEvent::InferenceEngineInfo {
+                            using_gpu,
+                            model,
+                            model_size_mb,
+                        } => {
+                            ui_status.use_gpu = using_gpu;
+                            ui_status.model = model;
+                            ui_status.model_size_mb = Some(model_size_mb);
+                            if self.config.use_gpu && !using_gpu {
+                                ui_status.last_message =
+                                    Some("GPU init failed; using CPU".to_string());
+                            }
+                            self.ui.set_status(ui_status.clone());
+                            hud.set_accel(using_gpu);
                         }
                         AppEvent::TranscriptionComplete(result) => {
                             match result {
@@ -327,24 +479,116 @@ impl App {
                                     }
 
                                     let history_text = formatted.trim_end().to_string();
-                                    if !history_text.is_empty() {
-                                        let metadata = pending_audio_metadata.take();
-                                        if let Err(e) = history.append(history_text, metadata) {
-                                            error!("Failed to append history: {}", e);
+                                    let metadata_snapshot = pending_audio_metadata.clone();
+                                    let is_long = metadata_snapshot
+                                        .as_ref()
+                                        .map(|meta| meta.duration_ms >= LONG_RECORDING_MS)
+                                        .unwrap_or(false)
+                                        || history_text.chars().count() > LONG_TRANSCRIPT_CHARS;
+                                    let session_id = session_store
+                                        .current()
+                                        .map(|session| session.id.clone())
+                                        .unwrap_or_else(fallback_session_id);
+                                    let mut saved_transcript_path = None;
+                                    if is_long && !history_text.is_empty() {
+                                        if let Some(path) = transcript_output_path(&session_id) {
+                                            match write_transcript_file(&path, &history_text) {
+                                                Ok(()) => {
+                                                    saved_transcript_path = Some(path);
+                                                }
+                                                Err(err) => {
+                                                    warn!("Failed to save transcript: {}", err);
+                                                }
+                                            }
                                         }
                                     }
 
+                                    if let Some(path) = saved_transcript_path.as_ref() {
+                                        last_transcript_path = Some(path.clone());
+                                    } else if !history_text.is_empty() {
+                                        if let Some(path) = last_transcript_output_path() {
+                                            if let Err(err) = write_transcript_file(&path, &history_text) {
+                                                warn!("Failed to save last transcript: {}", err);
+                                            } else {
+                                                last_transcript_path = Some(path);
+                                            }
+                                        }
+                                    }
+                                    let mut history_entry_id = None;
+                                    let mut history_error = None;
+                                    if !history_text.is_empty() {
+                                        let metadata = pending_audio_metadata.take();
+                                        match history.append(history_text.clone(), metadata) {
+                                            Ok(entry) => {
+                                                history_entry_id = Some(entry.id);
+                                                ui_status.history_count = history.len();
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to append history: {}", e);
+                                                history_error = Some(e.to_string());
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(err) = history_error {
+                                        let _ = session_store
+                                            .mark_failed(format!("Failed to append history: {}", err));
+                                    } else {
+                                        let _ = session_store
+                                            .mark_completed(history_text.clone(), history_entry_id);
+                                    }
+
+                                    if let (Some(started_at), Some(audio)) =
+                                        (transcribe_started_at.take(), metadata_snapshot)
+                                    {
+                                        let processing_ms = started_at.elapsed().as_millis() as u64;
+                                        let audio_secs = audio.duration_ms as f32 / 1000.0;
+                                        let processing_secs = (processing_ms as f32 / 1000.0).max(0.01);
+                                        ui_status.last_duration_ms = Some(audio.duration_ms);
+                                        ui_status.last_speed = Some(audio_secs / processing_secs);
+                                    }
+
+                                    let clipboard_text = saved_transcript_path
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .unwrap_or_else(|| formatted.clone());
+                                    let notify_message = if saved_transcript_path.is_some() {
+                                        "Transcript saved; path copied to clipboard"
+                                    } else {
+                                        "Transcription copied to clipboard"
+                                    };
+
                                     // Copy to clipboard
-                                    if let Err(e) = clipboard.set_text(&formatted) {
+                                    if let Err(e) = clipboard.set_text(&clipboard_text) {
                                         error!("Failed to copy to clipboard: {}", e);
+                                        hud.set_state(HudState::Ready {
+                                            message: "Clipboard copy failed".to_string(),
+                                        });
+                                        ui_status.state = "Idle".to_string();
+                                        ui_status.last_message = Some("Clipboard copy failed".to_string());
+                                        self.ui.set_status(ui_status.clone());
                                     } else {
                                         info!("Copied to clipboard!");
-                                        notifications.notify("Transcription copied to clipboard");
+                                        notifications.notify(notify_message);
+                                        hud.set_state(HudState::Ready {
+                                            message: notify_message.to_string(),
+                                        });
+                                        ui_status.state = "Idle".to_string();
+                                        ui_status.last_message = Some(notify_message.to_string());
+                                        self.ui.set_status(ui_status.clone());
                                     }
                                 }
                                 Err(e) => {
                                     error!("Transcription failed: {}", e);
+                                    let _ = session_store
+                                        .mark_failed(format!("Transcription failed: {}", e));
                                     notifications.notify("Transcription failed");
+                                    hud.set_state(HudState::Ready {
+                                        message: "Transcription failed".to_string(),
+                                    });
+                                    ui_status.state = "Idle".to_string();
+                                    ui_status.last_message = Some("Transcription failed".to_string());
+                                    self.ui.set_status(ui_status.clone());
                                 }
                             }
 
@@ -356,12 +600,35 @@ impl App {
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
                             self.ui.push_history(entry.text);
+                            ui_status.history_count = history.len();
+                            self.ui.set_status(ui_status.clone());
                         }
                         AppEvent::ToggleHistoryWindow => {
-                            self.ui.toggle();
+                            if !self.ui.toggle() {
+                                notifications.notify("History window is unavailable");
+                            }
                         }
                         AppEvent::ShowHistoryWindow => {
-                            self.ui.show();
+                            if !self.ui.show() {
+                                notifications.notify("History window is unavailable");
+                            }
+                        }
+                        AppEvent::OpenLastTranscript => {
+                            match last_transcript_path.as_ref() {
+                                Some(path) if path.exists() => {
+                                    if let Err(err) = open_path(path) {
+                                        warn!("Failed to open transcript: {}", err);
+                                    }
+                                }
+                                _ => {
+                                    notifications.notify("No saved transcript yet");
+                                }
+                            }
+                        }
+                        AppEvent::OpenTranscriptsFolder => {
+                            if let Err(err) = open_transcripts_folder() {
+                                warn!("Failed to open transcripts folder: {}", err);
+                            }
                         }
                         AppEvent::Quit => {
                             info!("Quit requested");
@@ -413,12 +680,23 @@ impl App {
 
         for command in inference_rx.iter() {
             match command {
-                InferenceCommand::Transcribe(samples) => {
+                InferenceCommand::TranscribeFile(path) => {
                     let mut callback = |progress: InferenceProgress| {
                         let _ = event_tx.send(AppEvent::InferenceProgress(progress));
                     };
+                    if let Err(err) = engine.prepare(Some(&mut callback)) {
+                        let _ = event_tx.send(AppEvent::TranscriptionComplete(Err(
+                            format!("Failed to load model: {}", err),
+                        )));
+                        continue;
+                    }
+                    let _ = event_tx.send(AppEvent::InferenceEngineInfo {
+                        using_gpu: engine.active_gpu(),
+                        model: engine.model_label(),
+                        model_size_mb: engine.model_size_mb(),
+                    });
                     let result =
-                        engine.transcribe_with_progress(&samples, Some(&mut callback));
+                        engine.transcribe_file_with_progress(&path, Some(&mut callback));
                     let result = result.map_err(|err| err.to_string());
                     let _ = event_tx.send(AppEvent::TranscriptionComplete(result));
                 }
@@ -490,4 +768,62 @@ impl App {
         // No-op on non-Windows platforms
         0
     }
+}
+
+fn fallback_session_id() -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    format!("session-{}", ts)
+}
+
+fn transcripts_dir() -> Option<PathBuf> {
+    ProjectDirs::from("com", "voclaude", "Voclaude")
+        .map(|dirs| dirs.data_dir().join("transcripts"))
+}
+
+fn transcript_output_path(session_id: &str) -> Option<PathBuf> {
+    transcripts_dir().map(|dir| dir.join(format!("{}.txt", session_id)))
+}
+
+fn last_transcript_output_path() -> Option<PathBuf> {
+    transcripts_dir().map(|dir| dir.join("last_transcript.txt"))
+}
+
+fn write_transcript_file(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn open_transcripts_folder() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(dir) = transcripts_dir() else {
+        return Err("Could not determine transcripts directory".into());
+    };
+    fs::create_dir_all(&dir)?;
+    open_path(&dir)
+}
+
+fn open_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer").arg(path).spawn()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+    }
+
+    Ok(())
 }

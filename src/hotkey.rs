@@ -7,7 +7,7 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn, trace};
 
 pub struct HotkeyManager {
@@ -69,6 +69,9 @@ impl HotkeyManager {
 
             let mut loop_count: u64 = 0;
             let mut last_log = std::time::Instant::now();
+            let mut last_trigger = Instant::now() - Duration::from_secs(1);
+            let min_press_gap = Duration::from_millis(100);
+            let release_fallback_gap = Duration::from_millis(300);
 
             loop {
                 loop_count += 1;
@@ -87,20 +90,38 @@ impl HotkeyManager {
                         info!("Event state: {:?}", event.state);
                         info!("IDs match: {}", event.id == hotkey_id);
 
-                        // Only trigger on key press, not release
-                        if event.state == HotKeyState::Pressed {
-                            info!("Event is PRESSED state");
-                            if event.id == hotkey_id {
-                                info!("IDs MATCH! Sending hotkey event...");
+                        if event.id != hotkey_id {
+                            warn!("Event ID {} does not match expected {}", event.id, hotkey_id);
+                            continue;
+                        }
+
+                        let now = Instant::now();
+                        match event.state {
+                            HotKeyState::Pressed => {
+                                info!("Event is PRESSED state");
+                                if now.duration_since(last_trigger) < min_press_gap {
+                                    debug!("Debounced hotkey press");
+                                    continue;
+                                }
+                                last_trigger = now;
+                                info!("Sending hotkey event...");
                                 match event_tx.send(event_to_send.clone()) {
                                     Ok(_) => info!("Hotkey event sent successfully!"),
                                     Err(e) => error!("FAILED to send hotkey event: {}", e),
                                 }
-                            } else {
-                                warn!("Event ID {} does not match expected {}", event.id, hotkey_id);
                             }
-                        } else {
-                            debug!("Ignoring non-pressed state: {:?}", event.state);
+                            HotKeyState::Released => {
+                                if now.duration_since(last_trigger) > release_fallback_gap {
+                                    warn!("Released without recent press; treating as press");
+                                    last_trigger = now;
+                                    match event_tx.send(event_to_send.clone()) {
+                                        Ok(_) => info!("Hotkey event sent successfully!"),
+                                        Err(e) => error!("FAILED to send hotkey event: {}", e),
+                                    }
+                                } else {
+                                    debug!("Ignoring release state");
+                                }
+                            }
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {

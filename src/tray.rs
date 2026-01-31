@@ -19,6 +19,8 @@ const ICON_PROCESSING: &[u8] = include_bytes!("../assets/icon_processing.png");
 /// Menu item IDs
 const MENU_TOGGLE: &str = "toggle";
 const MENU_HISTORY: &str = "history";
+const MENU_OPEN_TRANSCRIPTS: &str = "open_transcripts";
+const MENU_OPEN_LAST_TRANSCRIPT: &str = "open_last_transcript";
 const MENU_SETTINGS: &str = "settings";
 const MENU_QUIT: &str = "quit";
 
@@ -38,6 +40,10 @@ impl TrayManager {
         // Create menu items
         let toggle_item = MenuItem::with_id(MENU_TOGGLE, "Start Recording", true, None);
         let history_item = MenuItem::with_id(MENU_HISTORY, "Show History", true, None);
+        let open_transcripts_item =
+            MenuItem::with_id(MENU_OPEN_TRANSCRIPTS, "Open Transcripts Folder", true, None);
+        let open_last_transcript_item =
+            MenuItem::with_id(MENU_OPEN_LAST_TRANSCRIPT, "Open Last Transcript", true, None);
         let settings_item = MenuItem::with_id(MENU_SETTINGS, "Settings...", true, None);
         let separator = PredefinedMenuItem::separator();
         let quit_item = MenuItem::with_id(MENU_QUIT, "Quit Voclaude", true, None);
@@ -46,6 +52,8 @@ impl TrayManager {
         let menu = Menu::new();
         menu.append(&toggle_item)?;
         menu.append(&history_item)?;
+        menu.append(&open_last_transcript_item)?;
+        menu.append(&open_transcripts_item)?;
         menu.append(&separator)?;
         menu.append(&settings_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
@@ -80,6 +88,14 @@ impl TrayManager {
                         MENU_HISTORY => {
                             debug!("History clicked");
                             let _ = event_tx_clone.send(AppEvent::ShowHistoryWindow);
+                        }
+                        MENU_OPEN_TRANSCRIPTS => {
+                            debug!("Open transcripts clicked");
+                            let _ = event_tx_clone.send(AppEvent::OpenTranscriptsFolder);
+                        }
+                        MENU_OPEN_LAST_TRANSCRIPT => {
+                            debug!("Open last transcript clicked");
+                            let _ = event_tx_clone.send(AppEvent::OpenLastTranscript);
                         }
                         MENU_QUIT => {
                             debug!("Quit clicked");

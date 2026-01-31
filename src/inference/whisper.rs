@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::inference::{InferenceProgress, InferenceStage};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 
@@ -33,6 +33,12 @@ impl WhisperModel {
             WhisperModel::Medium => 1533,
         }
     }
+
+    fn label(&self) -> &'static str {
+        match self {
+            WhisperModel::Medium => "whisper-medium",
+        }
+    }
 }
 
 /// Whisper inference engine
@@ -41,6 +47,8 @@ pub struct WhisperEngine {
     model: WhisperModel,
     is_loaded: bool,
     use_gpu: bool,
+    language: Option<String>,
+    active_gpu: bool,
 }
 
 impl WhisperEngine {
@@ -51,17 +59,33 @@ impl WhisperEngine {
             model: WhisperModel::Medium,
             is_loaded: false,
             use_gpu,
+            language: None,
+            active_gpu: false,
         })
     }
 
     /// Create a new Whisper engine with config
     pub fn new_with_config(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new(config.use_gpu)
+        let mut engine = Self::new(config.use_gpu)?;
+        engine.language = normalize_language(config.language.as_deref());
+        Ok(engine)
     }
 
     /// Check if model is loaded
     pub fn is_loaded(&self) -> bool {
         self.is_loaded
+    }
+
+    pub fn active_gpu(&self) -> bool {
+        self.active_gpu
+    }
+
+    pub fn model_label(&self) -> String {
+        self.model.label().to_string()
+    }
+
+    pub fn model_size_mb(&self) -> u64 {
+        self.model.size_mb()
     }
 
     /// Unload model to free memory
@@ -70,6 +94,7 @@ impl WhisperEngine {
             info!("Unloading Whisper model");
             self.context = None;
             self.is_loaded = false;
+            self.active_gpu = false;
         }
     }
 
@@ -218,15 +243,20 @@ impl WhisperEngine {
             model_path.to_str().ok_or("Invalid model path")?,
             params,
         ) {
-            Ok(ctx) => ctx,
+            Ok(ctx) => {
+                self.active_gpu = prefer_gpu;
+                ctx
+            }
             Err(e) if prefer_gpu => {
                 warn!("GPU init failed ({}); retrying on CPU", e);
                 let mut cpu_params = WhisperContextParameters::default();
                 cpu_params.use_gpu(false);
-                WhisperContext::new_with_params(
+                let ctx = WhisperContext::new_with_params(
                     model_path.to_str().ok_or("Invalid model path")?,
                     cpu_params,
-                ).map_err(|e| format!("Failed to load Whisper model on CPU: {}", e))?
+                ).map_err(|e| format!("Failed to load Whisper model on CPU: {}", e))?;
+                self.active_gpu = false;
+                ctx
             }
             Err(e) => return Err(format!("Failed to load Whisper model: {}", e).into()),
         };
@@ -238,11 +268,27 @@ impl WhisperEngine {
         Ok(())
     }
 
+    pub fn prepare(
+        &mut self,
+        mut progress: Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.ensure_loaded(&mut progress)
+    }
+
     /// Transcribe audio samples
     /// Input: f32 samples at 16kHz mono
     /// Output: transcribed text
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
         self.transcribe_with_progress(samples, None)
+    }
+
+    pub fn transcribe_file_with_progress(
+        &mut self,
+        path: &Path,
+        progress: Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let samples = load_f32_file(path)?;
+        self.transcribe_with_progress(&samples, progress)
     }
 
     pub fn transcribe_with_progress(
@@ -265,8 +311,8 @@ impl WhisperEngine {
         // Configure transcription parameters
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
-        // Set language to English for faster processing
-        params.set_language(Some("en"));
+        // Set language from config (None = auto-detect)
+        params.set_language(self.language.as_deref());
 
         // Disable translation (we want transcription)
         params.set_translate(false);
@@ -320,4 +366,27 @@ impl Default for WhisperEngine {
     fn default() -> Self {
         Self::new(true).expect("Failed to create WhisperEngine")
     }
+}
+
+fn normalize_language(lang: Option<&str>) -> Option<String> {
+    let trimmed = lang.map(str::trim).filter(|value| !value.is_empty());
+    match trimmed {
+        Some("auto") => None,
+        Some(value) => Some(value.to_string()),
+        None => None,
+    }
+}
+
+fn load_f32_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() % 4 != 0 {
+        return Err("Invalid f32 audio file length".into());
+    }
+
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+
+    Ok(samples)
 }
