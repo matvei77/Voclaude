@@ -17,3 +17,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Python tooling
+**/__pycache__/
+**/*.pyc
+**/.venv/

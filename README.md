@@ -85,6 +85,11 @@ use_gpu = true
 
 Voclaude currently downloads the Whisper medium model (~1.5GB) automatically on first use.
 
+## Qwen3-ASR Smoke Test
+
+A Python-first Qwen3-ASR validation harness is available in `tools/qwen3_asr_smoke/`.
+Use it to verify Russian/English behavior and runtime viability before Rust integration.
+
 ## Architecture
 
 ```
