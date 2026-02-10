@@ -4,6 +4,7 @@ use super::{mono_from_interleaved, LinearResampler, RingBuffer};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
+use crossbeam_channel::Sender;
 use directories::ProjectDirs;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Target sample rate for Whisper (16kHz)
@@ -39,6 +40,7 @@ impl AudioRecording {
 }
 
 pub struct AudioCapture {
+    device_name: String,
     device: Device,
     config: StreamConfig,
     sample_format: SampleFormat,
@@ -48,6 +50,7 @@ pub struct AudioCapture {
     writer_stop: Arc<AtomicBool>,
     writer_handle: Arc<Mutex<Option<JoinHandle<WriterThreadResult>>>>,
     dropped_samples: Arc<AtomicUsize>,
+    level_tx: Option<Sender<f32>>,
 }
 
 struct WriterResult {
@@ -59,14 +62,15 @@ struct WriterResult {
 type WriterThreadResult = Result<WriterResult, String>;
 
 impl AudioCapture {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(level_tx: Option<Sender<f32>>) -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
 
         let device = host
             .default_input_device()
             .ok_or("No input device available")?;
 
-        info!("Using audio device: {}", device.name()?);
+        let device_name = device.name()?;
+        info!("Using audio device: {}", device_name);
 
         let supported_configs = device.supported_input_configs()?;
         let config = Self::find_best_config(supported_configs)?;
@@ -89,6 +93,7 @@ impl AudioCapture {
         let dropped_samples = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
+            device_name,
             device,
             config: config.clone().into(),
             sample_format: config.sample_format(),
@@ -98,6 +103,7 @@ impl AudioCapture {
             writer_stop,
             writer_handle,
             dropped_samples,
+            level_tx,
         })
     }
 
@@ -137,6 +143,10 @@ impl AudioCapture {
         Err("No supported audio config found".into())
     }
 
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     /// Start recording
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.is_recording.load(Ordering::Relaxed) {
@@ -154,10 +164,21 @@ impl AudioCapture {
         let buffer = self.buffer.clone();
         let stop = self.writer_stop.clone();
         let dropped = self.dropped_samples.clone();
+        let level_tx = self.level_tx.clone();
 
         let writer_handle = thread::Builder::new()
             .name("audio-writer".to_string())
-            .spawn(move || writer_thread(buffer, stop, dropped, channels, source_rate, output_path))?;
+            .spawn(move || {
+                writer_thread(
+                    buffer,
+                    stop,
+                    dropped,
+                    channels,
+                    source_rate,
+                    output_path,
+                    level_tx,
+                )
+            })?;
 
         *self.writer_handle.lock().unwrap() = Some(writer_handle);
 
@@ -353,6 +374,7 @@ fn writer_thread(
     channels: usize,
     source_rate: u32,
     output_path: PathBuf,
+    level_tx: Option<Sender<f32>>,
 ) -> WriterThreadResult {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -376,6 +398,8 @@ fn writer_thread(
     let mut pending: Vec<f32> = Vec::with_capacity(WRITER_CHUNK_SAMPLES * 2);
     let mut bytes: Vec<u8> = Vec::with_capacity(WRITER_CHUNK_SAMPLES * 4);
     let mut sample_count = 0usize;
+    let level_interval = Duration::from_millis(60);
+    let mut last_level_sent = Instant::now() - level_interval;
 
     loop {
         let read = buffer.pop_slice(&mut scratch);
@@ -404,6 +428,20 @@ fn writer_thread(
         if !resampled.is_empty() {
             write_f32_le(&mut writer, &resampled, &mut bytes).map_err(|e| e.to_string())?;
             sample_count += resampled.len();
+
+            if let Some(tx) = &level_tx {
+                if last_level_sent.elapsed() >= level_interval {
+                    let mut peak = 0.0f32;
+                    for sample in &resampled {
+                        let value = sample.abs();
+                        if value > peak {
+                            peak = value;
+                        }
+                    }
+                    let _ = tx.try_send(peak.min(1.0));
+                    last_level_sent = Instant::now();
+                }
+            }
         }
     }
 

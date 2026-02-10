@@ -83,7 +83,7 @@ impl TrayManager {
                         }
                         MENU_SETTINGS => {
                             debug!("Settings clicked");
-                            // TODO: Open settings window
+                            let _ = event_tx_clone.send(AppEvent::OpenSettings);
                         }
                         MENU_HISTORY => {
                             debug!("History clicked");

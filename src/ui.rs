@@ -115,7 +115,8 @@ impl UiManager {
                 viewport: egui::ViewportBuilder::default()
                     .with_title("Voclaude History")
                     .with_inner_size([520.0, 480.0])
-                    .with_visible(false),
+                    .with_visible(true)
+                    .with_position(egui::pos2(120.0, 120.0)),
                 #[cfg(target_os = "windows")]
                 event_loop_builder: Some(Box::new(|builder| {
                     builder.with_any_thread(true);
@@ -134,6 +135,7 @@ impl UiManager {
         });
 
         info!("History window thread started");
+        let _ = command_tx.send(UiCommand::Hide);
         Ok(Self { command_tx, alive })
     }
 
@@ -177,6 +179,7 @@ impl UiManager {
 enum UiCommand {
     Toggle,
     Show,
+    Hide,
     AddHistory(String),
     SetStatus(UiStatus),
 }
@@ -189,6 +192,8 @@ pub struct UiStatus {
     pub model: String,
     pub model_size_mb: Option<u64>,
     pub history_count: usize,
+    pub input_device: Option<String>,
+    pub input_level: Option<f32>,
     pub last_duration_ms: Option<u64>,
     pub last_speed: Option<f32>,
     pub last_message: Option<String>,
@@ -203,6 +208,8 @@ impl UiStatus {
             model,
             model_size_mb,
             history_count: 0,
+            input_device: None,
+            input_level: None,
             last_duration_ms: None,
             last_speed: None,
             last_message: None,
@@ -282,11 +289,24 @@ impl HudManager {
         }
         true
     }
+
+    pub fn set_level(&self, level: f32) -> bool {
+        if !self.alive.load(Ordering::Relaxed) {
+            error!("Status HUD is not running");
+            return false;
+        }
+        if let Err(err) = self.command_tx.send(HudCommand::SetLevel(level)) {
+            error!("Failed to send HUD level: {}", err);
+            return false;
+        }
+        true
+    }
 }
 
 enum HudCommand {
     SetState(HudState),
     SetAccel(bool),
+    SetLevel(f32),
 }
 
 struct HudApp {
@@ -296,6 +316,7 @@ struct HudApp {
     recording_started_at: Option<Instant>,
     ready_until: Option<Instant>,
     gpu_enabled: bool,
+    input_level: f32,
 }
 
 impl HudApp {
@@ -307,6 +328,7 @@ impl HudApp {
             recording_started_at: None,
             ready_until: None,
             gpu_enabled,
+            input_level: 0.0,
         }
     }
 
@@ -344,6 +366,9 @@ impl HudApp {
                 }
                 HudCommand::SetAccel(gpu_enabled) => {
                     self.gpu_enabled = gpu_enabled;
+                }
+                HudCommand::SetLevel(level) => {
+                    self.input_level = level.clamp(0.0, 1.0);
                 }
             }
         }
@@ -414,6 +439,12 @@ impl eframe::App for HudApp {
                         ui.colored_label(indicator_color, accel);
                     });
                 });
+                if matches!(self.state, HudState::Recording) {
+                    let bar = egui::ProgressBar::new(self.input_level)
+                        .desired_width(220.0)
+                        .text("Mic level");
+                    ui.add(bar);
+                }
             });
         });
 
@@ -451,7 +482,7 @@ impl HistoryApp {
             command_rx,
             history: VecDeque::new(),
             log_buffer,
-            visible: false,
+            visible: true,
             filter: String::new(),
             show_logs: false,
             status: UiStatus::new(String::new(), false, "whisper".to_string(), None),
@@ -470,6 +501,10 @@ impl HistoryApp {
                     self.visible = true;
                     visibility_changed = true;
                 }
+                UiCommand::Hide => {
+                    self.visible = false;
+                    visibility_changed = true;
+                }
                 UiCommand::AddHistory(entry) => {
                     if !entry.trim().is_empty() {
                         self.history.push_front(entry);
@@ -485,10 +520,13 @@ impl HistoryApp {
         }
 
         if visibility_changed {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
-                if self.visible {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
+            if self.visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(cmd);
                 }
+            }
         }
     }
 }
@@ -533,6 +571,11 @@ impl eframe::App for HistoryApp {
                             .unwrap_or_default();
                         ui.label(format!("Model: {}{}", self.status.model, size_text));
                     }
+                    if let Some(device) = &self.status.input_device {
+                        if !device.is_empty() {
+                            ui.label(format!("Input: {}", device));
+                        }
+                    }
                     ui.label(format!("History: {}", self.status.history_count));
                     if let Some(duration_ms) = self.status.last_duration_ms {
                         ui.label(format!("Last: {}", format_duration_ms(duration_ms)));
@@ -541,6 +584,13 @@ impl eframe::App for HistoryApp {
                         ui.label(format!("Speed: {:.2}x", speed));
                     }
                 });
+                if let Some(level) = self.status.input_level {
+                    let clamped = level.clamp(0.0, 1.0);
+                    let bar = egui::ProgressBar::new(clamped)
+                        .desired_width(160.0)
+                        .text("Mic level");
+                    ui.add(bar);
+                }
                 if let Some(message) = &self.status.last_message {
                     if !message.is_empty() {
                         ui.label(message);

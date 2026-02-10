@@ -35,6 +35,8 @@ pub enum AppEvent {
     OpenTranscriptsFolder,
     /// Open last transcript
     OpenLastTranscript,
+    /// Open config file
+    OpenSettings,
     /// Quit requested
     Quit,
     /// Inference progress update
@@ -124,13 +126,14 @@ pub struct App {
     event_rx: Receiver<AppEvent>,
     is_running: bool,
     ui: UiManager,
+    log_buffer: LogBuffer,
 }
 
 impl App {
     /// Run the application
     pub fn run(config: Config, log_buffer: LogBuffer) -> Result<(), Box<dyn std::error::Error>> {
         let (event_tx, event_rx) = unbounded::<AppEvent>();
-        let ui = UiManager::new(log_buffer)?;
+        let ui = UiManager::new(log_buffer.clone())?;
 
         let mut app = App {
             config,
@@ -139,6 +142,7 @@ impl App {
             event_rx,
             is_running: true,
             ui,
+            log_buffer,
         };
 
         app.run_event_loop()
@@ -166,7 +170,8 @@ impl App {
         info!("History hotkey registered: {}", self.config.history_hotkey);
 
         // Initialize audio capture
-        let audio = AudioCapture::new()?;
+        let (level_tx, level_rx) = bounded::<f32>(64);
+        let audio = AudioCapture::new(Some(level_tx))?;
         info!("Audio capture ready");
 
         // Initialize inference worker (lazy - loads model on demand)
@@ -195,6 +200,8 @@ impl App {
             Some(1533),
         );
         ui_status.history_count = history.len();
+        ui_status.input_device = Some(audio.device_name().to_string());
+        ui_status.input_level = Some(0.0);
         if self.config.use_gpu && !cfg!(feature = "cuda") {
             ui_status.use_gpu = false;
             ui_status.last_message = Some("GPU requested but CUDA build is disabled".to_string());
@@ -321,6 +328,18 @@ impl App {
                 }
             }
 
+            let mut latest_level: Option<f32> = None;
+            while let Ok(level) = level_rx.try_recv() {
+                latest_level = Some(level.clamp(0.0, 1.0));
+            }
+            if let Some(level) = latest_level {
+                ui_status.input_level = Some(level);
+                self.ui.set_status(ui_status.clone());
+                if self.state == AppState::Recording {
+                    hud.set_level(level);
+                }
+            }
+
             // Process events (non-blocking)
             match self.event_rx.try_recv() {
                 Ok(event) => {
@@ -369,7 +388,9 @@ impl App {
                                                 hud.set_state(HudState::Idle);
                                                 ui_status.state = "Idle".to_string();
                                                 ui_status.last_message = Some("No audio captured".to_string());
+                                                ui_status.input_level = Some(0.0);
                                                 self.ui.set_status(ui_status.clone());
+                                                hud.set_level(0.0);
                                                 continue;
                                             }
 
@@ -405,7 +426,9 @@ impl App {
                                                 hud.set_state(HudState::Idle);
                                                 ui_status.state = "Idle".to_string();
                                                 ui_status.last_message = Some("Transcription failed to start".to_string());
+                                                ui_status.input_level = Some(0.0);
                                                 self.ui.set_status(ui_status.clone());
+                                                hud.set_level(0.0);
                                             }
                                         }
                                         Err(e) => {
@@ -417,7 +440,9 @@ impl App {
                                             hud.set_state(HudState::Idle);
                                             ui_status.state = "Idle".to_string();
                                             ui_status.last_message = Some("Failed to stop recording".to_string());
+                                            ui_status.input_level = Some(0.0);
                                             self.ui.set_status(ui_status.clone());
+                                            hud.set_level(0.0);
                                         }
                                     }
                                 }
@@ -596,6 +621,9 @@ impl App {
                             pending_audio_metadata = None;
                             last_progress_stage = None;
                             _tray.set_state(AppState::Idle);
+                            ui_status.input_level = Some(0.0);
+                            self.ui.set_status(ui_status.clone());
+                            hud.set_level(0.0);
                         }
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
@@ -606,11 +634,19 @@ impl App {
                         AppEvent::ToggleHistoryWindow => {
                             if !self.ui.toggle() {
                                 notifications.notify("History window is unavailable");
+                                if let Ok(new_ui) = UiManager::new(self.log_buffer.clone()) {
+                                    self.ui = new_ui;
+                                    let _ = self.ui.toggle();
+                                }
                             }
                         }
                         AppEvent::ShowHistoryWindow => {
                             if !self.ui.show() {
                                 notifications.notify("History window is unavailable");
+                                if let Ok(new_ui) = UiManager::new(self.log_buffer.clone()) {
+                                    self.ui = new_ui;
+                                    let _ = self.ui.show();
+                                }
                             }
                         }
                         AppEvent::OpenLastTranscript => {
@@ -622,6 +658,19 @@ impl App {
                                 }
                                 _ => {
                                     notifications.notify("No saved transcript yet");
+                                }
+                            }
+                        }
+                        AppEvent::OpenSettings => {
+                            match ensure_config_file() {
+                                Ok(path) => {
+                                    if let Err(err) = open_path(&path) {
+                                        warn!("Failed to open config file: {}", err);
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("Failed to resolve config file: {}", err);
+                                    notifications.notify("Failed to open config file");
                                 }
                             }
                         }
@@ -826,4 +875,12 @@ fn open_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn ensure_config_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = Config::config_path().ok_or("Could not determine config path")?;
+    if !path.exists() {
+        Config::default().save()?;
+    }
+    Ok(path)
 }
