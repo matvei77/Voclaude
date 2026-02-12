@@ -52,6 +52,12 @@ Bigger model:
 python transcribe.py C:\path\to\sample.wav --model Qwen/Qwen3-ASR-1.7B
 ```
 
+Long file stability (manual chunking, single model load):
+
+```powershell
+python transcribe.py C:\path\to\long.wav --model Qwen/Qwen3-ASR-1.7B --chunk-seconds 60 --max-new-tokens 2048
+```
+
 JSON output:
 
 ```powershell
@@ -64,7 +70,19 @@ With timestamps (loads forced aligner):
 python transcribe.py C:\path\to\sample.wav --timestamps
 ```
 
+Quality-oriented profile for bilingual files:
+
+```powershell
+python transcribe.py C:\path\to\sample.wav `
+  --model Qwen/Qwen3-ASR-1.7B `
+  --dtype bfloat16 `
+  --chunk-seconds 60 `
+  --max-new-tokens 2048 `
+  --json
+```
+
 ## Notes
 
 - Default model in this script is `Qwen/Qwen3-ASR-0.6B` for faster first validation.
+- Qwen3-ASR can return timestamps (`--timestamps`) but does not perform speaker diarization (no speaker labels like `SPEAKER_00`).
 - After smoke validation, the next step is to define a stable Rust backend contract and bridge from the Rust app.

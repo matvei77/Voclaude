@@ -1,0 +1,20 @@
+[backend]
+kind = "qwen_python"
+
+[backend.qwen_python]
+python_path = "../../../tools/qwen3_asr_smoke/.venv/Scripts/python.exe"
+script_path = "../../../tools/qwen3_asr_smoke/transcribe.py"
+model = "Qwen/Qwen3-ASR-1.7B"
+device = "cuda:0"
+dtype = "bfloat16"
+max_new_tokens = 2048
+language = "auto"
+require_gpu = true
+timeout_seconds = 7200
+
+[chunking]
+seconds = 60.0
+overlap_seconds = 2.0
+
+[runtime]
+write_json = true

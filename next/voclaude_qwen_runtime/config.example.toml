@@ -1,0 +1,22 @@
+hotkey = "F4"
+history_hotkey = "Ctrl+Shift+H"
+language = "auto"
+add_trailing_space = true
+capitalize_first = true
+idle_unload_seconds = 300
+show_notifications = true
+history_max_entries = 500
+use_gpu = true
+
+qwen_model = "Qwen/Qwen3-ASR-1.7B"
+qwen_dtype = "bfloat16"
+qwen_device = "cuda:0"
+qwen_max_new_tokens = 2048
+qwen_chunk_seconds = 60.0
+qwen_chunk_overlap_seconds = 2.0
+qwen_timeout_seconds = 7200
+qwen_require_gpu = true
+
+# Set these to your local paths:
+# qwen_python_path = "/path/to/tools/qwen3_asr_smoke/.venv/Scripts/python.exe"
+# qwen_script_path = "/path/to/tools/qwen3_asr_smoke/transcribe.py"

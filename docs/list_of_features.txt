@@ -1,0 +1,50 @@
+● Here's the full picture of what voclaude_qwen_runtime is and what must work:
+
+  What it is
+
+  A system-tray voice dictation app for Windows. You press a hotkey, speak, press it again, and the transcribed text lands in your clipboard.
+
+  Feature set
+
+  Core loop (F4 flow)
+
+  1. System tray icon — app lives in the tray, no main window
+  2. F4 to start recording — captures mic audio at 16kHz mono, streams to disk as raw f32
+  3. F4 again to stop — stops capture, hands the audio file to the inference worker
+  4. Inference — spawns a one-shot Python process (transcribe.py) that loads Qwen3-ASR-1.7B, transcribes the WAV, returns JSON on stdout, exits
+  5. Clipboard — result text is copied to clipboard automatically
+  6. HUD overlay — small always-on-top status window shows recording state, mic level, transcription progress
+
+  Secondary features
+
+  - History window (Ctrl+Shift+H) — egui window listing past transcriptions with search/filter and copy buttons
+  - Session recovery — if the app crashes mid-transcription, it recovers the audio file on next launch
+  - Long transcript saving — recordings over 10 min or transcripts over 20k chars get saved as .txt files; clipboard gets the file path instead
+  - Idle model unload — after 5 min idle, sends unload command (mostly a no-op since Python is one-shot, but resets internal state)
+  - Desktop notifications — status updates via system notifications
+  - Preflight check — on startup, validates Python path, script path, and CUDA availability; fails fast with actionable error dialog
+  - --test mode — CLI path to transcribe a single WAV file without tray/hotkey, for debugging
+
+  Configuration (config.toml)
+
+  - Hotkeys, language hint, GPU toggle, model selection, chunk sizes, timeouts, Python/script paths
+
+  What must work for the app to be usable
+
+  1. Python environment with torch, transformers, and qwen3-asr model accessible — either via auto-discovery or explicit config paths
+  2. CUDA (or qwen_require_gpu = false for CPU mode)
+  3. Audio input device available
+  4. Windows message pump running on main thread (for hotkeys + tray)
+  5. The transcribe.py script must accept the expected CLI args and return JSON with model, device, load_seconds, inference_seconds, results[].text
+
+  What the cleanup plan fixed (what we just did)
+
+  The code was functionally wired but had naming/hygiene issues. We did no behavioral changes to the F4 flow itself — only:
+  - Deleted dead Parakeet/mel/model_manager code
+  - Renamed Whisper→Qwen naming throughout
+  - Fixed hardcoded user paths
+  - Made Python auto-discovery fail loudly instead of silently
+  - Removed unused reqwest dependency
+  - Cleaned build.rs, README, config example
+
+  The CUDA preflight error you're seeing is the app working as designed — it's telling you CUDA isn't available in that Python env.

@@ -1,5 +1,5 @@
 # Build artifacts
-/target/
+**/target/
 **/*.rs.bk
 
 # IDE
@@ -22,3 +22,5 @@ Thumbs.db
 **/__pycache__/
 **/*.pyc
 **/.venv/
+tools/qwen3_asr_smoke/runs/
+tools/qwen3_asr_smoke/*.wav
