@@ -1,101 +1,95 @@
-//! Lock-free single-producer/single-consumer ring buffer for audio samples.
+//! Growable audio buffer for unlimited recording length.
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+use tracing::error;
 
-/// SPSC ring buffer for f32 samples.
-pub struct RingBuffer {
-    buffer: Box<[UnsafeCell<f32>]>,
-    capacity: usize,
-    mask: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+/// Error type for ring buffer operations
+#[derive(Debug)]
+pub struct BufferError(String);
+
+impl std::fmt::Display for BufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Buffer error: {}", self.0)
+    }
 }
 
-unsafe impl Send for RingBuffer {}
-unsafe impl Sync for RingBuffer {}
+impl std::error::Error for BufferError {}
+
+impl<T> From<PoisonError<T>> for BufferError {
+    fn from(e: PoisonError<T>) -> Self {
+        BufferError(format!("Mutex poisoned: {}", e))
+    }
+}
+
+/// Thread-safe growable buffer for audio samples (unlimited length)
+pub struct RingBuffer {
+    samples: Mutex<Vec<f32>>,
+}
 
 impl RingBuffer {
-    pub fn new(min_capacity: usize) -> Self {
-        let capacity = min_capacity.max(2).next_power_of_two();
-        let mut buf = Vec::with_capacity(capacity);
-        buf.resize_with(capacity, || UnsafeCell::new(0.0));
+    /// Create a new growable buffer
+    /// The capacity parameter is used as initial capacity hint
+    pub fn new(initial_capacity: usize) -> Self {
         Self {
-            buffer: buf.into_boxed_slice(),
-            capacity,
-            mask: capacity - 1,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            samples: Mutex::new(Vec::with_capacity(initial_capacity)),
         }
     }
 
-    pub fn len(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        head.wrapping_sub(tail)
+    /// Push samples into the buffer (called from audio callback)
+    /// Returns the number of samples pushed
+    ///
+    /// Note: In the audio callback, we can't propagate errors easily,
+    /// so we log and return 0 on failure. The main thread should check
+    /// for buffer errors via pop_all().
+    pub fn push(&self, new_samples: &[f32]) -> usize {
+        match self.samples.lock() {
+            Ok(mut samples) => {
+                samples.extend_from_slice(new_samples);
+                new_samples.len()
+            }
+            Err(e) => {
+                // Log error - this is serious but we can't panic in audio callback
+                error!("CRITICAL: Audio buffer mutex poisoned, samples lost: {}", e);
+                0
+            }
+        }
     }
 
+    /// Pop all available samples from the buffer
+    /// Returns error if mutex is poisoned (indicates audio thread panicked)
+    pub fn pop_all(&self) -> Result<Vec<f32>, BufferError> {
+        let mut samples = self.samples.lock()?;
+        Ok(std::mem::take(&mut *samples))
+    }
+
+    /// Clear the buffer
+    pub fn clear(&self) {
+        match self.samples.lock() {
+            Ok(mut samples) => samples.clear(),
+            Err(e) => error!("Failed to clear buffer: {}", e),
+        }
+    }
+
+    /// Get the number of samples available
+    pub fn len(&self) -> usize {
+        match self.samples.lock() {
+            Ok(samples) => samples.len(),
+            Err(e) => {
+                error!("Failed to get buffer length: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Check if buffer is empty
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn clear(&self) {
-        let head = self.head.load(Ordering::Relaxed);
-        self.tail.store(head, Ordering::Release);
-    }
-
-    pub fn push_slice(&self, input: &[f32]) -> usize {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        let used = head.wrapping_sub(tail);
-        let free = self.capacity.saturating_sub(used);
-        let write_len = input.len().min(free);
-
-        for i in 0..write_len {
-            let idx = (head + i) & self.mask;
-            unsafe {
-                *self.buffer.get_unchecked(idx).get() = input[i];
-            }
-        }
-
-        self.head.store(head.wrapping_add(write_len), Ordering::Release);
-        write_len
-    }
-
-    pub fn push_mapped<T, F>(&self, input: &[T], map: F) -> usize
-    where
-        T: Copy,
-        F: Fn(T) -> f32 + Copy,
-    {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        let used = head.wrapping_sub(tail);
-        let free = self.capacity.saturating_sub(used);
-        let write_len = input.len().min(free);
-
-        for i in 0..write_len {
-            let idx = (head + i) & self.mask;
-            unsafe {
-                *self.buffer.get_unchecked(idx).get() = map(input[i]);
-            }
-        }
-
-        self.head.store(head.wrapping_add(write_len), Ordering::Release);
-        write_len
-    }
-
-    pub fn pop_slice(&self, output: &mut [f32]) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Relaxed);
-        let available = head.wrapping_sub(tail);
-        let read_len = output.len().min(available);
-
-        for i in 0..read_len {
-            let idx = (tail + i) & self.mask;
-            output[i] = unsafe { *self.buffer.get_unchecked(idx).get() };
-        }
-
-        self.tail.store(tail.wrapping_add(read_len), Ordering::Release);
-        read_len
+    /// Get recording duration in seconds
+    #[allow(dead_code)]
+    pub fn duration_secs(&self, sample_rate: u32) -> f32 {
+        self.len() as f32 / sample_rate as f32
     }
 }

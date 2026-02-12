@@ -7,20 +7,19 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn, trace};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error, info, trace};
 
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
     hotkey: HotKey,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl HotkeyManager {
-    pub fn new(
-        hotkey_str: &str,
-        app_event: AppEvent,
-        event_tx: Sender<AppEvent>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(hotkey_str: &str, event_tx: Sender<AppEvent>) -> Result<Self, Box<dyn std::error::Error>> {
         info!("=== HOTKEY INITIALIZATION START ===");
 
         // Log Windows thread ID
@@ -54,9 +53,10 @@ impl HotkeyManager {
             }
         }
 
-        // Spawn event handler thread
+        // Spawn event handler thread with shutdown signal
         let hotkey_id = hotkey.id();
-        let event_to_send = app_event.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
         info!("Hotkey ID: {}, spawning listener thread...", hotkey_id);
 
         std::thread::spawn(move || {
@@ -69,58 +69,33 @@ impl HotkeyManager {
 
             let mut loop_count: u64 = 0;
             let mut last_log = std::time::Instant::now();
-            let mut last_trigger = Instant::now() - Duration::from_secs(1);
-            let min_press_gap = Duration::from_millis(100);
-            let release_fallback_gap = Duration::from_millis(300);
 
             loop {
+                // Check shutdown flag
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    info!("Hotkey listener received shutdown signal");
+                    break;
+                }
+
                 loop_count += 1;
 
                 // Log every 10 seconds to show the thread is alive
                 if last_log.elapsed() > Duration::from_secs(10) {
-                    info!("Hotkey listener alive - {} iterations, waiting for events...", loop_count);
+                    debug!("Hotkey listener alive - {} iterations", loop_count);
                     last_log = std::time::Instant::now();
                 }
 
                 // Use recv_timeout instead of blocking recv for better diagnostics
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
-                        info!("=== HOTKEY EVENT RECEIVED ===");
-                        info!("Event ID: {}, Expected ID: {}", event.id, hotkey_id);
-                        info!("Event state: {:?}", event.state);
-                        info!("IDs match: {}", event.id == hotkey_id);
+                        debug!("Hotkey event received: ID={}, state={:?}", event.id, event.state);
 
-                        if event.id != hotkey_id {
-                            warn!("Event ID {} does not match expected {}", event.id, hotkey_id);
-                            continue;
-                        }
-
-                        let now = Instant::now();
-                        match event.state {
-                            HotKeyState::Pressed => {
-                                info!("Event is PRESSED state");
-                                if now.duration_since(last_trigger) < min_press_gap {
-                                    debug!("Debounced hotkey press");
-                                    continue;
-                                }
-                                last_trigger = now;
-                                info!("Sending hotkey event...");
-                                match event_tx.send(event_to_send.clone()) {
-                                    Ok(_) => info!("Hotkey event sent successfully!"),
-                                    Err(e) => error!("FAILED to send hotkey event: {}", e),
-                                }
-                            }
-                            HotKeyState::Released => {
-                                if now.duration_since(last_trigger) > release_fallback_gap {
-                                    warn!("Released without recent press; treating as press");
-                                    last_trigger = now;
-                                    match event_tx.send(event_to_send.clone()) {
-                                        Ok(_) => info!("Hotkey event sent successfully!"),
-                                        Err(e) => error!("FAILED to send hotkey event: {}", e),
-                                    }
-                                } else {
-                                    debug!("Ignoring release state");
-                                }
+                        // Only trigger on key press, not release
+                        if event.state == HotKeyState::Pressed && event.id == hotkey_id {
+                            info!("Hotkey pressed, sending event...");
+                            if event_tx.send(AppEvent::HotkeyPressed).is_err() {
+                                info!("Event channel closed, shutting down hotkey listener");
+                                break;
                             }
                         }
                     }
@@ -129,16 +104,16 @@ impl HotkeyManager {
                         trace!("Receiver timeout (normal)");
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        error!("Hotkey receiver DISCONNECTED! Exiting thread.");
+                        info!("Hotkey receiver disconnected, exiting thread");
                         break;
                     }
                 }
             }
-            error!("Hotkey listener thread exiting!");
+            info!("Hotkey listener thread exited cleanly");
         });
 
         info!("=== HOTKEY INITIALIZATION COMPLETE ===");
-        Ok(Self { manager, hotkey })
+        Ok(Self { manager, hotkey, shutdown })
     }
 
     fn parse_hotkey(s: &str) -> Result<HotKey, Box<dyn std::error::Error>> {
@@ -265,8 +240,12 @@ impl HotkeyManager {
 
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
+        // Signal shutdown to listener thread
+        self.shutdown.store(true, Ordering::Relaxed);
+
         if let Err(e) = self.manager.unregister(self.hotkey) {
             error!("Failed to unregister hotkey: {}", e);
         }
+        info!("HotkeyManager dropped, shutdown signaled");
     }
 }
