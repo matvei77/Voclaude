@@ -183,7 +183,7 @@ impl App {
                 return Err(format!(
                     "Qwen backend preflight failed: {}. \
 Check config at %APPDATA%\\voclaude\\VoclaudeQwenRuntime\\config\\config.toml \
-for qwen_python_path, qwen_script_path, and CUDA availability.",
+for qwen_model_path and CUDA availability.",
                     err
                 )
                 .into());

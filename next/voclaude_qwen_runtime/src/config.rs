@@ -36,44 +36,18 @@ pub struct Config {
     #[serde(default = "default_use_gpu")]
     pub use_gpu: bool,
 
-    /// Optional path to python executable used for Qwen backend.
-    /// If empty, runtime attempts auto-discovery.
-    #[serde(default)]
-    pub qwen_python_path: Option<String>,
-
-    /// Optional path to transcribe.py (qwen smoke script).
-    /// If empty, runtime attempts auto-discovery.
-    #[serde(default)]
-    pub qwen_script_path: Option<String>,
-
-    /// Qwen model id.
+    /// Qwen model id (HuggingFace repo id).
     #[serde(default = "default_qwen_model")]
     pub qwen_model: String,
 
-    /// Torch dtype passed to qwen script.
-    #[serde(default = "default_qwen_dtype")]
-    pub qwen_dtype: String,
-
-    /// Device passed to qwen script.
-    /// Typical values: auto, cuda:0, cpu.
-    #[serde(default = "default_qwen_device")]
-    pub qwen_device: String,
+    /// Optional path to local safetensors model directory.
+    /// If not set, falls back to HF cache or downloads from HuggingFace.
+    #[serde(default)]
+    pub qwen_model_path: Option<String>,
 
     /// Max new tokens for model generation.
     #[serde(default = "default_qwen_max_new_tokens")]
     pub qwen_max_new_tokens: u32,
-
-    /// Manual chunk size in seconds (0 disables).
-    #[serde(default = "default_qwen_chunk_seconds")]
-    pub qwen_chunk_seconds: f32,
-
-    /// Chunk overlap in seconds.
-    #[serde(default = "default_qwen_chunk_overlap_seconds")]
-    pub qwen_chunk_overlap_seconds: f32,
-
-    /// Hard timeout for one transcription request.
-    #[serde(default = "default_qwen_timeout_seconds")]
-    pub qwen_timeout_seconds: u64,
 
     /// Fail request if CUDA is unavailable.
     #[serde(default = "default_qwen_require_gpu")]
@@ -92,16 +66,10 @@ impl Default for Config {
             show_notifications: true,
             history_max_entries: default_history_max_entries(),
             use_gpu: true,
-            qwen_python_path: None,
-            qwen_script_path: None,
             qwen_model: default_qwen_model(),
-            qwen_dtype: default_qwen_dtype(),
-            qwen_device: default_qwen_device(),
+            qwen_model_path: None,
             qwen_max_new_tokens: default_qwen_max_new_tokens(),
-            qwen_chunk_seconds: default_qwen_chunk_seconds(),
-            qwen_chunk_overlap_seconds: default_qwen_chunk_overlap_seconds(),
-            qwen_timeout_seconds: default_qwen_timeout_seconds(),
-            qwen_require_gpu: default_qwen_require_gpu(),
+            qwen_require_gpu: false,
         }
     }
 }
@@ -164,30 +132,10 @@ fn default_qwen_model() -> String {
     "Qwen/Qwen3-ASR-1.7B".to_string()
 }
 
-fn default_qwen_dtype() -> String {
-    "bfloat16".to_string()
-}
-
-fn default_qwen_device() -> String {
-    "cuda:0".to_string()
-}
-
 fn default_qwen_max_new_tokens() -> u32 {
     2048
 }
 
-fn default_qwen_chunk_seconds() -> f32 {
-    60.0
-}
-
-fn default_qwen_chunk_overlap_seconds() -> f32 {
-    2.0
-}
-
-fn default_qwen_timeout_seconds() -> u64 {
-    7200
-}
-
 fn default_qwen_require_gpu() -> bool {
-    true
+    false
 }

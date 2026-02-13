@@ -128,6 +128,7 @@ pub(crate) enum UiCommand {
 #[derive(Debug, Clone)]
 pub struct UiStatus {
     pub state: String,
+    #[allow(dead_code)]
     pub hotkey: String,
     pub use_gpu: bool,
     pub model: String,

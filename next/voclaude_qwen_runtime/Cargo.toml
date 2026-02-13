@@ -9,7 +9,6 @@ repository = "https://github.com/matvei77/Voclaude"
 [dependencies]
 # Audio capture
 cpal = "0.15"
-hound = "3.5"              # WAV encoding
 
 # Audio processing
 rubato = "0.15"            # High-quality resampling
@@ -33,17 +32,30 @@ crossbeam-channel = "0.5"  # Fast MPSC channels
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-tempfile = "3.14"
+# FFT for mel spectrogram
+realfft = "3.4"
+
+# ML inference (Candle)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+safetensors = "0.7"
+tokenizers = "0.22"
+hf-hub = "0.4"
+half = "2.4"
+num-traits = "0.2"
 
 # Windows message loop
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 notify-rust = "4.11"
 
 [features]
-default = []
+default = ["cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cpu = []
 
 [profile.release]
 lto = true

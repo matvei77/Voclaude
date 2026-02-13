@@ -1,5 +1,8 @@
 //! Speech-to-text inference backend.
 
+pub mod candle_audio;
+pub mod candle_backend;
+pub mod candle_tokenizer;
 mod qwen;
 
 pub use qwen::QwenEngine;
