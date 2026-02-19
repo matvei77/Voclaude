@@ -8,7 +8,7 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn, trace};
+use tracing::{debug, error, info, trace};
 
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
@@ -70,62 +70,44 @@ impl HotkeyManager {
             let mut loop_count: u64 = 0;
             let mut last_log = std::time::Instant::now();
             let mut last_trigger = Instant::now() - Duration::from_secs(1);
-            let min_press_gap = Duration::from_millis(100);
-            let release_fallback_gap = Duration::from_millis(300);
+            // On Windows, some key combos only fire Released (not Pressed).
+            // We accept whichever arrives first, then debounce the paired
+            // event so we don't double-fire. 150ms is enough to absorb the
+            // Press→Release pair without feeling sluggish.
+            let min_event_gap = Duration::from_millis(150);
 
             loop {
                 loop_count += 1;
 
-                // Log every 10 seconds to show the thread is alive
                 if last_log.elapsed() > Duration::from_secs(10) {
-                    info!("Hotkey listener alive - {} iterations, waiting for events...", loop_count);
+                    info!("Hotkey listener alive - {} iterations", loop_count);
                     last_log = std::time::Instant::now();
                 }
 
-                // Use recv_timeout instead of blocking recv for better diagnostics
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
-                        info!("=== HOTKEY EVENT RECEIVED ===");
-                        info!("Event ID: {}, Expected ID: {}", event.id, hotkey_id);
-                        info!("Event state: {:?}", event.state);
-                        info!("IDs match: {}", event.id == hotkey_id);
-
                         if event.id != hotkey_id {
-                            warn!("Event ID {} does not match expected {}", event.id, hotkey_id);
+                            debug!("Event ID {} != expected {}", event.id, hotkey_id);
                             continue;
                         }
 
                         let now = Instant::now();
-                        match event.state {
-                            HotKeyState::Pressed => {
-                                info!("Event is PRESSED state");
-                                if now.duration_since(last_trigger) < min_press_gap {
-                                    debug!("Debounced hotkey press");
-                                    continue;
-                                }
-                                last_trigger = now;
-                                info!("Sending hotkey event...");
-                                match event_tx.send(event_to_send.clone()) {
-                                    Ok(_) => info!("Hotkey event sent successfully!"),
-                                    Err(e) => error!("FAILED to send hotkey event: {}", e),
-                                }
-                            }
-                            HotKeyState::Released => {
-                                if now.duration_since(last_trigger) > release_fallback_gap {
-                                    warn!("Released without recent press; treating as press");
-                                    last_trigger = now;
-                                    match event_tx.send(event_to_send.clone()) {
-                                        Ok(_) => info!("Hotkey event sent successfully!"),
-                                        Err(e) => error!("FAILED to send hotkey event: {}", e),
-                                    }
-                                } else {
-                                    debug!("Ignoring release state");
-                                }
-                            }
+                        let gap = now.duration_since(last_trigger);
+
+                        if gap < min_event_gap {
+                            debug!("Debounced {:?} ({}ms since last)",
+                                   event.state, gap.as_millis());
+                            continue;
+                        }
+
+                        last_trigger = now;
+                        info!("Hotkey fired ({:?})", event.state);
+                        match event_tx.send(event_to_send.clone()) {
+                            Ok(_) => info!("Hotkey event sent"),
+                            Err(e) => error!("FAILED to send hotkey event: {}", e),
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Normal timeout, continue loop
                         trace!("Receiver timeout (normal)");
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {

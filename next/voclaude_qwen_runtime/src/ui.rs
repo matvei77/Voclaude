@@ -1,8 +1,8 @@
 //! History window, HUD overlay, and log buffer.
 //!
-//! The main window serves dual purpose: as a History window (normal size, decorated)
-//! and as a HUD overlay (small, undecorated, positioned at top of screen). A keepalive
-//! thread ensures update() runs regularly even when the window is off-screen.
+//! Uses egui's multi-viewport support: the root viewport stays off-screen
+//! while HUD and History are spawned as separate OS windows via
+//! `show_viewport_deferred()`.
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
@@ -107,15 +107,10 @@ impl Write for LogBufferWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Unified command enum
+// Command enum (HUD-only; history/status use shared state directly)
 // ---------------------------------------------------------------------------
 
 pub(crate) enum UiCommand {
-    Toggle,
-    Show,
-    Hide,
-    AddHistory(String),
-    SetStatus(UiStatus),
     HudSetState(HudState),
     HudSetAccel(bool),
     HudSetLevel(f32),
@@ -168,10 +163,62 @@ pub enum HudState {
 }
 
 // ---------------------------------------------------------------------------
+// Shared state for multi-viewport
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct SharedUiState {
+    // HUD
+    hud_visible: Arc<AtomicBool>,
+    hud_state: Arc<Mutex<HudState>>,
+    hud_gpu_enabled: Arc<AtomicBool>,
+    hud_input_level: Arc<Mutex<f32>>,
+    hud_recording_started_at: Arc<Mutex<Option<Instant>>>,
+    hud_ready_until: Arc<Mutex<Option<Instant>>>,
+
+    // History
+    history_visible: Arc<AtomicBool>,
+    history: Arc<Mutex<VecDeque<String>>>,
+    filter: Arc<Mutex<String>>,
+    show_logs: Arc<AtomicBool>,
+
+    // Shared
+    status: Arc<Mutex<UiStatus>>,
+    log_buffer: LogBuffer,
+}
+
+impl SharedUiState {
+    fn new(log_buffer: LogBuffer, gpu_enabled: bool) -> Self {
+        Self {
+            hud_visible: Arc::new(AtomicBool::new(false)),
+            hud_state: Arc::new(Mutex::new(HudState::Idle)),
+            hud_gpu_enabled: Arc::new(AtomicBool::new(gpu_enabled)),
+            hud_input_level: Arc::new(Mutex::new(0.0)),
+            hud_recording_started_at: Arc::new(Mutex::new(None)),
+            hud_ready_until: Arc::new(Mutex::new(None)),
+
+            history_visible: Arc::new(AtomicBool::new(false)),
+            history: Arc::new(Mutex::new(VecDeque::new())),
+            filter: Arc::new(Mutex::new(String::new())),
+            show_logs: Arc::new(AtomicBool::new(false)),
+
+            status: Arc::new(Mutex::new(UiStatus::new(
+                String::new(),
+                false,
+                "qwen3-asr".to_string(),
+                None,
+            ))),
+            log_buffer,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UiManager
 // ---------------------------------------------------------------------------
 
 pub struct UiManager {
+    shared: SharedUiState,
     command_tx: Sender<UiCommand>,
     alive: Arc<AtomicBool>,
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
@@ -180,22 +227,21 @@ pub struct UiManager {
 impl UiManager {
     pub fn new(log_buffer: LogBuffer, gpu_enabled: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let (command_tx, command_rx) = unbounded();
-        let app = CombinedApp::new(command_rx, log_buffer, gpu_enabled);
+        let shared = SharedUiState::new(log_buffer, gpu_enabled);
+        let app = RootApp::new(command_rx, shared.clone());
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = alive.clone();
         let repaint_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
         let repaint_ctx_cc = repaint_ctx.clone();
-        let alive_keepalive = alive.clone();
 
         std::thread::spawn(move || {
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
                     .with_title("Voclaude")
-                    .with_inner_size([340.0, 72.0])
+                    .with_inner_size([1.0, 1.0])
                     .with_visible(true)
                     .with_position(egui::pos2(-32000.0, -32000.0))
                     .with_decorations(false)
-                    .with_always_on_top()
                     .with_taskbar(false),
                 #[cfg(target_os = "windows")]
                 event_loop_builder: Some(Box::new(|builder| {
@@ -211,16 +257,6 @@ impl UiManager {
                     if let Ok(mut guard) = repaint_ctx_cc.lock() {
                         *guard = Some(cc.egui_ctx.clone());
                     }
-                    let keepalive_ctx = cc.egui_ctx.clone();
-                    std::thread::spawn(move || {
-                        loop {
-                            std::thread::sleep(Duration::from_millis(100));
-                            if !alive_keepalive.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            keepalive_ctx.request_repaint();
-                        }
-                    });
                     Box::new(app)
                 }),
             ) {
@@ -230,8 +266,7 @@ impl UiManager {
         });
 
         info!("UI thread started");
-        let _ = command_tx.send(UiCommand::Hide);
-        Ok(Self { command_tx, alive, repaint_ctx })
+        Ok(Self { shared, command_tx, alive, repaint_ctx })
     }
 
     fn wake(&self) {
@@ -247,10 +282,8 @@ impl UiManager {
             error!("UI is not running");
             return false;
         }
-        if let Err(err) = self.command_tx.send(UiCommand::Toggle) {
-            error!("Failed to send toggle command: {}", err);
-            return false;
-        }
+        let prev = self.shared.history_visible.load(Ordering::Relaxed);
+        self.shared.history_visible.store(!prev, Ordering::Relaxed);
         self.wake();
         true
     }
@@ -260,24 +293,38 @@ impl UiManager {
             error!("UI is not running");
             return false;
         }
-        if let Err(err) = self.command_tx.send(UiCommand::Show) {
-            error!("Failed to send show command: {}", err);
-            return false;
-        }
+        self.shared.history_visible.store(true, Ordering::Relaxed);
         self.wake();
         true
     }
 
     pub fn push_history(&self, text: String) {
-        if let Err(err) = self.command_tx.send(UiCommand::AddHistory(text)) {
-            error!("Failed to send history entry: {}", err);
+        if let Ok(mut history) = self.shared.history.lock() {
+            if !text.trim().is_empty() {
+                history.push_front(text);
+                if history.len() > 500 {
+                    history.pop_back();
+                }
+            }
+        }
+        self.wake();
+    }
+
+    pub fn reload_history(&self, entries: Vec<String>) {
+        if let Ok(mut history) = self.shared.history.lock() {
+            history.clear();
+            for entry in entries {
+                if !entry.trim().is_empty() {
+                    history.push_back(entry);
+                }
+            }
         }
         self.wake();
     }
 
     pub fn set_status(&self, status: UiStatus) {
-        if let Err(err) = self.command_tx.send(UiCommand::SetStatus(status)) {
-            error!("Failed to send status update: {}", err);
+        if let Ok(mut s) = self.shared.status.lock() {
+            *s = status;
         }
         self.wake();
     }
@@ -342,576 +389,587 @@ impl HudManager {
 }
 
 // ---------------------------------------------------------------------------
-// Window modes
+// Root app (off-screen, spawns child viewports)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowMode {
-    Hidden,
-    Hud,
-    History,
-}
-
-// ---------------------------------------------------------------------------
-// Combined app
-// ---------------------------------------------------------------------------
-
-struct CombinedApp {
+struct RootApp {
+    shared: SharedUiState,
     command_rx: Receiver<UiCommand>,
-
-    // History state
-    history: VecDeque<String>,
-    log_buffer: LogBuffer,
-    history_visible: bool,
-    filter: String,
-    show_logs: bool,
-    status: UiStatus,
-
-    // HUD state
-    hud_state: HudState,
-    hud_visible: bool,
-    hud_recording_started_at: Option<Instant>,
-    hud_ready_until: Option<Instant>,
-    hud_gpu_enabled: bool,
-    hud_input_level: f32,
-
-    // Window management
-    window_mode: WindowMode,
     theme_applied: bool,
 }
 
-impl CombinedApp {
-    fn new(command_rx: Receiver<UiCommand>, log_buffer: LogBuffer, gpu_enabled: bool) -> Self {
+impl RootApp {
+    fn new(command_rx: Receiver<UiCommand>, shared: SharedUiState) -> Self {
         Self {
+            shared,
             command_rx,
-
-            history: VecDeque::new(),
-            log_buffer,
-            history_visible: false,
-            filter: String::new(),
-            show_logs: false,
-            status: UiStatus::new(String::new(), false, "qwen3-asr".to_string(), None),
-
-            hud_state: HudState::Idle,
-            hud_visible: false,
-            hud_recording_started_at: None,
-            hud_ready_until: None,
-            hud_gpu_enabled: gpu_enabled,
-            hud_input_level: 0.0,
-
-            window_mode: WindowMode::Hidden,
             theme_applied: false,
         }
     }
 
-    fn apply_commands(&mut self) {
+    fn apply_commands(&self) {
         while let Ok(cmd) = self.command_rx.try_recv() {
             match cmd {
-                UiCommand::Toggle => {
-                    self.history_visible = !self.history_visible;
-                }
-                UiCommand::Show => {
-                    self.history_visible = true;
-                }
-                UiCommand::Hide => {
-                    self.history_visible = false;
-                }
-                UiCommand::AddHistory(entry) => {
-                    if !entry.trim().is_empty() {
-                        self.history.push_front(entry);
-                        if self.history.len() > 500 {
-                            self.history.pop_back();
-                        }
-                    }
-                }
-                UiCommand::SetStatus(status) => {
-                    self.status = status;
-                }
                 UiCommand::HudSetState(state) => {
-                    self.hud_state = state;
-                    match &self.hud_state {
+                    match &state {
                         HudState::Idle => {
-                            self.hud_visible = false;
-                            self.hud_recording_started_at = None;
-                            self.hud_ready_until = None;
+                            self.shared.hud_visible.store(false, Ordering::Relaxed);
+                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
+                                *s = None;
+                            }
+                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
+                                *s = None;
+                            }
                         }
                         HudState::Recording => {
-                            if self.hud_recording_started_at.is_none() {
-                                self.hud_recording_started_at = Some(Instant::now());
+                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
+                                if s.is_none() {
+                                    *s = Some(Instant::now());
+                                }
                             }
-                            self.hud_visible = true;
-                            self.hud_ready_until = None;
+                            self.shared.hud_visible.store(true, Ordering::Relaxed);
+                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
+                                *s = None;
+                            }
                         }
                         HudState::Transcribing { .. } => {
-                            self.hud_visible = true;
-                            self.hud_recording_started_at = None;
-                            self.hud_ready_until = None;
+                            self.shared.hud_visible.store(true, Ordering::Relaxed);
+                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
+                                *s = None;
+                            }
+                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
+                                *s = None;
+                            }
                         }
                         HudState::Ready { .. } => {
-                            self.hud_visible = true;
-                            self.hud_recording_started_at = None;
-                            self.hud_ready_until = Some(Instant::now() + Duration::from_secs(3));
+                            self.shared.hud_visible.store(true, Ordering::Relaxed);
+                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
+                                *s = None;
+                            }
+                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
+                                *s = Some(Instant::now() + Duration::from_secs(3));
+                            }
                         }
+                    }
+                    if let Ok(mut s) = self.shared.hud_state.lock() {
+                        *s = state;
                     }
                 }
                 UiCommand::HudSetAccel(gpu_enabled) => {
-                    self.hud_gpu_enabled = gpu_enabled;
+                    self.shared.hud_gpu_enabled.store(gpu_enabled, Ordering::Relaxed);
                 }
                 UiCommand::HudSetLevel(level) => {
-                    self.hud_input_level = level.clamp(0.0, 1.0);
+                    if let Ok(mut s) = self.shared.hud_input_level.lock() {
+                        *s = level.clamp(0.0, 1.0);
+                    }
                 }
             }
         }
     }
 
-    fn tick_hud_timers(&mut self) {
-        if let Some(ready_until) = self.hud_ready_until {
+    fn tick_hud_timers(&self) {
+        let ready_until = self.shared.hud_ready_until.lock().ok().and_then(|g| *g);
+        if let Some(ready_until) = ready_until {
             if Instant::now() >= ready_until {
-                self.hud_state = HudState::Idle;
-                self.hud_visible = false;
-                self.hud_ready_until = None;
+                if let Ok(mut s) = self.shared.hud_state.lock() {
+                    *s = HudState::Idle;
+                }
+                self.shared.hud_visible.store(false, Ordering::Relaxed);
+                if let Ok(mut s) = self.shared.hud_ready_until.lock() {
+                    *s = None;
+                }
             }
         }
-    }
-
-    fn transition_window(&self, ctx: &egui::Context, target: WindowMode) {
-        info!("[UI] Window mode: {:?} -> {:?}", self.window_mode, target);
-        match target {
-            WindowMode::Hidden => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                    egui::pos2(-32000.0, -32000.0),
-                ));
-            }
-            WindowMode::Hud => {
-                let monitor = get_primary_screen_size();
-                let hud_w = 340.0_f32;
-                let hud_h = 72.0_f32;
-                let x = monitor.x - hud_w - 20.0;
-                let y = 24.0;
-
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title("Voclaude".to_string()));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(hud_w, hud_h)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-            WindowMode::History => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                    "Voclaude History".to_string(),
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(560.0, 520.0)));
-                if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
-                    ctx.send_viewport_cmd(cmd);
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
-    }
-
-    fn render_hud_panel(&self, ctx: &egui::Context) {
-        let bg = egui::Color32::from_rgb(18, 18, 28);
-
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(bg)
-                    .inner_margin(egui::Margin::same(10.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    match &self.hud_state {
-                        HudState::Recording => {
-                            // Pulsing red dot
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(14.0, 14.0),
-                                egui::Sense::hover(),
-                            );
-                            let t = ui.input(|i| i.time);
-                            let pulse = (t * 3.0).sin() as f32 * 0.3 + 0.7;
-                            ui.painter().circle_filled(
-                                dot_rect.center(),
-                                5.0,
-                                egui::Color32::from_rgb(
-                                    (255.0 * pulse) as u8,
-                                    50,
-                                    50,
-                                ),
-                            );
-
-                            let elapsed = self
-                                .hud_recording_started_at
-                                .map(|s| s.elapsed())
-                                .unwrap_or_default();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Recording  {}",
-                                    format_duration(elapsed)
-                                ))
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(230, 230, 230)),
-                            );
-                        }
-                        HudState::Transcribing { message, percent } => {
-                            ui.add(egui::Spinner::new().size(14.0));
-                            let text = match percent {
-                                Some(p) => format!("{} ({}%)", message, p),
-                                None => message.clone(),
-                            };
-                            ui.label(
-                                egui::RichText::new(text)
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(180, 180, 230)),
-                            );
-                        }
-                        HudState::Ready { message } => {
-                            let (dot_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(14.0, 14.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle_filled(
-                                dot_rect.center(),
-                                5.0,
-                                egui::Color32::from_rgb(78, 204, 163),
-                            );
-                            ui.label(
-                                egui::RichText::new(message)
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(180, 230, 200)),
-                            );
-                        }
-                        HudState::Idle => {}
-                    }
-
-                    // GPU/CPU badge on right
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let (text, color) = if self.hud_gpu_enabled {
-                                ("GPU", egui::Color32::from_rgb(78, 204, 163))
-                            } else {
-                                ("CPU", egui::Color32::from_rgb(130, 170, 230))
-                            };
-                            let badge_bg = egui::Color32::from_rgba_unmultiplied(
-                                color.r() / 4,
-                                color.g() / 4,
-                                color.b() / 4,
-                                180,
-                            );
-                            egui::Frame::none()
-                                .fill(badge_bg)
-                                .rounding(egui::Rounding::same(4.0))
-                                .inner_margin(egui::Margin {
-                                    left: 6.0,
-                                    right: 6.0,
-                                    top: 2.0,
-                                    bottom: 2.0,
-                                })
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(text)
-                                            .size(11.0)
-                                            .color(color)
-                                            .strong(),
-                                    );
-                                });
-                        },
-                    );
-                });
-
-                if matches!(self.hud_state, HudState::Recording) {
-                    ui.add_space(6.0);
-                    draw_level_bar(ui, self.hud_input_level, ui.available_width(), 6.0);
-                }
-            });
-
-        ctx.request_repaint_after(Duration::from_millis(100));
-    }
-
-    fn render_history(&mut self, ctx: &egui::Context) {
-        // Top panel: header
-        egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(24, 24, 36))
-                    .inner_margin(egui::Margin {
-                        left: 12.0,
-                        right: 12.0,
-                        top: 8.0,
-                        bottom: 8.0,
-                    }),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Voclaude").size(18.0).strong());
-                    ui.add_space(8.0);
-
-                    // State indicator
-                    let (state_text, state_color) = match self.status.state.as_str() {
-                        "Recording" => ("Recording", egui::Color32::from_rgb(240, 70, 70)),
-                        "Transcribing" => {
-                            ("Transcribing", egui::Color32::from_rgb(220, 180, 60))
-                        }
-                        _ => ("Idle", egui::Color32::from_rgb(78, 204, 163)),
-                    };
-                    let (dot_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(10.0, 10.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter()
-                        .circle_filled(dot_rect.center(), 4.0, state_color);
-                    ui.label(
-                        egui::RichText::new(state_text)
-                            .size(12.0)
-                            .color(state_color),
-                    );
-
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button("Hide").clicked() {
-                                self.history_visible = false;
-                            }
-                            ui.checkbox(&mut self.show_logs, "Log");
-                        },
-                    );
-                });
-            });
-
-        // Bottom panel: status bar
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(24, 24, 36))
-                    .inner_margin(egui::Margin {
-                        left: 12.0,
-                        right: 12.0,
-                        top: 6.0,
-                        bottom: 6.0,
-                    }),
-            )
-            .show(ctx, |ui| {
-                // Mic level bar
-                if let Some(level) = self.status.input_level {
-                    draw_level_bar(ui, level, ui.available_width(), 4.0);
-                    ui.add_space(4.0);
-                }
-
-                ui.horizontal(|ui| {
-                    // GPU/CPU badge
-                    let (accel, color) = if self.status.use_gpu {
-                        ("GPU", egui::Color32::from_rgb(78, 204, 163))
-                    } else {
-                        ("CPU", egui::Color32::from_rgb(130, 170, 230))
-                    };
-                    let badge_bg = egui::Color32::from_rgba_unmultiplied(
-                        color.r() / 4,
-                        color.g() / 4,
-                        color.b() / 4,
-                        180,
-                    );
-                    egui::Frame::none()
-                        .fill(badge_bg)
-                        .rounding(egui::Rounding::same(3.0))
-                        .inner_margin(egui::Margin {
-                            left: 5.0,
-                            right: 5.0,
-                            top: 1.0,
-                            bottom: 1.0,
-                        })
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(accel)
-                                    .size(10.0)
-                                    .color(color)
-                                    .strong(),
-                            );
-                        });
-
-                    ui.separator();
-
-                    if !self.status.model.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.status.model)
-                                .size(11.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.separator();
-                    }
-
-                    ui.label(
-                        egui::RichText::new(format!("#{}", self.status.history_count))
-                            .size(11.0)
-                            .color(egui::Color32::GRAY),
-                    );
-
-                    if let Some(speed) = self.status.last_speed {
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("{:.1}x", speed))
-                                .size(11.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                    if let Some(ms) = self.status.last_duration_ms {
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format_duration_ms(ms))
-                                .size(11.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-
-                    if let Some(device) = &self.status.input_device {
-                        if !device.is_empty() {
-                            ui.separator();
-                            let short = if device.len() > 25 {
-                                &device[..25]
-                            } else {
-                                device
-                            };
-                            ui.label(
-                                egui::RichText::new(short)
-                                    .size(10.0)
-                                    .color(egui::Color32::from_gray(100)),
-                            );
-                        }
-                    }
-                });
-
-                if let Some(msg) = &self.status.last_message {
-                    if !msg.is_empty() {
-                        ui.label(
-                            egui::RichText::new(msg)
-                                .size(11.0)
-                                .color(egui::Color32::from_gray(160)),
-                        );
-                    }
-                }
-            });
-
-        // Central panel: search + history entries + logs
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Search:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .desired_width(ui.available_width() - 60.0),
-                );
-                if ui.button("Clear").clicked() {
-                    self.filter.clear();
-                }
-            });
-            ui.add_space(4.0);
-
-            let available = ui.available_height();
-            let log_height = if self.show_logs { 150.0 } else { 0.0 };
-            let history_height = (available - log_height - 8.0).max(100.0);
-
-            egui::ScrollArea::vertical()
-                .max_height(history_height)
-                .show(ui, |ui| {
-                    if self.history.is_empty() {
-                        ui.add_space(40.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("No transcriptions yet")
-                                    .size(14.0)
-                                    .color(egui::Color32::from_gray(100)),
-                            );
-                        });
-                    } else {
-                        let filter = self.filter.trim().to_lowercase();
-                        for entry in &self.history {
-                            if !filter.is_empty()
-                                && !entry.to_lowercase().contains(&filter)
-                            {
-                                continue;
-                            }
-                            egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(28, 28, 40))
-                                .rounding(egui::Rounding::same(4.0))
-                                .inner_margin(egui::Margin::same(8.0))
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    egui::Color32::from_rgb(40, 40, 55),
-                                ))
-                                .show(ui, |ui| {
-                                    ui.add(egui::Label::new(entry.as_str()).wrap(true));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Min),
-                                        |ui| {
-                                            if ui.small_button("Copy").clicked() {
-                                                if let Ok(mut clipboard) =
-                                                    arboard::Clipboard::new()
-                                                {
-                                                    let _ = clipboard.set_text(entry);
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                            ui.add_space(3.0);
-                        }
-                    }
-                });
-
-            if self.show_logs {
-                ui.add_space(4.0);
-                ui.separator();
-                ui.label(egui::RichText::new("Log").size(12.0).strong());
-                let log_lines = self.log_buffer.snapshot();
-                egui::ScrollArea::vertical()
-                    .max_height(log_height)
-                    .stick_to_bottom(true)
-                    .id_source("log_scroll")
-                    .show(ui, |ui| {
-                        for line in &log_lines {
-                            ui.monospace(egui::RichText::new(line.as_str()).size(10.0));
-                        }
-                    });
-            }
-        });
     }
 }
 
-impl eframe::App for CombinedApp {
+impl eframe::App for RootApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.theme_applied {
             apply_theme(ctx);
             self.theme_applied = true;
         }
 
-        // Intercept close: hide instead of quitting
+        // Root viewport must never die
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.history_visible = false;
         }
 
         self.apply_commands();
         self.tick_hud_timers();
 
-        // Determine target window mode
-        let target_mode = if self.history_visible {
-            WindowMode::History
-        } else if self.hud_visible {
-            WindowMode::Hud
-        } else {
-            WindowMode::Hidden
-        };
+        // Spawn HUD child viewport when visible
+        if self.shared.hud_visible.load(Ordering::Relaxed) {
+            let monitor = get_primary_screen_size();
+            let hud_w = 340.0_f32;
+            let hud_h = 72.0_f32;
+            let x = monitor.x - hud_w - 20.0;
+            let y = 24.0;
 
-        if target_mode != self.window_mode {
-            self.transition_window(ctx, target_mode);
-            self.window_mode = target_mode;
+            let shared = self.shared.clone();
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of("voclaude_hud"),
+                egui::ViewportBuilder::default()
+                    .with_title("Voclaude HUD")
+                    .with_inner_size([hud_w, hud_h])
+                    .with_position(egui::pos2(x, y))
+                    .with_decorations(false)
+                    .with_always_on_top()
+                    .with_taskbar(false),
+                move |ctx, _class| {
+                    render_hud(ctx, &shared);
+                },
+            );
+
+            // Keep root repainting to tick HUD timers
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        match self.window_mode {
-            WindowMode::Hidden => {}
-            WindowMode::Hud => self.render_hud_panel(ctx),
-            WindowMode::History => self.render_history(ctx),
+        // Spawn History child viewport when visible
+        if self.shared.history_visible.load(Ordering::Relaxed) {
+            let shared = self.shared.clone();
+            let monitor = get_primary_screen_size();
+            let win_w = 560.0_f32;
+            let win_h = 520.0_f32;
+            let x = (monitor.x - win_w) / 2.0;
+            let y = (monitor.y - win_h) / 2.0;
+
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of("voclaude_history"),
+                egui::ViewportBuilder::default()
+                    .with_title("Voclaude History")
+                    .with_inner_size([win_w, win_h])
+                    .with_position(egui::pos2(x, y))
+                    .with_decorations(true)
+                    .with_resizable(true),
+                move |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        shared.history_visible.store(false, Ordering::Relaxed);
+                    }
+                    render_history(ctx, &shared);
+                },
+            );
         }
+
+        // Root must have a CentralPanel (egui requirement)
+        egui::CentralPanel::default().show(ctx, |_ui| {});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport renderers
+// ---------------------------------------------------------------------------
+
+fn render_hud(ctx: &egui::Context, shared: &SharedUiState) {
+    let hud_state = shared
+        .hud_state
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or(HudState::Idle);
+    let gpu_enabled = shared.hud_gpu_enabled.load(Ordering::Relaxed);
+    let input_level = shared
+        .hud_input_level
+        .lock()
+        .ok()
+        .map(|g| *g)
+        .unwrap_or(0.0);
+    let recording_started_at = shared
+        .hud_recording_started_at
+        .lock()
+        .ok()
+        .and_then(|g| *g);
+
+    let bg = egui::Color32::from_rgb(18, 18, 28);
+
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(bg)
+                .inner_margin(egui::Margin::same(10.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                match &hud_state {
+                    HudState::Recording => {
+                        // Pulsing red dot
+                        let (dot_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(14.0, 14.0),
+                            egui::Sense::hover(),
+                        );
+                        let t = ui.input(|i| i.time);
+                        let pulse = (t * 3.0).sin() as f32 * 0.3 + 0.7;
+                        ui.painter().circle_filled(
+                            dot_rect.center(),
+                            5.0,
+                            egui::Color32::from_rgb(
+                                (255.0 * pulse) as u8,
+                                50,
+                                50,
+                            ),
+                        );
+
+                        let elapsed = recording_started_at
+                            .map(|s| s.elapsed())
+                            .unwrap_or_default();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Recording  {}",
+                                format_duration(elapsed)
+                            ))
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(230, 230, 230)),
+                        );
+                    }
+                    HudState::Transcribing { message, percent } => {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        let text = match percent {
+                            Some(p) => format!("{} ({}%)", message, p),
+                            None => message.clone(),
+                        };
+                        ui.label(
+                            egui::RichText::new(text)
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(180, 180, 230)),
+                        );
+                    }
+                    HudState::Ready { message } => {
+                        let (dot_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(14.0, 14.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(
+                            dot_rect.center(),
+                            5.0,
+                            egui::Color32::from_rgb(78, 204, 163),
+                        );
+                        ui.label(
+                            egui::RichText::new(message)
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(180, 230, 200)),
+                        );
+                    }
+                    HudState::Idle => {}
+                }
+
+                // GPU/CPU badge on right
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let (text, color) = if gpu_enabled {
+                            ("GPU", egui::Color32::from_rgb(78, 204, 163))
+                        } else {
+                            ("CPU", egui::Color32::from_rgb(130, 170, 230))
+                        };
+                        let badge_bg = egui::Color32::from_rgba_unmultiplied(
+                            color.r() / 4,
+                            color.g() / 4,
+                            color.b() / 4,
+                            180,
+                        );
+                        egui::Frame::none()
+                            .fill(badge_bg)
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin {
+                                left: 6.0,
+                                right: 6.0,
+                                top: 2.0,
+                                bottom: 2.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .size(11.0)
+                                        .color(color)
+                                        .strong(),
+                                );
+                            });
+                    },
+                );
+            });
+
+            if matches!(hud_state, HudState::Recording) {
+                ui.add_space(6.0);
+                draw_level_bar(ui, input_level, ui.available_width(), 6.0);
+            }
+        });
+
+    ctx.request_repaint_after(Duration::from_millis(100));
+}
+
+fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
+    let status = shared
+        .status
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_else(|| UiStatus::new(String::new(), false, String::new(), None));
+
+    // Top panel: header
+    egui::TopBottomPanel::top("header")
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(24, 24, 36))
+                .inner_margin(egui::Margin {
+                    left: 12.0,
+                    right: 12.0,
+                    top: 8.0,
+                    bottom: 8.0,
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Voclaude").size(18.0).strong());
+                ui.add_space(8.0);
+
+                // State indicator
+                let (state_text, state_color) = match status.state.as_str() {
+                    "Recording" => ("Recording", egui::Color32::from_rgb(240, 70, 70)),
+                    "Transcribing" => {
+                        ("Transcribing", egui::Color32::from_rgb(220, 180, 60))
+                    }
+                    _ => ("Idle", egui::Color32::from_rgb(78, 204, 163)),
+                };
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(10.0, 10.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, state_color);
+                ui.label(
+                    egui::RichText::new(state_text)
+                        .size(12.0)
+                        .color(state_color),
+                );
+
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui.button("Hide").clicked() {
+                            shared.history_visible.store(false, Ordering::Relaxed);
+                        }
+                        let mut show_logs = shared.show_logs.load(Ordering::Relaxed);
+                        ui.checkbox(&mut show_logs, "Log");
+                        shared.show_logs.store(show_logs, Ordering::Relaxed);
+                    },
+                );
+            });
+        });
+
+    // Bottom panel: status bar
+    egui::TopBottomPanel::bottom("status_bar")
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(24, 24, 36))
+                .inner_margin(egui::Margin {
+                    left: 12.0,
+                    right: 12.0,
+                    top: 6.0,
+                    bottom: 6.0,
+                }),
+        )
+        .show(ctx, |ui| {
+            // Mic level bar
+            if let Some(level) = status.input_level {
+                draw_level_bar(ui, level, ui.available_width(), 4.0);
+                ui.add_space(4.0);
+            }
+
+            ui.horizontal(|ui| {
+                // GPU/CPU badge
+                let (accel, color) = if status.use_gpu {
+                    ("GPU", egui::Color32::from_rgb(78, 204, 163))
+                } else {
+                    ("CPU", egui::Color32::from_rgb(130, 170, 230))
+                };
+                let badge_bg = egui::Color32::from_rgba_unmultiplied(
+                    color.r() / 4,
+                    color.g() / 4,
+                    color.b() / 4,
+                    180,
+                );
+                egui::Frame::none()
+                    .fill(badge_bg)
+                    .rounding(egui::Rounding::same(3.0))
+                    .inner_margin(egui::Margin {
+                        left: 5.0,
+                        right: 5.0,
+                        top: 1.0,
+                        bottom: 1.0,
+                    })
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(accel)
+                                .size(10.0)
+                                .color(color)
+                                .strong(),
+                        );
+                    });
+
+                ui.separator();
+
+                if !status.model.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&status.model)
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.separator();
+                }
+
+                ui.label(
+                    egui::RichText::new(format!("#{}", status.history_count))
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+
+                if let Some(speed) = status.last_speed {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{:.1}x", speed))
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                if let Some(ms) = status.last_duration_ms {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format_duration_ms(ms))
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+
+                if let Some(device) = &status.input_device {
+                    if !device.is_empty() {
+                        ui.separator();
+                        let short = if device.len() > 25 {
+                            &device[..25]
+                        } else {
+                            device
+                        };
+                        ui.label(
+                            egui::RichText::new(short)
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(100)),
+                        );
+                    }
+                }
+            });
+
+            if let Some(msg) = &status.last_message {
+                if !msg.is_empty() {
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                }
+            }
+        });
+
+    // Central panel: search + history entries + logs
+    let show_logs = shared.show_logs.load(Ordering::Relaxed);
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        // Filter text input
+        {
+            let mut filter_guard = shared.filter.lock().unwrap_or_else(|e| e.into_inner());
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut *filter_guard)
+                        .desired_width(ui.available_width() - 60.0),
+                );
+                if ui.button("Clear").clicked() {
+                    filter_guard.clear();
+                }
+            });
+        }
+        ui.add_space(4.0);
+
+        // Snapshot data for rendering (avoids holding locks during layout)
+        let filter_lower = shared
+            .filter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim()
+            .to_lowercase();
+        let history: Vec<String> = shared
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+
+        let available = ui.available_height();
+        let log_height = if show_logs { 150.0 } else { 0.0 };
+        let history_height = (available - log_height - 8.0).max(100.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(history_height)
+            .show(ui, |ui| {
+                if history.is_empty() {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("No transcriptions yet")
+                                .size(14.0)
+                                .color(egui::Color32::from_gray(100)),
+                        );
+                    });
+                } else {
+                    for entry in &history {
+                        if !filter_lower.is_empty()
+                            && !entry.to_lowercase().contains(&filter_lower)
+                        {
+                            continue;
+                        }
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(28, 28, 40))
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin::same(8.0))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgb(40, 40, 55),
+                            ))
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(entry.as_str()).wrap(true));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Min),
+                                    |ui| {
+                                        if ui.small_button("Copy").clicked() {
+                                            if let Ok(mut clipboard) =
+                                                arboard::Clipboard::new()
+                                            {
+                                                let _ = clipboard.set_text(entry);
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        ui.add_space(3.0);
+                    }
+                }
+            });
+
+        if show_logs {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Log").size(12.0).strong());
+            let log_lines = shared.log_buffer.snapshot();
+            egui::ScrollArea::vertical()
+                .max_height(log_height)
+                .stick_to_bottom(true)
+                .id_source("log_scroll")
+                .show(ui, |ui| {
+                    for line in &log_lines {
+                        ui.monospace(egui::RichText::new(line.as_str()).size(10.0));
+                    }
+                });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------

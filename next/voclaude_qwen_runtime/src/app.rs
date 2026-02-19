@@ -196,7 +196,7 @@ for qwen_model_path and CUDA availability.",
         info!("Qwen backend preflight passed");
 
         // Initialize inference worker (lazy - loads model on demand)
-        let inference_tx = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+        let (inference_tx, inference_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
         info!("Inference worker ready (model will load on first use)");
 
         // Clipboard
@@ -651,21 +651,29 @@ for qwen_model_path and CUDA availability.",
                             self.ui.set_status(ui_status.clone());
                         }
                         AppEvent::ToggleHistoryWindow => {
+                            // Reload history from disk before showing so entries
+                            // are always fresh, even across hide/show cycles.
+                            let entries: Vec<String> = history
+                                .entries()
+                                .iter()
+                                .map(|e| e.text.clone())
+                                .collect();
+                            self.ui.reload_history(entries);
                             if !self.ui.toggle() {
+                                warn!("History window toggle failed (UI thread may have exited)");
                                 notifications.notify("History window is unavailable");
-                                if let Ok(new_ui) = UiManager::new(self.log_buffer.clone(), self.config.use_gpu) {
-                                    self.ui = new_ui;
-                                    let _ = self.ui.toggle();
-                                }
                             }
                         }
                         AppEvent::ShowHistoryWindow => {
+                            let entries: Vec<String> = history
+                                .entries()
+                                .iter()
+                                .map(|e| e.text.clone())
+                                .collect();
+                            self.ui.reload_history(entries);
                             if !self.ui.show() {
+                                warn!("History window show failed (UI thread may have exited)");
                                 notifications.notify("History window is unavailable");
-                                if let Ok(new_ui) = UiManager::new(self.log_buffer.clone(), self.config.use_gpu) {
-                                    self.ui = new_ui;
-                                    let _ = self.ui.show();
-                                }
                             }
                         }
                         AppEvent::OpenLastTranscript => {
@@ -717,17 +725,22 @@ for qwen_model_path and CUDA availability.",
         }
 
         let _ = inference_tx.send(InferenceCommand::Shutdown);
-        info!("Shutting down...");
+        drop(inference_tx); // Close channel so worker exits iter() loop
+        info!("Waiting for inference worker to shut down...");
+        if let Err(e) = inference_handle.join() {
+            error!("Inference worker thread panicked: {:?}", e);
+        }
+        info!("Shutdown complete.");
         Ok(())
     }
 
     fn spawn_inference_worker(
         event_tx: Sender<AppEvent>,
         config: Config,
-    ) -> Sender<InferenceCommand> {
+    ) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
         let (inference_tx, inference_rx) = bounded::<InferenceCommand>(2);
-        thread::spawn(move || Self::inference_worker(inference_rx, event_tx, config));
-        inference_tx
+        let handle = thread::spawn(move || Self::inference_worker(inference_rx, event_tx, config));
+        (inference_tx, handle)
     }
 
     fn inference_worker(
