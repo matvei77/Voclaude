@@ -4,6 +4,6 @@ mod capture;
 mod processing;
 mod ring_buffer;
 
-pub use capture::{AudioCapture, WHISPER_SAMPLE_RATE};
-pub use processing::{mono_from_interleaved, resample_linear, LinearResampler};
+pub use capture::{AudioCapture, TARGET_SAMPLE_RATE};
+pub use processing::{mono_from_interleaved, LinearResampler};
 pub use ring_buffer::RingBuffer;

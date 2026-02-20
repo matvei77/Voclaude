@@ -23,7 +23,6 @@ where
 }
 
 /// Simple linear resampling from source_rate to target_rate.
-#[allow(dead_code)]
 pub fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
     if source_rate == target_rate {
         return samples.to_vec();

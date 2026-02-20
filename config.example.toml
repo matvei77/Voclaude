@@ -1,0 +1,39 @@
+# Voclaude configuration
+# Location: %APPDATA%\voclaude\VoclaudeQwenRuntime\config\config.toml
+
+# Hotkey to toggle recording
+hotkey = "F4"
+
+# Hotkey to toggle history window
+history_hotkey = "Ctrl+Shift+H"
+
+# Language hint (comment out for auto-detect)
+# language = "en"
+
+# Formatting
+add_trailing_space = true
+capitalize_first = true
+
+# Unload model after N seconds idle (saves VRAM)
+idle_unload_seconds = 300
+
+# Show OS notifications
+show_notifications = true
+
+# Maximum history entries
+history_max_entries = 500
+
+# GPU acceleration (CUDA)
+use_gpu = true
+
+# Model (HuggingFace repo id, downloaded automatically on first use)
+qwen_model = "Qwen/Qwen3-ASR-1.7B"
+
+# Optional: path to local model directory (safetensors)
+# qwen_model_path = "C:/models/Qwen3-ASR-1.7B"
+
+# Max tokens per transcription
+qwen_max_new_tokens = 2048
+
+# Require GPU (fail if CUDA unavailable)
+qwen_require_gpu = false

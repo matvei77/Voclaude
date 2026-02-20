@@ -1,14 +1,12 @@
-//! Speech-to-text inference backend.
+//! Whisper speech-to-text inference.
 
-pub mod candle_audio;
-pub mod candle_backend;
-pub mod candle_tokenizer;
-mod qwen;
+mod whisper;
 
-pub use qwen::QwenEngine;
+pub use whisper::WhisperEngine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceStage {
+    DownloadingModel,
     LoadingModel,
     Transcribing,
 }

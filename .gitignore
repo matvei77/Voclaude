@@ -14,13 +14,16 @@
 # OS files
 .DS_Store
 Thumbs.db
+nul
 
 # Logs
 *.log
 
-# Python tooling
+# Python
 **/__pycache__/
 **/*.pyc
 **/.venv/
-tools/qwen3_asr_smoke/runs/
-tools/qwen3_asr_smoke/*.wav
+
+# Claude Code local settings
+.claude/settings.local.json
+.claude/*.local.md

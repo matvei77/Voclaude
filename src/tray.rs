@@ -8,10 +8,8 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
     Icon,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// Embedded icons (will be replaced with actual assets)
 const ICON_IDLE: &[u8] = include_bytes!("../assets/icon_idle.png");
@@ -20,16 +18,17 @@ const ICON_PROCESSING: &[u8] = include_bytes!("../assets/icon_processing.png");
 
 /// Menu item IDs
 const MENU_TOGGLE: &str = "toggle";
+const MENU_HISTORY: &str = "history";
+const MENU_OPEN_TRANSCRIPTS: &str = "open_transcripts";
+const MENU_OPEN_LAST_TRANSCRIPT: &str = "open_last_transcript";
 const MENU_SETTINGS: &str = "settings";
 const MENU_QUIT: &str = "quit";
 
 pub struct TrayManager {
     tray: TrayIcon,
-    #[allow(dead_code)]
-    event_tx: Sender<AppEvent>,
     toggle_item: MenuItem,
     state: Arc<Mutex<AppState>>,
-    shutdown: Arc<AtomicBool>,
+    status_detail: Arc<Mutex<Option<String>>>,
 }
 
 impl TrayManager {
@@ -39,6 +38,11 @@ impl TrayManager {
 
         // Create menu items
         let toggle_item = MenuItem::with_id(MENU_TOGGLE, "Start Recording", true, None);
+        let history_item = MenuItem::with_id(MENU_HISTORY, "Show History", true, None);
+        let open_transcripts_item =
+            MenuItem::with_id(MENU_OPEN_TRANSCRIPTS, "Open Transcripts Folder", true, None);
+        let open_last_transcript_item =
+            MenuItem::with_id(MENU_OPEN_LAST_TRANSCRIPT, "Open Last Transcript", true, None);
         let settings_item = MenuItem::with_id(MENU_SETTINGS, "Settings...", true, None);
         let separator = PredefinedMenuItem::separator();
         let quit_item = MenuItem::with_id(MENU_QUIT, "Quit Voclaude", true, None);
@@ -46,6 +50,9 @@ impl TrayManager {
         // Build menu
         let menu = Menu::new();
         menu.append(&toggle_item)?;
+        menu.append(&history_item)?;
+        menu.append(&open_last_transcript_item)?;
+        menu.append(&open_transcripts_item)?;
         menu.append(&separator)?;
         menu.append(&settings_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
@@ -59,64 +66,51 @@ impl TrayManager {
             .build()?;
 
         let state = Arc::new(Mutex::new(AppState::Idle));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let status_detail = Arc::new(Mutex::new(None));
 
-        // Spawn menu event handler with shutdown signal
+        // Spawn menu event handler
         let event_tx_clone = event_tx.clone();
-        let shutdown_clone = shutdown.clone();
+        let _state_clone = state.clone();
         std::thread::spawn(move || {
-            info!("Tray menu event handler started");
             let receiver = MenuEvent::receiver();
-
             loop {
-                // Check shutdown flag
-                if shutdown_clone.load(Ordering::Relaxed) {
-                    info!("Tray menu handler received shutdown signal");
-                    break;
-                }
-
-                // Use recv_timeout to allow checking shutdown flag periodically
-                match receiver.recv_timeout(Duration::from_millis(100)) {
-                    Ok(event) => {
-                        match event.id.0.as_str() {
-                            MENU_TOGGLE => {
-                                debug!("Toggle recording clicked");
-                                if event_tx_clone.send(AppEvent::HotkeyPressed).is_err() {
-                                    info!("Event channel closed, shutting down tray handler");
-                                    break;
-                                }
-                            }
-                            MENU_SETTINGS => {
-                                debug!("Settings clicked");
-                                // TODO: Open settings window
-                            }
-                            MENU_QUIT => {
-                                debug!("Quit clicked");
-                                if event_tx_clone.send(AppEvent::Quit).is_err() {
-                                    break;
-                                }
-                            }
-                            _ => {}
+                if let Ok(event) = receiver.recv() {
+                    match event.id.0.as_str() {
+                        MENU_TOGGLE => {
+                            debug!("Toggle recording clicked");
+                            let _ = event_tx_clone.send(AppEvent::HotkeyPressed);
                         }
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Normal timeout, check shutdown flag and continue
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        info!("Tray menu receiver disconnected, exiting thread");
-                        break;
+                        MENU_SETTINGS => {
+                            debug!("Settings clicked");
+                            let _ = event_tx_clone.send(AppEvent::OpenSettings);
+                        }
+                        MENU_HISTORY => {
+                            debug!("History clicked");
+                            let _ = event_tx_clone.send(AppEvent::ShowHistoryWindow);
+                        }
+                        MENU_OPEN_TRANSCRIPTS => {
+                            debug!("Open transcripts clicked");
+                            let _ = event_tx_clone.send(AppEvent::OpenTranscriptsFolder);
+                        }
+                        MENU_OPEN_LAST_TRANSCRIPT => {
+                            debug!("Open last transcript clicked");
+                            let _ = event_tx_clone.send(AppEvent::OpenLastTranscript);
+                        }
+                        MENU_QUIT => {
+                            debug!("Quit clicked");
+                            let _ = event_tx_clone.send(AppEvent::Quit);
+                        }
+                        _ => {}
                     }
                 }
             }
-            info!("Tray menu event handler exited cleanly");
         });
 
         Ok(Self {
             tray,
-            event_tx,
             toggle_item,
             state,
-            shutdown,
+            status_detail,
         })
     }
 
@@ -135,11 +129,36 @@ impl TrayManager {
             *s = state;
         }
 
+        if state != AppState::Transcribing {
+            if let Ok(mut detail) = self.status_detail.lock() {
+                *detail = None;
+            }
+        }
+
         // Update icon and tooltip
+        let detail = self
+            .status_detail
+            .lock()
+            .ok()
+            .and_then(|detail| detail.clone());
         let (icon_data, tooltip, menu_text) = match state {
-            AppState::Idle => (ICON_IDLE, "Voclaude - Ready", "Start Recording"),
-            AppState::Recording => (ICON_RECORDING, "Voclaude - Recording...", "Stop Recording"),
-            AppState::Transcribing => (ICON_PROCESSING, "Voclaude - Processing...", "Processing..."),
+            AppState::Idle => (
+                ICON_IDLE,
+                "Voclaude - Ready".to_string(),
+                "Start Recording",
+            ),
+            AppState::Recording => (
+                ICON_RECORDING,
+                "Voclaude - Recording...".to_string(),
+                "Stop Recording",
+            ),
+            AppState::Transcribing => (
+                ICON_PROCESSING,
+                detail
+                    .map(|message| format!("Voclaude - {}", message))
+                    .unwrap_or_else(|| "Voclaude - Processing...".to_string()),
+                "Processing...",
+            ),
         };
 
         // Update icon
@@ -150,7 +169,7 @@ impl TrayManager {
         }
 
         // Update tooltip
-        if let Err(e) = self.tray.set_tooltip(Some(tooltip)) {
+        if let Err(e) = self.tray.set_tooltip(Some(&tooltip)) {
             error!("Failed to set tooltip: {}", e);
         }
 
@@ -160,12 +179,18 @@ impl TrayManager {
         // Disable toggle during transcription
         self.toggle_item.set_enabled(state != AppState::Transcribing);
     }
-}
 
-impl Drop for TrayManager {
-    fn drop(&mut self) {
-        // Signal shutdown to menu handler thread
-        self.shutdown.store(true, Ordering::Relaxed);
-        info!("TrayManager dropped, shutdown signaled");
+    pub fn set_progress(&self, message: &str) {
+        if let Ok(mut detail) = self.status_detail.lock() {
+            *detail = Some(message.to_string());
+        }
+
+        let state = self.state.lock().ok().map(|state| *state).unwrap_or(AppState::Idle);
+        if state == AppState::Transcribing {
+            let tooltip = format!("Voclaude - {}", message);
+            if let Err(e) = self.tray.set_tooltip(Some(&tooltip)) {
+                error!("Failed to set tooltip: {}", e);
+            }
+        }
     }
 }

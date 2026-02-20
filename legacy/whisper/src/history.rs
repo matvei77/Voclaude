@@ -122,7 +122,7 @@ impl HistoryStore {
     }
 
     fn history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+        ProjectDirs::from("com", "voclaude", "Voclaude")
             .map(|dirs| dirs.data_dir().join("history.json"))
             .ok_or_else(|| "Could not determine history path".into())
     }

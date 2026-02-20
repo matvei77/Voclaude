@@ -1,8 +1,8 @@
 //! Configuration management with sensible defaults.
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use directories::ProjectDirs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -13,7 +13,8 @@ pub struct Config {
     #[serde(default = "default_history_hotkey")]
     pub history_hotkey: String,
 
-    /// Language hint for Qwen ASR (None = auto-detect)
+    /// Language for transcription (None = auto-detect)
+    /// Note: Parakeet is English-only, this is for future multi-language support
     pub language: Option<String>,
 
     /// Add trailing space after pasted text
@@ -35,23 +36,6 @@ pub struct Config {
     /// Enable GPU acceleration when available
     #[serde(default = "default_use_gpu")]
     pub use_gpu: bool,
-
-    /// Qwen model id (HuggingFace repo id).
-    #[serde(default = "default_qwen_model")]
-    pub qwen_model: String,
-
-    /// Optional path to local safetensors model directory.
-    /// If not set, falls back to HF cache or downloads from HuggingFace.
-    #[serde(default)]
-    pub qwen_model_path: Option<String>,
-
-    /// Max new tokens for model generation.
-    #[serde(default = "default_qwen_max_new_tokens")]
-    pub qwen_max_new_tokens: u32,
-
-    /// Fail request if CUDA is unavailable.
-    #[serde(default = "default_qwen_require_gpu")]
-    pub qwen_require_gpu: bool,
 }
 
 impl Default for Config {
@@ -59,17 +43,13 @@ impl Default for Config {
         Self {
             hotkey: "F4".to_string(),
             history_hotkey: default_history_hotkey(),
-            language: None,
+            language: None, // Parakeet is English-only for now
             add_trailing_space: true,
             capitalize_first: true,
             idle_unload_seconds: 300, // 5 minutes
             show_notifications: true,
             history_max_entries: default_history_max_entries(),
             use_gpu: true,
-            qwen_model: default_qwen_model(),
-            qwen_model_path: None,
-            qwen_max_new_tokens: default_qwen_max_new_tokens(),
-            qwen_require_gpu: false,
         }
     }
 }
@@ -77,8 +57,14 @@ impl Default for Config {
 impl Config {
     /// Get the config directory
     pub fn config_dir() -> Option<PathBuf> {
-        ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+        ProjectDirs::from("com", "voclaude", "Voclaude")
             .map(|dirs| dirs.config_dir().to_path_buf())
+    }
+
+    /// Get the models directory
+    pub fn models_dir() -> Option<PathBuf> {
+        ProjectDirs::from("com", "voclaude", "Voclaude")
+            .map(|dirs| dirs.data_dir().join("models"))
     }
 
     /// Get the config file path
@@ -126,16 +112,4 @@ fn default_history_max_entries() -> usize {
 
 fn default_history_hotkey() -> String {
     "Ctrl+Shift+H".to_string()
-}
-
-fn default_qwen_model() -> String {
-    "Qwen/Qwen3-ASR-1.7B".to_string()
-}
-
-fn default_qwen_max_new_tokens() -> u32 {
-    2048
-}
-
-fn default_qwen_require_gpu() -> bool {
-    false
 }
