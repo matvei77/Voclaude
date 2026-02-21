@@ -1,7 +1,7 @@
 //! Transcription history storage and retention.
 
 use crossbeam_channel::Sender;
-use directories::ProjectDirs;
+use crate::config::project_dirs;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -122,7 +122,7 @@ impl HistoryStore {
     }
 
     fn history_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+        project_dirs()
             .map(|dirs| dirs.data_dir().join("history.json"))
             .ok_or_else(|| "Could not determine history path".into())
     }

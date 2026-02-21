@@ -5,7 +5,7 @@ use super::{mono_from_interleaved, LinearResampler, RingBuffer};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
 use crossbeam_channel::Sender;
-use directories::ProjectDirs;
+use crate::config::project_dirs;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -349,7 +349,7 @@ impl AudioCapture {
 }
 
 fn audio_output_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+    project_dirs()
         .map(|dirs| dirs.data_dir().join("audio.f32"))
         .ok_or_else(|| "Could not determine audio output path".into())
 }

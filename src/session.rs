@@ -1,7 +1,7 @@
 //! Recording session metadata storage.
 
 use crate::history::AudioMetadata;
-use directories::ProjectDirs;
+use crate::config::project_dirs;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -145,13 +145,13 @@ impl SessionStore {
     }
 
     fn session_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+        project_dirs()
             .map(|dirs| dirs.data_dir().join("session.json"))
             .ok_or_else(|| "Could not determine session path".into())
     }
 
     fn audio_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
+        project_dirs()
             .map(|dirs| dirs.data_dir().join("audio.f32"))
             .ok_or_else(|| "Could not determine audio path".into())
     }

@@ -15,7 +15,7 @@ mod ui;
 
 use app::App;
 use config::Config;
-use inference::QwenEngine;
+use inference::{AsrEngine, QwenEngine};
 use tracing::{info, error, Level};
 
 fn main() {
@@ -44,7 +44,7 @@ fn main() {
             .init();
 
         if args.len() < 3 {
-            eprintln!("Usage: voclaude-qwen-runtime --test <path-to-audio.wav>");
+            eprintln!("Usage: voclaude --test <path-to-audio.wav>");
             std::process::exit(1);
         }
         let wav_path = &args[2];
@@ -68,7 +68,8 @@ fn main() {
         .with_writer(log_writer)
         .init();
 
-    info!("Voclaude Qwen runtime starting...");
+    Config::migrate_from_legacy();
+    info!("Voclaude starting...");
 
     // Load config
     let config = match Config::load() {
@@ -106,9 +107,9 @@ fn run_test(audio_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::path::Path::new(audio_path);
 
     // Create engine and transcribe using file-based path
-    info!("Creating Qwen engine...");
+    info!("Creating inference engine...");
     let mut test_config = Config::load().unwrap_or_default();
-    test_config.qwen_require_gpu = false; // test mode always allows CPU fallback
+    test_config.require_gpu = false; // test mode always allows CPU fallback
     let mut engine = QwenEngine::new_with_config(&test_config)?;
 
     info!("Transcribing...");
@@ -134,7 +135,7 @@ fn show_fatal_error_dialog(message: &str) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
-    let title: Vec<u16> = OsStr::new("Voclaude Qwen Runtime Error")
+    let title: Vec<u16> = OsStr::new("Voclaude Error")
         .encode_wide()
         .chain(once(0))
         .collect();

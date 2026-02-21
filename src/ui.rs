@@ -205,7 +205,7 @@ impl SharedUiState {
             status: Arc::new(Mutex::new(UiStatus::new(
                 String::new(),
                 false,
-                "qwen3-asr".to_string(),
+                "model".to_string(),
                 None,
             ))),
             log_buffer,
@@ -231,6 +231,7 @@ impl UiManager {
         let app = RootApp::new(command_rx, shared.clone());
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = alive.clone();
+        let alive_keepalive = alive.clone();
         let repaint_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
         let repaint_ctx_cc = repaint_ctx.clone();
 
@@ -257,6 +258,22 @@ impl UiManager {
                     if let Ok(mut guard) = repaint_ctx_cc.lock() {
                         *guard = Some(cc.egui_ctx.clone());
                     }
+
+                    // Keepalive thread: pokes the root event loop every 100ms so it
+                    // stays responsive to incoming commands even when no child
+                    // viewports are visible.
+                    let keepalive_ctx = cc.egui_ctx.clone();
+                    let keepalive_alive = alive_keepalive.clone();
+                    std::thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(Duration::from_millis(100));
+                            if !keepalive_alive.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            keepalive_ctx.request_repaint();
+                        }
+                    });
+
                     Box::new(app)
                 }),
             ) {

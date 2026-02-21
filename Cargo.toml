@@ -1,8 +1,8 @@
 [package]
-name = "voclaude-qwen-runtime"
+name = "voclaude"
 version = "0.3.0"
 edition = "2021"
-description = "Voice input anywhere - local-first, GPU-accelerated speech-to-text with Qwen"
+description = "Voice input anywhere - local-first, GPU-accelerated speech-to-text"
 license = "MIT"
 repository = "https://github.com/matvei77/Voclaude"
 

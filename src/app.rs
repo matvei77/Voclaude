@@ -4,13 +4,13 @@ use crate::audio::{AudioCapture, TARGET_SAMPLE_RATE};
 use crate::config::Config;
 use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
-use crate::inference::{InferenceProgress, InferenceStage, QwenEngine};
+use crate::inference::{AsrEngine, InferenceProgress, InferenceStage, QwenEngine};
 use crate::tray::TrayManager;
 use crate::ui::{HudManager, HudState, LogBuffer, UiManager, UiStatus};
 use crate::session::SessionStore;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use directories::ProjectDirs;
+use crate::config::project_dirs;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -174,22 +174,8 @@ impl App {
         let audio = AudioCapture::new(Some(level_tx))?;
         info!("Audio capture ready");
 
-        // Preflight check: verify model can be loaded.
-        // The actual model stays loaded lazily in the inference worker.
-        {
-            let mut preflight_engine = QwenEngine::new_with_config(&self.config)?;
-            if let Err(err) = preflight_engine.prepare(None) {
-                return Err(format!(
-                    "Backend preflight failed: {}. \
-Check config at %APPDATA%\\voclaude\\VoclaudeQwenRuntime\\config\\config.toml \
-for qwen_model_path and CUDA availability.",
-                    err
-                )
-                .into());
-            }
-            preflight_engine.unload();
-        }
-        info!("Qwen backend preflight passed");
+        // No preflight — model loads lazily on first transcription.
+        // If it fails, the user gets immediate feedback via the HUD.
 
         // Initialize inference worker (lazy - loads model on demand)
         let (inference_tx, inference_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
@@ -213,8 +199,8 @@ for qwen_model_path and CUDA availability.",
         let mut ui_status = UiStatus::new(
             self.config.hotkey.clone(),
             self.config.use_gpu,
-            "qwen3-asr-1.7b".to_string(),
-            Some(3300),
+            self.config.model_display_name(),
+            None,
         );
         ui_status.history_count = history.len();
         ui_status.input_device = Some(audio.device_name().to_string());
@@ -639,6 +625,13 @@ for qwen_model_path and CUDA availability.",
                             ui_status.input_level = Some(0.0);
                             self.ui.set_status(ui_status.clone());
                             hud.set_level(0.0);
+
+                            // Eagerly unload model to free GPU/RAM — it reloads
+                            // fast from SSD on next transcription.
+                            if let Err(err) = inference_tx.send(InferenceCommand::Unload) {
+                                warn!("Failed to request post-transcription unload: {}", err);
+                            }
+                            idle_unload_requested = true;
                         }
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
@@ -856,8 +849,7 @@ fn fallback_session_id() -> String {
 }
 
 fn transcripts_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime")
-        .map(|dirs| dirs.data_dir().join("transcripts"))
+    project_dirs().map(|dirs| dirs.data_dir().join("transcripts"))
 }
 
 fn transcript_output_path(session_id: &str) -> Option<PathBuf> {

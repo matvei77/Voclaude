@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::inference::candle_backend::Qwen3ASRModel;
 use crate::inference::candle_tokenizer::Qwen3ASRTokenizer;
-use crate::inference::{InferenceProgress, InferenceStage};
+use crate::inference::{AsrEngine, InferenceProgress, InferenceStage};
 use candle_core::{DType, Device};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,83 +63,11 @@ impl QwenEngine {
     pub fn new_with_config(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let mut engine = Self::new(config.use_gpu)?;
         engine.language = normalize_language(config.language.as_deref());
-        engine.model_id = config.qwen_model.clone();
-        engine.model_path = config.qwen_model_path.clone();
-        engine.max_new_tokens = config.qwen_max_new_tokens;
-        engine.require_gpu = config.qwen_require_gpu;
+        engine.model_id = config.model.clone();
+        engine.model_path = config.model_path.clone();
+        engine.max_new_tokens = config.max_new_tokens;
+        engine.require_gpu = config.require_gpu;
         Ok(engine)
-    }
-
-    pub fn active_gpu(&self) -> bool {
-        self.active_gpu
-    }
-
-    pub fn model_label(&self) -> String {
-        format!("qwen-candle ({})", self.model_id)
-    }
-
-    pub fn model_size_mb(&self) -> u64 {
-        if self.model_id.contains("0.6B") {
-            1400
-        } else if self.model_id.contains("1.7B") {
-            3300
-        } else {
-            DEFAULT_MODEL_SIZE_MB
-        }
-    }
-
-    pub fn unload(&mut self) {
-        if self.model.is_some() {
-            info!("Unloading Qwen model from memory");
-            self.model = None;
-            self.tokenizer = None;
-        }
-    }
-
-    pub fn prepare(
-        &mut self,
-        mut progress: Option<&mut dyn FnMut(InferenceProgress)>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.model.is_some() {
-            return Ok(());
-        }
-
-        if self.use_gpu && self.require_gpu && !self.active_gpu {
-            return Err("CUDA is required but not available".into());
-        }
-
-        if let Some(cb) = progress.as_deref_mut() {
-            cb(InferenceProgress {
-                stage: InferenceStage::LoadingModel,
-                message: "Loading Qwen model...".to_string(),
-                percent: None,
-            });
-        }
-
-        let model_dir = self.resolve_model_dir()?;
-        let started = Instant::now();
-
-        info!("Loading Qwen model from {:?} on {:?}", model_dir, self.device);
-
-        if let Some(cb) = progress.as_deref_mut() {
-            cb(InferenceProgress {
-                stage: InferenceStage::LoadingModel,
-                message: "Loading model weights (this may take a moment)...".to_string(),
-                percent: None,
-            });
-        }
-
-        let tokenizer = Qwen3ASRTokenizer::load(&model_dir)
-            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-        let model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype)
-            .map_err(|e| format!("Failed to load model: {}", e))?;
-
-        let elapsed = started.elapsed();
-        info!("Qwen model loaded in {:.2}s", elapsed.as_secs_f64());
-
-        self.tokenizer = Some(tokenizer);
-        self.model = Some(model);
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -157,7 +85,7 @@ impl QwenEngine {
         if let Some(cb) = progress.as_deref_mut() {
             cb(InferenceProgress {
                 stage: InferenceStage::Transcribing,
-                message: "Transcribing with Qwen...".to_string(),
+                message: "Transcribing...".to_string(),
                 percent: None,
             });
         }
@@ -171,28 +99,9 @@ impl QwenEngine {
             .map_err(|e| format!("Transcription failed: {}", e))?;
 
         let elapsed = started.elapsed();
-        info!("Qwen transcription complete: infer={:.2}s", elapsed.as_secs_f64());
+        info!("Transcription complete: infer={:.2}s", elapsed.as_secs_f64());
 
         Ok(text)
-    }
-
-    pub fn transcribe_file_with_progress(
-        &mut self,
-        path: &Path,
-        progress: Option<&mut dyn FnMut(InferenceProgress)>,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let samples = if path
-            .extension()
-            .map(|v| v.to_string_lossy().eq_ignore_ascii_case("f32"))
-            .unwrap_or(false)
-        {
-            load_f32_file(path)?
-        } else {
-            // For WAV files, use hound to read them
-            load_wav_file(path)?
-        };
-
-        self.transcribe_with_progress(&samples, progress)
     }
 
     fn resolve_model_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -202,7 +111,7 @@ impl QwenEngine {
             if p.exists() && p.is_dir() {
                 return Ok(p);
             }
-            return Err(format!("Configured qwen_model_path not found: {}", path).into());
+            return Err(format!("Configured model_path not found: {}", path).into());
         }
 
         // 2. Try HuggingFace cache
@@ -247,6 +156,98 @@ impl QwenEngine {
         // Resolve again from cache
         resolve_hf_cache(&self.model_id)
             .ok_or_else(|| format!("Model {} not found after download", self.model_id).into())
+    }
+}
+
+impl AsrEngine for QwenEngine {
+    fn prepare(
+        &mut self,
+        mut progress: Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.model.is_some() {
+            return Ok(());
+        }
+
+        if self.use_gpu && self.require_gpu && !self.active_gpu {
+            return Err("CUDA is required but not available".into());
+        }
+
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(InferenceProgress {
+                stage: InferenceStage::LoadingModel,
+                message: "Loading model...".to_string(),
+                percent: None,
+            });
+        }
+
+        let model_dir = self.resolve_model_dir()?;
+        let started = Instant::now();
+
+        info!("Loading model from {:?} on {:?}", model_dir, self.device);
+
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(InferenceProgress {
+                stage: InferenceStage::LoadingModel,
+                message: "Loading model weights (this may take a moment)...".to_string(),
+                percent: None,
+            });
+        }
+
+        let tokenizer = Qwen3ASRTokenizer::load(&model_dir)
+            .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+        let model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype)
+            .map_err(|e| format!("Failed to load model: {}", e))?;
+
+        let elapsed = started.elapsed();
+        info!("Model loaded in {:.2}s", elapsed.as_secs_f64());
+
+        self.tokenizer = Some(tokenizer);
+        self.model = Some(model);
+        Ok(())
+    }
+
+    fn transcribe_file_with_progress(
+        &mut self,
+        path: &Path,
+        progress: Option<&mut dyn FnMut(InferenceProgress)>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let samples = if path
+            .extension()
+            .map(|v| v.to_string_lossy().eq_ignore_ascii_case("f32"))
+            .unwrap_or(false)
+        {
+            load_f32_file(path)?
+        } else {
+            load_wav_file(path)?
+        };
+
+        self.transcribe_with_progress(&samples, progress)
+    }
+
+    fn unload(&mut self) {
+        if self.model.is_some() {
+            info!("Unloading model from memory");
+            self.model = None;
+            self.tokenizer = None;
+        }
+    }
+
+    fn active_gpu(&self) -> bool {
+        self.active_gpu
+    }
+
+    fn model_label(&self) -> String {
+        format!("candle ({})", self.model_id)
+    }
+
+    fn model_size_mb(&self) -> u64 {
+        if self.model_id.contains("0.6B") {
+            1400
+        } else if self.model_id.contains("1.7B") {
+            3300
+        } else {
+            DEFAULT_MODEL_SIZE_MB
+        }
     }
 }
 
