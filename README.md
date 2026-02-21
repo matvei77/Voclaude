@@ -16,12 +16,31 @@ Press a hotkey, speak, and your words are instantly transcribed and copied to yo
 - **Global hotkey** — configurable hotkey (default: F4) works from any application
 - **Session recovery** — if the app crashes mid-transcription, it recovers on restart
 
-## Quick Start
+## Quick Start (download)
+
+If someone gave you a `voclaude-vX.Y.Z-gpu.zip`:
+
+1. **Unzip** the archive anywhere (e.g. `C:\Voclaude\`)
+2. **Run** `voclaude.exe` — it appears in your system tray
+3. **Press F4** to record, **F4 again** to stop — transcription is copied to your clipboard
+4. **Paste** (Ctrl+V) anywhere
+
+The ASR model (~4.5 GB) downloads automatically from Hugging Face on first use. After that, everything works offline.
+
+### Requirements (download)
+
+- **Windows 10/11** (64-bit)
+- **NVIDIA GPU** with recent drivers (the zip includes CUDA runtime DLLs, no toolkit install needed)
+- ~4.5 GB free disk space for the model
+
+For CPU-only builds (no NVIDIA GPU needed), ask for the `-cpu` zip or build from source (see below).
+
+## Quick Start (build from source)
 
 ### Prerequisites
 
 - **Rust** 1.70+ ([rustup.rs](https://rustup.rs))
-- **NVIDIA GPU** with CUDA toolkit 12.x (for GPU mode)
+- **NVIDIA GPU** with [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) 12.x+ (for GPU mode)
 - ~4.5 GB disk space for the model (downloaded automatically on first run)
 
 ### Build and Run
@@ -34,10 +53,10 @@ cargo build --release
 
 ```bash
 # Windows
-target\release\voclaude-qwen-runtime.exe
+target\release\voclaude.exe
 
 # Linux
-./target/release/voclaude-qwen-runtime
+./target/release/voclaude
 ```
 
 ### CPU-only Build
@@ -47,6 +66,17 @@ If you don't have an NVIDIA GPU:
 ```bash
 cargo build --release --no-default-features --features cpu
 ```
+
+### Packaging for Distribution
+
+To build a distributable zip with CUDA DLLs bundled:
+
+```powershell
+.\package.ps1          # GPU build -> dist\voclaude-vX.Y.Z-gpu.zip
+.\package.ps1 -Cpu     # CPU build -> dist\voclaude-vX.Y.Z-cpu.zip
+```
+
+The GPU zip includes `voclaude.exe`, the required CUDA DLLs, and `config.example.toml`. Recipients only need NVIDIA GPU drivers — no CUDA Toolkit or Rust toolchain.
 
 ### Linux Dependencies
 
@@ -79,16 +109,16 @@ Right-click the tray icon for: Show History, Open Transcripts, Settings, Quit.
 
 Config is created automatically on first run.
 
-**Location:** `%APPDATA%\voclaude\VoclaudeQwenRuntime\config\config.toml`
+**Location:** `%APPDATA%\voclaude\Voclaude\config\config.toml`
 
 ```toml
 hotkey = "F4"
 history_hotkey = "Ctrl+Shift+H"
 add_trailing_space = true
 capitalize_first = true
-idle_unload_seconds = 300
+idle_unload_seconds = 30
 use_gpu = true
-qwen_model = "Qwen/Qwen3-ASR-1.7B"
+model = "Qwen/Qwen3-ASR-1.7B"
 ```
 
 See [`config.example.toml`](config.example.toml) for all options.
@@ -134,14 +164,18 @@ The Qwen3-ASR model (~4.5 GB) is downloaded from Hugging Face on first use. Ensu
 Check that your microphone is set as the default input device in your system sound settings.
 
 ### CUDA errors
-- Ensure CUDA toolkit 12.x is installed
-- Check that `nvidia-smi` works from the command line
+- If using the prebuilt zip: make sure you have an NVIDIA GPU and up-to-date drivers (`nvidia-smi` should work)
+- If building from source: ensure CUDA Toolkit 12.x+ is installed
 - Try CPU mode: rebuild with `--no-default-features --features cpu`
+
+### Hotkey not working
+- Make sure no other application has registered the same global hotkey (F4)
+- Try a different hotkey in the config file (e.g. `hotkey = "Ctrl+Shift+Space"`)
 
 ### Linux: Hotkey not working on Wayland
 Global hotkeys may require X11 compatibility:
 ```bash
-GDK_BACKEND=x11 ./target/release/voclaude-qwen-runtime
+GDK_BACKEND=x11 ./target/release/voclaude
 ```
 
 ## License
