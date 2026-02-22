@@ -178,6 +178,7 @@ struct SharedUiState {
 
     // History
     history_visible: Arc<AtomicBool>,
+    history_needs_focus: Arc<AtomicBool>,
     history: Arc<Mutex<VecDeque<String>>>,
     filter: Arc<Mutex<String>>,
     show_logs: Arc<AtomicBool>,
@@ -198,6 +199,7 @@ impl SharedUiState {
             hud_ready_until: Arc::new(Mutex::new(None)),
 
             history_visible: Arc::new(AtomicBool::new(false)),
+            history_needs_focus: Arc::new(AtomicBool::new(false)),
             history: Arc::new(Mutex::new(VecDeque::new())),
             filter: Arc::new(Mutex::new(String::new())),
             show_logs: Arc::new(AtomicBool::new(false)),
@@ -300,7 +302,12 @@ impl UiManager {
             return false;
         }
         let prev = self.shared.history_visible.load(Ordering::Relaxed);
-        self.shared.history_visible.store(!prev, Ordering::Relaxed);
+        let new_val = !prev;
+        self.shared.history_visible.store(new_val, Ordering::Relaxed);
+        if new_val {
+            self.shared.history_needs_focus.store(true, Ordering::Relaxed);
+        }
+        info!("History toggle: {} -> {}", prev, new_val);
         self.wake();
         true
     }
@@ -311,6 +318,8 @@ impl UiManager {
             return false;
         }
         self.shared.history_visible.store(true, Ordering::Relaxed);
+        self.shared.history_needs_focus.store(true, Ordering::Relaxed);
+        info!("History show requested");
         self.wake();
         true
     }
@@ -543,6 +552,7 @@ impl eframe::App for RootApp {
         }
 
         // Spawn History child viewport when visible
+        let history_vp_id = egui::ViewportId::from_hash_of("voclaude_history");
         if self.shared.history_visible.load(Ordering::Relaxed) {
             let shared = self.shared.clone();
             let monitor = get_primary_screen_size();
@@ -551,14 +561,24 @@ impl eframe::App for RootApp {
             let x = (monitor.x - win_w) / 2.0;
             let y = (monitor.y - win_h) / 2.0;
 
+            // Send focus commands from the ROOT viewport so they work even
+            // when the history viewport is behind other windows and not
+            // repainting.
+            if self.shared.history_needs_focus.swap(false, Ordering::Relaxed) {
+                ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Focus);
+            }
+
             ctx.show_viewport_deferred(
-                egui::ViewportId::from_hash_of("voclaude_history"),
+                history_vp_id,
                 egui::ViewportBuilder::default()
                     .with_title("Voclaude History")
                     .with_inner_size([win_w, win_h])
                     .with_position(egui::pos2(x, y))
                     .with_decorations(true)
-                    .with_resizable(true),
+                    .with_resizable(true)
+                    .with_visible(true),
                 move |ctx, _class| {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         shared.history_visible.store(false, Ordering::Relaxed);

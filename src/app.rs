@@ -659,6 +659,7 @@ impl App {
                                 .iter()
                                 .map(|e| e.text.clone())
                                 .collect();
+                            info!("ShowHistoryWindow: {} entries to display", entries.len());
                             self.ui.reload_history(entries);
                             if !self.ui.show() {
                                 warn!("History window show failed (UI thread may have exited)");
