@@ -179,6 +179,8 @@ struct SharedUiState {
     // History
     history_visible: Arc<AtomicBool>,
     history_needs_focus: Arc<AtomicBool>,
+    /// Whether the history viewport has been created and painted at least once.
+    history_viewport_alive: Arc<AtomicBool>,
     history: Arc<Mutex<VecDeque<String>>>,
     filter: Arc<Mutex<String>>,
     show_logs: Arc<AtomicBool>,
@@ -200,6 +202,7 @@ impl SharedUiState {
 
             history_visible: Arc::new(AtomicBool::new(false)),
             history_needs_focus: Arc::new(AtomicBool::new(false)),
+            history_viewport_alive: Arc::new(AtomicBool::new(false)),
             history: Arc::new(Mutex::new(VecDeque::new())),
             filter: Arc::new(Mutex::new(String::new())),
             show_logs: Arc::new(AtomicBool::new(false)),
@@ -242,8 +245,7 @@ impl UiManager {
                 viewport: egui::ViewportBuilder::default()
                     .with_title("Voclaude")
                     .with_inner_size([1.0, 1.0])
-                    .with_visible(true)
-                    .with_position(egui::pos2(-32000.0, -32000.0))
+                    .with_visible(false)
                     .with_decorations(false)
                     .with_taskbar(false),
                 #[cfg(target_os = "windows")]
@@ -555,37 +557,61 @@ impl eframe::App for RootApp {
         let history_vp_id = egui::ViewportId::from_hash_of("voclaude_history");
         if self.shared.history_visible.load(Ordering::Relaxed) {
             let shared = self.shared.clone();
-            let monitor = get_primary_screen_size();
-            let win_w = 560.0_f32;
-            let win_h = 520.0_f32;
-            let x = (monitor.x - win_w) / 2.0;
-            let y = (monitor.y - win_h) / 2.0;
+            let viewport_alive = self.shared.history_viewport_alive.load(Ordering::Relaxed);
 
-            // Send focus commands from the ROOT viewport so they work even
-            // when the history viewport is behind other windows and not
-            // repainting.
-            if self.shared.history_needs_focus.swap(false, Ordering::Relaxed) {
+            // Only send focus commands if the viewport has already been created
+            // and painted at least once. On first open, the deferred viewport
+            // callback will handle the initial focus.
+            if self.shared.history_needs_focus.swap(false, Ordering::Relaxed) && viewport_alive {
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Focus);
             }
 
+            // Build viewport — only set position on first creation (when
+            // viewport is not yet alive). After that, let the user's window
+            // position persist by not overriding it.
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("Voclaude History")
+                .with_inner_size([560.0, 520.0])
+                .with_decorations(true)
+                .with_resizable(true)
+                .with_visible(true);
+
+            if !viewport_alive {
+                let monitor = get_primary_screen_size();
+                let x = (monitor.x - 560.0) / 2.0;
+                let y = (monitor.y - 520.0) / 2.0;
+                builder = builder.with_position(egui::pos2(x, y));
+            }
+
             ctx.show_viewport_deferred(
                 history_vp_id,
-                egui::ViewportBuilder::default()
-                    .with_title("Voclaude History")
-                    .with_inner_size([win_w, win_h])
-                    .with_position(egui::pos2(x, y))
-                    .with_decorations(true)
-                    .with_resizable(true)
-                    .with_visible(true),
+                builder,
                 move |ctx, _class| {
+                    // Mark viewport as alive on first paint
+                    if !shared.history_viewport_alive.load(Ordering::Relaxed) {
+                        shared.history_viewport_alive.store(true, Ordering::Relaxed);
+                        // Request focus on first creation
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+
+                    // Handle close — this fires during repaint. Also check if
+                    // visibility was toggled off externally.
                     if ctx.input(|i| i.viewport().close_requested()) {
                         shared.history_visible.store(false, Ordering::Relaxed);
+                        shared.history_viewport_alive.store(false, Ordering::Relaxed);
                     }
                     render_history(ctx, &shared);
                 },
             );
+            // Keep root repainting while history is visible so close events
+            // from the deferred viewport are captured promptly.
+            ctx.request_repaint_after(Duration::from_millis(200));
+        } else {
+            // Viewport should be hidden — reset alive flag so next open
+            // gets proper first-creation handling.
+            self.shared.history_viewport_alive.store(false, Ordering::Relaxed);
         }
 
         // Root must have a CentralPanel (egui requirement)

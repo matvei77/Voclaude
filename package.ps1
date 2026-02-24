@@ -17,6 +17,8 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistDir     = Join-Path $ProjectRoot "dist"
 $Version     = (Select-String -Path (Join-Path $ProjectRoot "Cargo.toml") -Pattern '^version\s*=\s*"(.+)"' |
                 Select-Object -First 1).Matches.Groups[1].Value
+$GitHash     = (git -C $ProjectRoot rev-parse --short=8 HEAD 2>$null)
+if (-not $GitHash) { $GitHash = "unknown" }
 
 if ($Cpu) {
     $Variant = "cpu"
@@ -92,8 +94,8 @@ if (Test-Path $ExampleConfig) {
     Copy-Item $ExampleConfig $StageDir
 }
 
-# Create zip
-$ZipName = "voclaude-v$Version-$Variant.zip"
+# Create zip (include git hash for traceability)
+$ZipName = "voclaude-v$Version-$GitHash-$Variant.zip"
 $ZipPath = Join-Path $DistDir $ZipName
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 

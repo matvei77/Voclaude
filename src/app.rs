@@ -126,6 +126,7 @@ pub struct App {
     event_rx: Receiver<AppEvent>,
     is_running: bool,
     ui: UiManager,
+    #[allow(dead_code)]
     log_buffer: LogBuffer,
 }
 
@@ -155,19 +156,16 @@ impl App {
         let _tray = TrayManager::new(self.event_tx.clone())?;
         info!("Tray icon ready");
 
-        // Initialize hotkey listener - MUST keep alive!
-        let _hotkey = HotkeyManager::new(
-            &self.config.hotkey,
-            AppEvent::HotkeyPressed,
+        // Initialize hotkey listener - single unified thread for all hotkeys
+        // to avoid GlobalHotKeyEvent receiver contention.
+        let _hotkey = HotkeyManager::new_multi(
+            &[
+                (&self.config.hotkey, AppEvent::HotkeyPressed),
+                (&self.config.history_hotkey, AppEvent::ToggleHistoryWindow),
+            ],
             self.event_tx.clone(),
         )?;
-        let _history_hotkey = HotkeyManager::new(
-            &self.config.history_hotkey,
-            AppEvent::ToggleHistoryWindow,
-            self.event_tx.clone(),
-        )?;
-        info!("Hotkey registered: {}", self.config.hotkey);
-        info!("History hotkey registered: {}", self.config.history_hotkey);
+        info!("Hotkeys registered: {} (record), {} (history)", self.config.hotkey, self.config.history_hotkey);
 
         // Initialize audio capture
         let (level_tx, level_rx) = bounded::<f32>(64);
@@ -178,7 +176,7 @@ impl App {
         // If it fails, the user gets immediate feedback via the HUD.
 
         // Initialize inference worker (lazy - loads model on demand)
-        let (inference_tx, inference_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+        let (mut inference_tx, mut inference_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
         info!("Inference worker ready (model will load on first use)");
 
         // Clipboard
@@ -305,6 +303,27 @@ impl App {
                 info!("Current state: {:?}", self.state);
                 info!("Event channel len: {}", self.event_rx.len());
                 last_status_log = Instant::now();
+            }
+
+            // Watchdog: detect inference worker panic and respawn
+            if inference_handle.is_finished() {
+                error!("Inference worker thread exited unexpectedly — respawning");
+                let _ = inference_handle.join();
+                let (new_tx, new_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+                inference_tx = new_tx;
+                inference_handle = new_handle;
+                info!("Inference worker respawned");
+                notifications.notify("Inference engine restarted after error");
+                if self.state == AppState::Transcribing {
+                    self.state = AppState::Idle;
+                    _tray.set_state(AppState::Idle);
+                    hud.set_state(HudState::Ready {
+                        message: "Inference engine restarted".to_string(),
+                    });
+                    ui_status.state = "Idle".to_string();
+                    ui_status.last_message = Some("Inference engine restarted after error".to_string());
+                    self.ui.set_status(ui_status.clone());
+                }
             }
 
             // Check for idle unload
@@ -626,12 +645,9 @@ impl App {
                             self.ui.set_status(ui_status.clone());
                             hud.set_level(0.0);
 
-                            // Eagerly unload model to free GPU/RAM — it reloads
-                            // fast from SSD on next transcription.
-                            if let Err(err) = inference_tx.send(InferenceCommand::Unload) {
-                                warn!("Failed to request post-transcription unload: {}", err);
-                            }
-                            idle_unload_requested = true;
+                            // Model stays resident for fast re-use.
+                            // The idle_unload_seconds timer (default 30s) handles
+                            // VRAM reclamation when the user stops using the app.
                         }
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
@@ -683,6 +699,47 @@ impl App {
                                 Ok(path) => {
                                     if let Err(err) = open_path(&path) {
                                         warn!("Failed to open config file: {}", err);
+                                    } else {
+                                        // Validate config after user potentially edits it.
+                                        // Spawn a background thread to poll for file changes
+                                        // and validate when the modification time updates.
+                                        let event_tx_clone = self.event_tx.clone();
+                                        let config_path = path.clone();
+                                        let original_mtime = std::fs::metadata(&config_path)
+                                            .and_then(|m| m.modified())
+                                            .ok();
+                                        thread::spawn(move || {
+                                            // Wait up to 5 minutes for the user to save
+                                            let deadline = Instant::now() + Duration::from_secs(300);
+                                            let mut last_check = Instant::now();
+                                            while Instant::now() < deadline {
+                                                thread::sleep(Duration::from_secs(2));
+                                                let current_mtime = std::fs::metadata(&config_path)
+                                                    .and_then(|m| m.modified())
+                                                    .ok();
+                                                if current_mtime != original_mtime && last_check.elapsed() > Duration::from_secs(1) {
+                                                    last_check = Instant::now();
+                                                    // File was modified — validate
+                                                    match Config::load() {
+                                                        Ok(_new_config) => {
+                                                            info!("Config reloaded successfully after edit");
+                                                            let _ = event_tx_clone.send(AppEvent::InferenceProgress(
+                                                                InferenceProgress {
+                                                                    stage: InferenceStage::Transcribing,
+                                                                    message: "Settings saved successfully".to_string(),
+                                                                    percent: None,
+                                                                },
+                                                            ));
+                                                            break;
+                                                        }
+                                                        Err(err) => {
+                                                            warn!("Config validation failed: {}", err);
+                                                            // Don't break — user might fix and re-save
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                                 Err(err) => {

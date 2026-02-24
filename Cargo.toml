@@ -31,6 +31,7 @@ crossbeam-channel = "0.5"  # Fast MPSC channels
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # FFT for mel spectrogram
 realfft = "3.4"

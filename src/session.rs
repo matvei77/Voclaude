@@ -187,8 +187,22 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&temp_path, path)?;
-    Ok(())
+
+    // On Windows, rename can fail with ACCESS_DENIED if the target is
+    // held by antivirus or indexing. Retry a few times with backoff.
+    let mut last_err = None;
+    for attempt in 0..5u32 {
+        match std::fs::rename(&temp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap().into())
 }
 
 fn backup_corrupt(path: &Path, contents: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {

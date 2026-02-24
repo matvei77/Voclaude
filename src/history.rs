@@ -166,8 +166,22 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&temp_path, path)?;
-    Ok(())
+
+    // On Windows, rename can fail with ACCESS_DENIED if the target is
+    // held by antivirus or indexing. Retry a few times with backoff.
+    let mut last_err = None;
+    for attempt in 0..5u32 {
+        match std::fs::rename(&temp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap().into())
 }
 
 fn backup_corrupt_history(
@@ -232,4 +246,52 @@ fn recover_entries(contents: &str) -> Vec<HistoryEntry> {
     }
 
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_entry_has_unique_id() {
+        let e1 = HistoryEntry::new("hello".to_string(), None);
+        let e2 = HistoryEntry::new("world".to_string(), None);
+        assert_ne!(e1.id, e2.id);
+    }
+
+    #[test]
+    fn audio_metadata_duration() {
+        let meta = AudioMetadata::from_samples(16000, 16000);
+        assert_eq!(meta.duration_ms, 1000);
+    }
+
+    #[test]
+    fn recover_entries_from_corrupt_json() {
+        // Partial/corrupt JSON with two valid entries
+        let corrupt = r#"[
+            {"id":"1-0","created_at_ms":1000,"text":"hello","audio":null},
+            {"id":"2-1","created_at_ms":2000,"text":"world","audio":null}
+        GARBAGE"#;
+        let recovered = recover_entries(corrupt);
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].text, "hello");
+        assert_eq!(recovered[1].text, "world");
+    }
+
+    #[test]
+    fn recover_entries_empty_string() {
+        let recovered = recover_entries("");
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn write_atomic_retry_succeeds() {
+        let dir = std::env::temp_dir().join("voclaude_test_history");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_history.json");
+        write_atomic(&path, "[]").expect("write_atomic should succeed");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "[]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

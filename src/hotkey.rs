@@ -5,122 +5,81 @@ use crate::app::AppEvent;
 use crossbeam_channel::Sender;
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
-    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+    GlobalHotKeyEvent, GlobalHotKeyManager,
 };
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace};
 
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
-    hotkey: HotKey,
+    hotkeys: Vec<HotKey>,
 }
 
 impl HotkeyManager {
-    pub fn new(
-        hotkey_str: &str,
-        app_event: AppEvent,
+    /// Register multiple hotkeys with a single listener thread.
+    /// Takes pairs of (hotkey_string, AppEvent) and dispatches events
+    /// based on the hotkey ID — avoiding the global receiver contention
+    /// issue that occurs when multiple threads compete for events.
+    pub fn new_multi(
+        bindings: &[(&str, AppEvent)],
         event_tx: Sender<AppEvent>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        info!("=== HOTKEY INITIALIZATION START ===");
-
-        // Log Windows thread ID
-        #[cfg(target_os = "windows")]
-        {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn GetCurrentThreadId() -> u32;
-            }
-            let win_thread_id = unsafe { GetCurrentThreadId() };
-            info!("Hotkey init on Windows Thread ID: {}", win_thread_id);
-        }
-
-        info!("Creating GlobalHotKeyManager...");
-
         let manager = GlobalHotKeyManager::new()?;
-        info!("GlobalHotKeyManager created successfully");
+        let mut hotkeys = Vec::new();
+        let mut id_to_event: HashMap<u32, AppEvent> = HashMap::new();
 
-        // Parse hotkey string (e.g., "Super+C", "Ctrl+Shift+Space")
-        info!("Parsing hotkey string: '{}'", hotkey_str);
-        let hotkey = Self::parse_hotkey(hotkey_str)?;
-        info!("Parsed hotkey - ID: {}", hotkey.id());
-
-        // Register the hotkey
-        info!("Registering hotkey with Windows...");
-        match manager.register(hotkey) {
-            Ok(_) => info!("Hotkey registered successfully with Windows!"),
-            Err(e) => {
-                error!("FAILED to register hotkey: {:?}", e);
-                return Err(e.into());
-            }
+        for (hotkey_str, app_event) in bindings {
+            let hotkey = Self::parse_hotkey(hotkey_str)?;
+            info!("Registering hotkey '{}' (ID: {})", hotkey_str, hotkey.id());
+            manager.register(hotkey)?;
+            id_to_event.insert(hotkey.id(), app_event.clone());
+            hotkeys.push(hotkey);
         }
 
-        // Spawn event handler thread
-        let hotkey_id = hotkey.id();
-        let event_to_send = app_event.clone();
-        info!("Hotkey ID: {}, spawning listener thread...", hotkey_id);
-
+        // Single unified listener thread for ALL hotkeys
         std::thread::spawn(move || {
-            info!("=== HOTKEY LISTENER THREAD STARTED ===");
-            info!("Thread ID: {:?}", std::thread::current().id());
-            info!("Getting GlobalHotKeyEvent receiver...");
-
+            info!("Unified hotkey listener started ({} bindings)", id_to_event.len());
             let receiver = GlobalHotKeyEvent::receiver();
-            info!("Got receiver, entering event loop...");
-
-            let mut loop_count: u64 = 0;
-            let mut last_log = std::time::Instant::now();
-            let mut last_trigger = Instant::now() - Duration::from_secs(1);
-            // On Windows, some key combos only fire Released (not Pressed).
-            // We accept whichever arrives first, then debounce the paired
-            // event so we don't double-fire. 150ms is enough to absorb the
-            // Press→Release pair without feeling sluggish.
             let min_event_gap = Duration::from_millis(150);
+            let mut last_trigger_per_id: HashMap<u32, Instant> = HashMap::new();
 
             loop {
-                loop_count += 1;
-
-                if last_log.elapsed() > Duration::from_secs(10) {
-                    info!("Hotkey listener alive - {} iterations", loop_count);
-                    last_log = std::time::Instant::now();
-                }
-
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
-                        if event.id != hotkey_id {
-                            debug!("Event ID {} != expected {}", event.id, hotkey_id);
-                            continue;
-                        }
+                        if let Some(app_event) = id_to_event.get(&event.id) {
+                            let now = Instant::now();
+                            let last = last_trigger_per_id
+                                .get(&event.id)
+                                .copied()
+                                .unwrap_or(Instant::now() - Duration::from_secs(1));
 
-                        let now = Instant::now();
-                        let gap = now.duration_since(last_trigger);
+                            if now.duration_since(last) < min_event_gap {
+                                debug!("Debounced hotkey {} ({:?})", event.id, event.state);
+                                continue;
+                            }
 
-                        if gap < min_event_gap {
-                            debug!("Debounced {:?} ({}ms since last)",
-                                   event.state, gap.as_millis());
-                            continue;
-                        }
-
-                        last_trigger = now;
-                        info!("Hotkey fired ({:?})", event.state);
-                        match event_tx.send(event_to_send.clone()) {
-                            Ok(_) => info!("Hotkey event sent"),
-                            Err(e) => error!("FAILED to send hotkey event: {}", e),
+                            last_trigger_per_id.insert(event.id, now);
+                            info!("Hotkey {} fired ({:?})", event.id, event.state);
+                            if let Err(e) = event_tx.send(app_event.clone()) {
+                                error!("Failed to send hotkey event: {}", e);
+                            }
+                        } else {
+                            debug!("Unknown hotkey ID: {}", event.id);
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        trace!("Receiver timeout (normal)");
+                        trace!("Hotkey receiver timeout (normal)");
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        error!("Hotkey receiver DISCONNECTED! Exiting thread.");
+                        error!("Hotkey receiver disconnected!");
                         break;
                     }
                 }
             }
-            error!("Hotkey listener thread exiting!");
         });
 
-        info!("=== HOTKEY INITIALIZATION COMPLETE ===");
-        Ok(Self { manager, hotkey })
+        Ok(Self { manager, hotkeys })
     }
 
     fn parse_hotkey(s: &str) -> Result<HotKey, Box<dyn std::error::Error>> {
@@ -247,8 +206,10 @@ impl HotkeyManager {
 
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
-        if let Err(e) = self.manager.unregister(self.hotkey) {
-            error!("Failed to unregister hotkey: {}", e);
+        for hotkey in &self.hotkeys {
+            if let Err(e) = self.manager.unregister(*hotkey) {
+                error!("Failed to unregister hotkey: {}", e);
+            }
         }
     }
 }

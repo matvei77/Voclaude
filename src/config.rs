@@ -12,6 +12,10 @@ pub fn project_dirs() -> Option<ProjectDirs> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Schema version — bump when breaking changes are made to the config format.
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
+
     /// Hotkey to toggle recording (e.g., "F4", "Ctrl+Alt+V")
     pub hotkey: String,
 
@@ -63,6 +67,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            config_version: default_config_version(),
             hotkey: "F4".to_string(),
             history_hotkey: default_history_hotkey(),
             language: None,
@@ -91,19 +96,46 @@ impl Config {
         Self::config_dir().map(|dir| dir.join("config.toml"))
     }
 
-    /// Load config from disk, or create default
+    /// Load config from disk, or create default. Validates all fields.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::config_path().ok_or("Could not determine config path")?;
 
-        if path.exists() {
+        let config = if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
             let config: Config = toml::from_str(&contents)?;
-            Ok(config)
+            config
         } else {
             let config = Config::default();
             config.save()?;
-            Ok(config)
+            config
+        };
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate all config fields. Returns Err with a descriptive message
+    /// on the first invalid value.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.hotkey.trim().is_empty() {
+            return Err("hotkey cannot be empty".into());
         }
+        if self.history_hotkey.trim().is_empty() {
+            return Err("history_hotkey cannot be empty".into());
+        }
+        if self.idle_unload_seconds == 0 {
+            return Err("idle_unload_seconds must be > 0".into());
+        }
+        if self.history_max_entries == 0 {
+            return Err("history_max_entries must be > 0".into());
+        }
+        if self.max_new_tokens == 0 || self.max_new_tokens > 8192 {
+            return Err("max_new_tokens must be between 1 and 8192".into());
+        }
+        if self.model.trim().is_empty() {
+            return Err("model cannot be empty".into());
+        }
+        Ok(())
     }
 
     /// Save config to disk
@@ -210,6 +242,10 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()>
     Ok(())
 }
 
+fn default_config_version() -> u32 {
+    1
+}
+
 fn default_use_gpu() -> bool {
     true
 }
@@ -232,4 +268,89 @@ fn default_max_new_tokens() -> u32 {
 
 fn default_require_gpu() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_valid() {
+        let config = Config::default();
+        config.validate().expect("default config should be valid");
+        assert_eq!(config.config_version, 1);
+        assert_eq!(config.hotkey, "F4");
+    }
+
+    #[test]
+    fn parse_minimal_toml() {
+        let toml_str = r#"
+            hotkey = "F5"
+            add_trailing_space = false
+            capitalize_first = false
+            idle_unload_seconds = 60
+            show_notifications = false
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("should parse");
+        assert_eq!(config.hotkey, "F5");
+        assert_eq!(config.idle_unload_seconds, 60);
+        // Defaults should fill in
+        assert_eq!(config.config_version, 1);
+        assert_eq!(config.history_max_entries, 500);
+        config.validate().expect("should be valid");
+    }
+
+    #[test]
+    fn parse_legacy_aliases() {
+        let toml_str = r#"
+            hotkey = "F4"
+            add_trailing_space = true
+            capitalize_first = true
+            idle_unload_seconds = 30
+            show_notifications = true
+            qwen_model = "Qwen/Qwen3-ASR-0.6B"
+            qwen_model_path = "/some/path"
+            qwen_max_new_tokens = 1024
+            qwen_require_gpu = true
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("should parse legacy aliases");
+        assert_eq!(config.model, "Qwen/Qwen3-ASR-0.6B");
+        assert_eq!(config.model_path.as_deref(), Some("/some/path"));
+        assert_eq!(config.max_new_tokens, 1024);
+        assert!(config.require_gpu);
+    }
+
+    #[test]
+    fn validate_rejects_empty_hotkey() {
+        let mut config = Config::default();
+        config.hotkey = "".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_idle() {
+        let mut config = Config::default();
+        config.idle_unload_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_tokens() {
+        let mut config = Config::default();
+        config.max_new_tokens = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_huge_max_tokens() {
+        let mut config = Config::default();
+        config.max_new_tokens = 10000;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn model_display_name_extracts_basename() {
+        let config = Config::default();
+        assert_eq!(config.model_display_name(), "qwen3-asr-1.7b");
+    }
 }
