@@ -42,6 +42,13 @@ impl std::io::Write for CombinedWriter {
 }
 
 fn main() {
+    // Defer cuBLAS/cuDNN kernel loading until first use (~200-400 MB saved).
+    // Must be set before any CUDA initialization occurs.
+    // SAFETY: Called at the very start of main() before any threads are spawned.
+    if std::env::var_os("CUDA_MODULE_LOADING").is_none() {
+        unsafe { std::env::set_var("CUDA_MODULE_LOADING", "LAZY") };
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     // --version: print version and exit

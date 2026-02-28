@@ -565,10 +565,11 @@ struct DecoderAttention {
     num_kv_heads: usize,
     head_dim: usize,
     /// Pre-allocated KV cache: (k_cache, v_cache) each of shape
-    /// (batch, num_kv_heads, max_seq_len, head_dim). Only the first
+    /// (batch, num_kv_heads, cache_capacity, head_dim). Only the first
     /// `cache_len` entries along dim 2 are valid.
     kv_cache: Option<(Tensor, Tensor)>,
     cache_len: usize,
+    cache_capacity: usize,
 }
 
 impl DecoderAttention {
@@ -591,7 +592,19 @@ impl DecoderAttention {
             head_dim: cfg.head_dim,
             kv_cache: None,
             cache_len: 0,
+            cache_capacity: 0,
         })
+    }
+
+    /// Pre-allocate KV cache buffers for the given maximum sequence length.
+    /// This avoids repeated Tensor::cat (which creates old+new+result = 3× peak VRAM).
+    fn allocate_cache(&mut self, max_seq_len: usize, device: &Device, dtype: DType) -> Result<()> {
+        let k = Tensor::zeros((1, self.num_kv_heads, max_seq_len, self.head_dim), dtype, device)?;
+        let v = Tensor::zeros((1, self.num_kv_heads, max_seq_len, self.head_dim), dtype, device)?;
+        self.kv_cache = Some((k, v));
+        self.cache_len = 0;
+        self.cache_capacity = max_seq_len;
+        Ok(())
     }
 
     fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -614,25 +627,32 @@ impl DecoderAttention {
         let q = apply_rotary_emb(&q, cos, sin)?;
         let k = apply_rotary_emb(&k, cos, sin)?;
 
-        // KV cache: append new K/V via Tensor::cat.
-        //
-        // NOTE: candle 0.9's functional API doesn't support in-place tensor
-        // writes (no slice_set/index_put_), so we can't pre-allocate a fixed
-        // buffer and write into it. Tensor::cat is the standard candle approach.
-        // The O(N) per-step copy cost is acceptable for ASR decode lengths
-        // (~50-200 generated tokens). Tensor::clone() below is cheap (Arc bump).
-        let (k_full, v_full) = match &self.kv_cache {
-            Some((prev_k, prev_v)) => {
-                let k_full = Tensor::cat(&[prev_k, &k], 2)?;
-                let v_full = Tensor::cat(&[prev_v, &v], 2)?;
-                (k_full, v_full)
-            }
-            None => (k, v),
-        };
-        self.cache_len = k_full.dims()[2];
-        // BUG 4: store owned values, then borrow back — avoids a redundant clone.
-        self.kv_cache = Some((k_full, v_full));
-        let (k_full, v_full) = self.kv_cache.as_ref().unwrap();
+        // KV cache: write new K/V into pre-allocated buffers via slice_set.
+        // This avoids Tensor::cat which creates old+new+result = 3× peak VRAM.
+        // Falls back to Tensor::cat if cache wasn't pre-allocated (shouldn't happen).
+        if self.cache_capacity > 0 {
+            // Pre-allocated path: write into existing buffer
+            let (k_buf, v_buf) = self.kv_cache.as_ref().unwrap();
+            k_buf.slice_set(&k, 2, self.cache_len)?;
+            v_buf.slice_set(&v, 2, self.cache_len)?;
+            self.cache_len += seq;
+        } else {
+            // Fallback: no pre-allocation, use cat (legacy path)
+            let (k_full, v_full) = match &self.kv_cache {
+                Some((prev_k, prev_v)) => {
+                    let k_full = Tensor::cat(&[prev_k, &k], 2)?;
+                    let v_full = Tensor::cat(&[prev_v, &v], 2)?;
+                    (k_full, v_full)
+                }
+                None => (k, v),
+            };
+            self.cache_len = k_full.dims()[2];
+            self.kv_cache = Some((k_full, v_full));
+        }
+        let (k_cache, v_cache) = self.kv_cache.as_ref().unwrap();
+        // Narrow to only the valid portion of the pre-allocated buffer
+        let k_full = k_cache.narrow(2, 0, self.cache_len)?;
+        let v_full = v_cache.narrow(2, 0, self.cache_len)?;
 
         // GQA (Grouped Query Attention): Q has more heads than KV.
         // For seq=1 decode (hot path): reshape Q into KV groups instead of
@@ -647,12 +667,17 @@ impl DecoderAttention {
             // q: (b, num_heads, 1, hd) → (b, num_kv_heads, n_rep, hd)
             let q = q.reshape((b, self.num_kv_heads, n_rep, self.head_dim))?;
             let k_t = k_full.transpose(D::Minus2, D::Minus1)?.contiguous()?; // (b, kv_h, hd, kv_len)
+            drop(k_full);
             // (b, kv_h, n_rep, hd) @ (b, kv_h, hd, kv_len) → (b, kv_h, n_rep, kv_len)
             let attn = (q.matmul(&k_t)? / scale)?;
+            drop(q);
+            drop(k_t);
             // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
             let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
             // (b, kv_h, n_rep, kv_len) @ (b, kv_h, kv_len, hd) → (b, kv_h, n_rep, hd)
             let out = attn.matmul(&v_full)?;
+            drop(attn);
+            drop(v_full);
             // (b, kv_h, n_rep, hd) → (b, num_heads, 1, hd) → (b, 1, hidden)
             out.reshape((b, self.num_heads, 1, self.head_dim))?
                 .transpose(1, 2)?.contiguous()?
@@ -665,25 +690,30 @@ impl DecoderAttention {
             } else {
                 k_full.clone()
             };
+            drop(k_full);
             let v_expanded = if n_rep > 1 {
                 let (b, h, s, d) = v_full.dims4()?;
                 v_full.unsqueeze(2)?.expand((b, h, n_rep, s, d))?.reshape((b, h * n_rep, s, d))?.contiguous()?
             } else {
                 v_full.clone()
             };
+            drop(v_full);
 
             let attn = (q.contiguous()?.matmul(&k_expanded.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / scale)?;
+            drop(q);
+            drop(k_expanded);
 
             // Causal mask for prefill (seq > 1)
-            // I-14: Build mask at target dtype directly to avoid CPU F32→GPU→F16 round-trip
+            // Build at target dtype on CPU, then transfer — halves GPU transfer for F16.
             let attn = if seq > 1 {
-                let offset = (kv_len - seq) as i64;
+                let offset = kv_len - seq;
+                // Fill the causal (zero) region row-by-row instead of per-element branch.
                 let mut mask_data = vec![f32::NEG_INFINITY; seq * kv_len];
                 for i in 0..seq {
-                    for j in 0..kv_len {
-                        if j as i64 <= i as i64 + offset {
-                            mask_data[i * kv_len + j] = 0.0;
-                        }
+                    let allowed = i + offset + 1; // number of allowed positions in this row
+                    let row_start = i * kv_len;
+                    for j in 0..allowed.min(kv_len) {
+                        mask_data[row_start + j] = 0.0;
                     }
                 }
                 let mask = Tensor::from_vec(mask_data, (1, 1, seq, kv_len), &Device::Cpu)?
@@ -697,6 +727,8 @@ impl DecoderAttention {
             // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
             let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
             let out = attn.matmul(&v_expanded)?;
+            drop(attn);
+            drop(v_expanded);
             out.transpose(1, 2)?.contiguous()?.reshape((b, seq, self.num_heads * self.head_dim))?
         };
 
@@ -706,6 +738,7 @@ impl DecoderAttention {
     fn clear_cache(&mut self) {
         self.kv_cache = None;
         self.cache_len = 0;
+        self.cache_capacity = 0;
     }
 }
 
@@ -756,6 +789,10 @@ impl DecoderLayer {
         let x = self.post_attention_layernorm.forward(&x)?;
         let x = self.mlp.forward(&x)?;
         x + residual
+    }
+
+    fn allocate_cache(&mut self, max_seq_len: usize, device: &Device, dtype: DType) -> Result<()> {
+        self.self_attn.allocate_cache(max_seq_len, device, dtype)
     }
 
     fn clear_cache(&mut self) {
@@ -812,6 +849,14 @@ impl TextDecoder {
 
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
+    }
+
+    /// Pre-allocate KV cache buffers across all layers for the given max sequence length.
+    fn allocate_caches(&mut self, max_seq_len: usize, device: &Device, dtype: DType) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.allocate_cache(max_seq_len, device, dtype)?;
+        }
+        Ok(())
     }
 
     fn clear_cache(&mut self) {
@@ -929,6 +974,9 @@ impl Qwen3ASRModel {
             (features, actual_len)
         }; // mel and encoder intermediates dropped here
 
+        // Sync device to reclaim mel/encoder intermediate VRAM before decode phase.
+        self.device.synchronize()?;
+
         // 3. Build prompt
         let (input_ids, audio_positions) = tokenizer.encode_asr_prompt(n_audio_tokens, language)?;
 
@@ -975,8 +1023,17 @@ impl Qwen3ASRModel {
         // holds &mut self.text_decoder (two disjoint borrows on different fields).
         let device = self.device.clone();
 
+        // Sync device before KV cache allocation to ensure splicing intermediates are freed.
+        device.synchronize()?;
+
         // The guard ensures clear_cache() is called on all exit paths (BUG 1).
         self.text_decoder.clear_cache();
+
+        // Pre-allocate KV cache buffers for the entire sequence (prefill + max generated tokens).
+        // This avoids Tensor::cat per decode step which creates 3× peak VRAM.
+        let cache_capacity = seq_len + self.max_new_tokens;
+        self.text_decoder.allocate_caches(cache_capacity, &device, self.dtype)?;
+
         let _cache_guard = CacheGuard(&mut self.text_decoder);
         let logits = _cache_guard.0.forward_embeds(&embeds, &position_ids)?;
         drop(embeds);
@@ -992,7 +1049,7 @@ impl Qwen3ASRModel {
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut cur_pos = seq_len;
 
-        for _ in 0..max_new_tokens {
+        for step in 0..max_new_tokens {
             // last_logits is (vocab_size,) — argmax gives the next token
             let next_token = last_logits
                 .argmax(D::Minus1)?
@@ -1014,6 +1071,11 @@ impl Qwen3ASRModel {
             last_logits = full_logits.i((0, full_logits.dims()[1] - 1))?;
             drop(full_logits);
             cur_pos += 1;
+
+            // Periodic sync to reclaim transient decode VRAM
+            if step > 0 && step % 100 == 0 {
+                device.synchronize()?;
+            }
         }
 
         // 9. Decode tokens to text
