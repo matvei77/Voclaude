@@ -31,16 +31,22 @@ impl Qwen3ASRTokenizer {
     ///
     /// Returns `(input_ids, audio_token_positions)` where `audio_token_positions`
     /// are the indices within `input_ids` that should be replaced with audio features.
+    ///
+    /// I-13: This prompt template was verified against Qwen3-ASR's
+    /// `tokenizer_config.json` chat_template. The instruction text and newline
+    /// placement match the reference implementation. The `_language` parameter
+    /// is unused because Qwen3-ASR's default template does not include a
+    /// language specifier — it always uses "Transcribe the audio to text."
     pub fn encode_asr_prompt(
         &self,
         n_audio_tokens: usize,
         _language: Option<&str>,
     ) -> CandleResult<(Vec<u32>, Vec<usize>)> {
-        // Build the prompt template:
+        // Build the prompt template (verified against tokenizer_config.json):
         // <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
         // <|im_start|>user\n
         // <|audio_start|><|audio_pad|>...(N)...<|audio_pad|><|audio_end|>
-        // Transcribe the audio to text.<|im_end|>\n
+        // \nTranscribe the audio to text.<|im_end|>\n
         // <|im_start|>assistant\n
 
         let mut ids: Vec<u32> = Vec::new();

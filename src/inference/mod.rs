@@ -17,7 +17,6 @@ pub enum InferenceStage {
 pub struct InferenceProgress {
     pub stage: InferenceStage,
     pub message: String,
-    pub percent: Option<u8>,
 }
 
 /// Backend-agnostic speech-to-text engine interface.

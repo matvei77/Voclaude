@@ -81,8 +81,25 @@ if (-not $Cpu) {
         Write-Host "Install CUDA Toolkit or set CUDA_PATH to fix this.`n" -ForegroundColor Yellow
     }
 
+    # S-4: Verify CUDA DLL major version matches the build environment to prevent
+    # silent crashes from mismatched cublas/candle ABI.
+    $ExpectedCudaMajor = $null
+    if ($env:CUDA_PATH -match 'v(\d+)\.\d+') {
+        $ExpectedCudaMajor = $Matches[1]
+    } elseif ((Get-Command nvcc -ErrorAction SilentlyContinue)) {
+        $nvccOut = nvcc --version 2>&1 | Select-String 'release (\d+)\.\d+'
+        if ($nvccOut) { $ExpectedCudaMajor = $nvccOut.Matches.Groups[1].Value }
+    }
+
     foreach ($entry in $Found.GetEnumerator()) {
         $dll = Split-Path -Leaf $entry.Value
+        # Check DLL version number matches expected CUDA major version
+        if ($ExpectedCudaMajor -and $dll -match '_(\d+)\.dll$') {
+            $dllMajor = $Matches[1]
+            if ($dllMajor -ne $ExpectedCudaMajor) {
+                Write-Host "  WARNING: $dll is CUDA $dllMajor but build environment is CUDA $ExpectedCudaMajor — ABI mismatch!" -ForegroundColor Red
+            }
+        }
         Copy-Item $entry.Value $StageDir
         Write-Host "  Bundled $dll" -ForegroundColor DarkGray
     }

@@ -10,9 +10,6 @@ repository = "https://github.com/matvei77/Voclaude"
 # Audio capture
 cpal = "0.15"
 
-# Audio processing
-rubato = "0.15"            # High-quality resampling
-
 # UI
 tray-icon = "0.19"
 global-hotkey = "0.6"

@@ -96,11 +96,17 @@ impl SessionStore {
         Ok(session)
     }
 
+    // P-7/E-10: All state transitions now guard on valid source states
+
     pub fn mark_transcribing(
         &mut self,
         audio: AudioMetadata,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = self.current.as_mut() {
+            if session.state != SessionState::Recording {
+                warn!("Cannot transition to Transcribing from {:?}", session.state);
+                return Ok(());
+            }
             session.state = SessionState::Transcribing;
             session.audio = Some(audio);
             session.ended_at_ms = Some(now_ms());
@@ -115,6 +121,10 @@ impl SessionStore {
         history_entry_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = self.current.as_mut() {
+            if session.state != SessionState::Transcribing {
+                warn!("Cannot transition to Completed from {:?}", session.state);
+                return Ok(());
+            }
             session.state = SessionState::Completed;
             session.transcript = Some(transcript);
             session.history_entry_id = history_entry_id;
@@ -126,6 +136,10 @@ impl SessionStore {
 
     pub fn mark_failed(&mut self, error: String) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = self.current.as_mut() {
+            if matches!(session.state, SessionState::Completed | SessionState::Aborted) {
+                warn!("Cannot transition to Failed from {:?}", session.state);
+                return Ok(());
+            }
             session.state = SessionState::Failed;
             session.error = Some(error);
             session.ended_at_ms = Some(now_ms());
@@ -136,6 +150,10 @@ impl SessionStore {
 
     pub fn mark_aborted(&mut self, reason: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = self.current.as_mut() {
+            if matches!(session.state, SessionState::Completed | SessionState::Aborted) {
+                warn!("Cannot transition to Aborted from {:?}", session.state);
+                return Ok(());
+            }
             session.state = SessionState::Aborted;
             session.error = reason;
             session.ended_at_ms = Some(now_ms());
@@ -167,8 +185,10 @@ impl SessionStore {
 }
 
 fn new_session_id() -> String {
+    // P-6: Include PID in session ID to avoid collision across restarts
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}", now_ms(), counter)
+    let pid = std::process::id();
+    format!("{}-{}-{}", now_ms(), pid, counter)
 }
 
 fn now_ms() -> u64 {
@@ -182,7 +202,15 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp_path = path.with_extension("json.tmp");
+    // P-2: Use unique temp path with PID+timestamp to avoid collision on crash
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_name = format!("{}.{}-{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(), pid, ts);
+    let temp_path = path.with_file_name(temp_name);
     let mut file = std::fs::File::create(&temp_path)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
@@ -202,6 +230,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
             }
         }
     }
+    let _ = std::fs::remove_file(&temp_path);
     Err(last_err.unwrap().into())
 }
 

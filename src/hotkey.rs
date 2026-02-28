@@ -5,15 +5,20 @@ use crate::app::AppEvent;
 use crossbeam_channel::Sender;
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
-    GlobalHotKeyEvent, GlobalHotKeyManager,
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace};
 
 pub struct HotkeyManager {
     manager: GlobalHotKeyManager,
     hotkeys: Vec<HotKey>,
+    shutdown: Arc<AtomicBool>,
+    // O-7: Store listener thread handle so Drop can join it
+    listener_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HotkeyManager {
@@ -37,16 +42,28 @@ impl HotkeyManager {
             hotkeys.push(hotkey);
         }
 
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_flag = Arc::clone(&shutdown);
+
         // Single unified listener thread for ALL hotkeys
-        std::thread::spawn(move || {
+        let listener_handle = std::thread::spawn(move || {
             info!("Unified hotkey listener started ({} bindings)", id_to_event.len());
             let receiver = GlobalHotKeyEvent::receiver();
             let min_event_gap = Duration::from_millis(150);
             let mut last_trigger_per_id: HashMap<u32, Instant> = HashMap::new();
 
             loop {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
+                        // Only act on key-down events — ignore Released to avoid double-fire
+                        if event.state == HotKeyState::Released {
+                            continue;
+                        }
+
                         if let Some(app_event) = id_to_event.get(&event.id) {
                             let now = Instant::now();
                             let last = last_trigger_per_id
@@ -79,7 +96,7 @@ impl HotkeyManager {
             }
         });
 
-        Ok(Self { manager, hotkeys })
+        Ok(Self { manager, hotkeys, shutdown, listener_handle: Some(listener_handle) })
     }
 
     fn parse_hotkey(s: &str) -> Result<HotKey, Box<dyn std::error::Error>> {
@@ -162,6 +179,28 @@ impl HotkeyManager {
                 "pageup" => key_code = Some(Code::PageUp),
                 "pagedown" => key_code = Some(Code::PageDown),
 
+                // O-1: Arrow keys and additional special keys
+                "arrowup" | "up" => key_code = Some(Code::ArrowUp),
+                "arrowdown" | "down" => key_code = Some(Code::ArrowDown),
+                "arrowleft" | "left" => key_code = Some(Code::ArrowLeft),
+                "arrowright" | "right" => key_code = Some(Code::ArrowRight),
+                "insert" => key_code = Some(Code::Insert),
+                "pause" => key_code = Some(Code::Pause),
+                "printscreen" | "prtsc" => key_code = Some(Code::PrintScreen),
+                "scrolllock" => key_code = Some(Code::ScrollLock),
+                "numlock" => key_code = Some(Code::NumLock),
+                "capslock" => key_code = Some(Code::CapsLock),
+                "contextmenu" => key_code = Some(Code::ContextMenu),
+
+                // Media keys
+                "mediaplaypause" => key_code = Some(Code::MediaPlayPause),
+                "mediastop" => key_code = Some(Code::MediaStop),
+                "mediatracknext" | "medianext" => key_code = Some(Code::MediaTrackNext),
+                "mediatrackprevious" | "mediaprev" => key_code = Some(Code::MediaTrackPrevious),
+                "audiovolumemute" | "volumemute" => key_code = Some(Code::AudioVolumeMute),
+                "audiovolumeup" | "volumeup" => key_code = Some(Code::AudioVolumeUp),
+                "audiovolumedown" | "volumedown" => key_code = Some(Code::AudioVolumeDown),
+
                 // Numpad keys
                 "numpad0" | "num0" => key_code = Some(Code::Numpad0),
                 "numpad1" | "num1" => key_code = Some(Code::Numpad1),
@@ -200,12 +239,20 @@ impl HotkeyManager {
         }
 
         let code = key_code.ok_or("No key specified in hotkey")?;
-        Ok(HotKey::new(Some(modifiers), code))
+        // O-2: Pass None instead of Some(empty) when no modifiers are specified,
+        // since RegisterHotKey with fsModifiers=0 may fail for some key codes.
+        let mods = if modifiers.is_empty() { None } else { Some(modifiers) };
+        Ok(HotKey::new(mods, code))
     }
 }
 
 impl Drop for HotkeyManager {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // O-7: Join listener thread to prevent zombie events during reconfiguration
+        if let Some(handle) = self.listener_handle.take() {
+            let _ = handle.join();
+        }
         for hotkey in &self.hotkeys {
             if let Err(e) = self.manager.unregister(*hotkey) {
                 error!("Failed to unregister hotkey: {}", e);

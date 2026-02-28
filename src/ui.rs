@@ -1,16 +1,15 @@
-//! History window, HUD overlay, and log buffer.
+//! History window and log buffer.
 //!
 //! Uses egui's multi-viewport support: the root viewport stays off-screen
-//! while HUD and History are spawned as separate OS windows via
+//! while History is spawned as a separate OS window via
 //! `show_viewport_deferred()`.
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -47,11 +46,15 @@ impl LogBuffer {
         }
     }
 
+    // U-12: Recover from poisoned lock instead of returning empty silently
     pub fn snapshot(&self) -> Vec<String> {
-        let inner = self.inner.lock().ok();
-        inner
-            .map(|buffer| buffer.lines.iter().cloned().collect())
-            .unwrap_or_default()
+        match self.inner.lock() {
+            Ok(buffer) => buffer.lines.iter().cloned().collect(),
+            Err(poisoned) => {
+                // Recover data from poisoned mutex
+                poisoned.into_inner().lines.iter().cloned().collect()
+            }
+        }
     }
 
     fn push_chunk(&self, chunk: &str) {
@@ -96,7 +99,9 @@ impl<'a> MakeWriter<'a> for LogBufferMakeWriter {
 impl Write for LogBufferWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let written = self.stdout.write(buf)?;
-        let chunk = String::from_utf8_lossy(&buf[..written]);
+        // U-9: Use the full buf slice (not partial write result) to avoid
+        // mid-UTF-8 truncation in the ring buffer
+        let chunk = String::from_utf8_lossy(buf);
         self.buffer.push_chunk(&chunk);
         Ok(written)
     }
@@ -104,16 +109,6 @@ impl Write for LogBufferWriter {
     fn flush(&mut self) -> io::Result<()> {
         self.stdout.flush()
     }
-}
-
-// ---------------------------------------------------------------------------
-// Command enum (HUD-only; history/status use shared state directly)
-// ---------------------------------------------------------------------------
-
-pub(crate) enum UiCommand {
-    HudSetState(HudState),
-    HudSetAccel(bool),
-    HudSetLevel(f32),
 }
 
 // ---------------------------------------------------------------------------
@@ -154,28 +149,12 @@ impl UiStatus {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum HudState {
-    Idle,
-    Recording,
-    Transcribing { message: String, percent: Option<u8> },
-    Ready { message: String },
-}
-
 // ---------------------------------------------------------------------------
 // Shared state for multi-viewport
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct SharedUiState {
-    // HUD
-    hud_visible: Arc<AtomicBool>,
-    hud_state: Arc<Mutex<HudState>>,
-    hud_gpu_enabled: Arc<AtomicBool>,
-    hud_input_level: Arc<Mutex<f32>>,
-    hud_recording_started_at: Arc<Mutex<Option<Instant>>>,
-    hud_ready_until: Arc<Mutex<Option<Instant>>>,
-
     // History
     history_visible: Arc<AtomicBool>,
     history_needs_focus: Arc<AtomicBool>,
@@ -191,15 +170,8 @@ struct SharedUiState {
 }
 
 impl SharedUiState {
-    fn new(log_buffer: LogBuffer, gpu_enabled: bool) -> Self {
+    fn new(log_buffer: LogBuffer) -> Self {
         Self {
-            hud_visible: Arc::new(AtomicBool::new(false)),
-            hud_state: Arc::new(Mutex::new(HudState::Idle)),
-            hud_gpu_enabled: Arc::new(AtomicBool::new(gpu_enabled)),
-            hud_input_level: Arc::new(Mutex::new(0.0)),
-            hud_recording_started_at: Arc::new(Mutex::new(None)),
-            hud_ready_until: Arc::new(Mutex::new(None)),
-
             history_visible: Arc::new(AtomicBool::new(false)),
             history_needs_focus: Arc::new(AtomicBool::new(false)),
             history_viewport_alive: Arc::new(AtomicBool::new(false)),
@@ -224,16 +196,14 @@ impl SharedUiState {
 
 pub struct UiManager {
     shared: SharedUiState,
-    command_tx: Sender<UiCommand>,
     alive: Arc<AtomicBool>,
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
 }
 
 impl UiManager {
-    pub fn new(log_buffer: LogBuffer, gpu_enabled: bool) -> Result<Self, Box<dyn std::error::Error>> {
-        let (command_tx, command_rx) = unbounded();
-        let shared = SharedUiState::new(log_buffer, gpu_enabled);
-        let app = RootApp::new(command_rx, shared.clone());
+    pub fn new(log_buffer: LogBuffer, _gpu_enabled: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        let shared = SharedUiState::new(log_buffer);
+        let app = RootApp::new(shared.clone());
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = alive.clone();
         let alive_keepalive = alive.clone();
@@ -242,9 +212,13 @@ impl UiManager {
 
         std::thread::spawn(move || {
             let options = eframe::NativeOptions {
+                // U-7: Place root viewport off-screen and use WS_EX_TOOLWINDOW
+                // (via with_taskbar(false)) to prevent it from appearing in
+                // Alt-Tab on Windows 11.
                 viewport: egui::ViewportBuilder::default()
                     .with_title("Voclaude")
                     .with_inner_size([1.0, 1.0])
+                    .with_position(egui::pos2(-100.0, -100.0))
                     .with_visible(false)
                     .with_decorations(false)
                     .with_taskbar(false),
@@ -264,18 +238,20 @@ impl UiManager {
                     }
 
                     // Keepalive thread: pokes the root event loop every 100ms so it
-                    // stays responsive to incoming commands even when no child
-                    // viewports are visible.
+                    // stays responsive even when no child viewports are visible.
+                    // U-10: Check alive flag BEFORE requesting repaint, and drop
+                    // context clone promptly after loop exit (no strong ref past shutdown)
                     let keepalive_ctx = cc.egui_ctx.clone();
                     let keepalive_alive = alive_keepalive.clone();
                     std::thread::spawn(move || {
-                        loop {
+                        while keepalive_alive.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(100));
-                            if !keepalive_alive.load(Ordering::Relaxed) {
+                            if !keepalive_alive.load(Ordering::SeqCst) {
                                 break;
                             }
                             keepalive_ctx.request_repaint();
                         }
+                        drop(keepalive_ctx); // Release Context clone promptly
                     });
 
                     Box::new(app)
@@ -287,7 +263,20 @@ impl UiManager {
         });
 
         info!("UI thread started");
-        Ok(Self { shared, command_tx, alive, repaint_ctx })
+
+        // U-2: Wait up to 500ms for repaint_ctx to be initialized by eframe
+        // creation closure, so early wake() calls aren't silently dropped.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if let Ok(guard) = repaint_ctx.lock() {
+                if guard.is_some() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        Ok(Self { shared, alive, repaint_ctx })
     }
 
     fn wake(&self) {
@@ -299,15 +288,15 @@ impl UiManager {
     }
 
     pub fn toggle(&self) -> bool {
-        if !self.alive.load(Ordering::Relaxed) {
+        if !self.alive.load(Ordering::SeqCst) {
             error!("UI is not running");
             return false;
         }
-        let prev = self.shared.history_visible.load(Ordering::Relaxed);
+        // U-8: Use fetch_xor for atomic toggle (avoids load→!→store race)
+        let prev = self.shared.history_visible.fetch_xor(true, Ordering::SeqCst);
         let new_val = !prev;
-        self.shared.history_visible.store(new_val, Ordering::Relaxed);
         if new_val {
-            self.shared.history_needs_focus.store(true, Ordering::Relaxed);
+            self.shared.history_needs_focus.store(true, Ordering::SeqCst);
         }
         info!("History toggle: {} -> {}", prev, new_val);
         self.wake();
@@ -315,12 +304,13 @@ impl UiManager {
     }
 
     pub fn show(&self) -> bool {
-        if !self.alive.load(Ordering::Relaxed) {
+        if !self.alive.load(Ordering::SeqCst) {
             error!("UI is not running");
             return false;
         }
-        self.shared.history_visible.store(true, Ordering::Relaxed);
-        self.shared.history_needs_focus.store(true, Ordering::Relaxed);
+        // U-11: Use SeqCst for portable happens-before guarantee
+        self.shared.history_visible.store(true, Ordering::SeqCst);
+        self.shared.history_needs_focus.store(true, Ordering::SeqCst);
         info!("History show requested");
         self.wake();
         true
@@ -344,6 +334,10 @@ impl UiManager {
             for entry in entries {
                 if !entry.trim().is_empty() {
                     history.push_back(entry);
+                    // U-5: Enforce the same 500-entry cap as push_history
+                    if history.len() > 500 {
+                        history.pop_front();
+                    }
                 }
             }
         }
@@ -356,64 +350,6 @@ impl UiManager {
         }
         self.wake();
     }
-
-    pub fn command_sender(&self) -> Sender<UiCommand> {
-        self.command_tx.clone()
-    }
-
-    pub fn repaint_signal(&self) -> Arc<Mutex<Option<egui::Context>>> {
-        self.repaint_ctx.clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HudManager
-// ---------------------------------------------------------------------------
-
-pub struct HudManager {
-    command_tx: Sender<UiCommand>,
-    repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
-}
-
-impl HudManager {
-    pub fn new(command_tx: Sender<UiCommand>, repaint_ctx: Arc<Mutex<Option<egui::Context>>>) -> Self {
-        Self { command_tx, repaint_ctx }
-    }
-
-    fn wake(&self) {
-        if let Ok(guard) = self.repaint_ctx.lock() {
-            if let Some(ctx) = guard.as_ref() {
-                ctx.request_repaint();
-            }
-        }
-    }
-
-    pub fn set_state(&self, state: HudState) -> bool {
-        if let Err(err) = self.command_tx.send(UiCommand::HudSetState(state)) {
-            error!("Failed to send HUD state: {}", err);
-            return false;
-        }
-        self.wake();
-        true
-    }
-
-    pub fn set_accel(&self, gpu_enabled: bool) -> bool {
-        if let Err(err) = self.command_tx.send(UiCommand::HudSetAccel(gpu_enabled)) {
-            error!("Failed to send HUD accel state: {}", err);
-            return false;
-        }
-        self.wake();
-        true
-    }
-
-    pub fn set_level(&self, level: f32) -> bool {
-        if let Err(err) = self.command_tx.send(UiCommand::HudSetLevel(level)) {
-            error!("Failed to send HUD level: {}", err);
-            return false;
-        }
-        self.wake();
-        true
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,91 +358,14 @@ impl HudManager {
 
 struct RootApp {
     shared: SharedUiState,
-    command_rx: Receiver<UiCommand>,
     theme_applied: bool,
 }
 
 impl RootApp {
-    fn new(command_rx: Receiver<UiCommand>, shared: SharedUiState) -> Self {
+    fn new(shared: SharedUiState) -> Self {
         Self {
             shared,
-            command_rx,
             theme_applied: false,
-        }
-    }
-
-    fn apply_commands(&self) {
-        while let Ok(cmd) = self.command_rx.try_recv() {
-            match cmd {
-                UiCommand::HudSetState(state) => {
-                    match &state {
-                        HudState::Idle => {
-                            self.shared.hud_visible.store(false, Ordering::Relaxed);
-                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
-                                *s = None;
-                            }
-                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
-                                *s = None;
-                            }
-                        }
-                        HudState::Recording => {
-                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
-                                if s.is_none() {
-                                    *s = Some(Instant::now());
-                                }
-                            }
-                            self.shared.hud_visible.store(true, Ordering::Relaxed);
-                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
-                                *s = None;
-                            }
-                        }
-                        HudState::Transcribing { .. } => {
-                            self.shared.hud_visible.store(true, Ordering::Relaxed);
-                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
-                                *s = None;
-                            }
-                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
-                                *s = None;
-                            }
-                        }
-                        HudState::Ready { .. } => {
-                            self.shared.hud_visible.store(true, Ordering::Relaxed);
-                            if let Ok(mut s) = self.shared.hud_recording_started_at.lock() {
-                                *s = None;
-                            }
-                            if let Ok(mut s) = self.shared.hud_ready_until.lock() {
-                                *s = Some(Instant::now() + Duration::from_secs(3));
-                            }
-                        }
-                    }
-                    if let Ok(mut s) = self.shared.hud_state.lock() {
-                        *s = state;
-                    }
-                }
-                UiCommand::HudSetAccel(gpu_enabled) => {
-                    self.shared.hud_gpu_enabled.store(gpu_enabled, Ordering::Relaxed);
-                }
-                UiCommand::HudSetLevel(level) => {
-                    if let Ok(mut s) = self.shared.hud_input_level.lock() {
-                        *s = level.clamp(0.0, 1.0);
-                    }
-                }
-            }
-        }
-    }
-
-    fn tick_hud_timers(&self) {
-        let ready_until = self.shared.hud_ready_until.lock().ok().and_then(|g| *g);
-        if let Some(ready_until) = ready_until {
-            if Instant::now() >= ready_until {
-                if let Ok(mut s) = self.shared.hud_state.lock() {
-                    *s = HudState::Idle;
-                }
-                self.shared.hud_visible.store(false, Ordering::Relaxed);
-                if let Ok(mut s) = self.shared.hud_ready_until.lock() {
-                    *s = None;
-                }
-            }
         }
     }
 }
@@ -523,36 +382,6 @@ impl eframe::App for RootApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
-        self.apply_commands();
-        self.tick_hud_timers();
-
-        // Spawn HUD child viewport when visible
-        if self.shared.hud_visible.load(Ordering::Relaxed) {
-            let monitor = get_primary_screen_size();
-            let hud_w = 340.0_f32;
-            let hud_h = 72.0_f32;
-            let x = monitor.x - hud_w - 20.0;
-            let y = 24.0;
-
-            let shared = self.shared.clone();
-            ctx.show_viewport_deferred(
-                egui::ViewportId::from_hash_of("voclaude_hud"),
-                egui::ViewportBuilder::default()
-                    .with_title("Voclaude HUD")
-                    .with_inner_size([hud_w, hud_h])
-                    .with_position(egui::pos2(x, y))
-                    .with_decorations(false)
-                    .with_always_on_top()
-                    .with_taskbar(false),
-                move |ctx, _class| {
-                    render_hud(ctx, &shared);
-                },
-            );
-
-            // Keep root repainting to tick HUD timers
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-
         // Spawn History child viewport when visible
         let history_vp_id = egui::ViewportId::from_hash_of("voclaude_history");
         if self.shared.history_visible.load(Ordering::Relaxed) {
@@ -562,7 +391,7 @@ impl eframe::App for RootApp {
             // Only send focus commands if the viewport has already been created
             // and painted at least once. On first open, the deferred viewport
             // callback will handle the initial focus.
-            if self.shared.history_needs_focus.swap(false, Ordering::Relaxed) && viewport_alive {
+            if viewport_alive && self.shared.history_needs_focus.swap(false, Ordering::Relaxed) {
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd_to(history_vp_id, egui::ViewportCommand::Focus);
@@ -579,9 +408,15 @@ impl eframe::App for RootApp {
                 .with_visible(true);
 
             if !viewport_alive {
-                let monitor = get_primary_screen_size();
-                let x = (monitor.x - 560.0) / 2.0;
-                let y = (monitor.y - 520.0) / 2.0;
+                // U-6: GetSystemMetrics returns physical pixels for the primary
+                // monitor. We divide by the root viewport's pixels_per_point(),
+                // which is approximate on multi-monitor setups with different DPI.
+                // Clamp to ensure the window doesn't open off-screen.
+                let monitor_phys = get_primary_screen_size();
+                let ppp = ctx.pixels_per_point();
+                let monitor = egui::vec2(monitor_phys.x / ppp, monitor_phys.y / ppp);
+                let x = ((monitor.x - 560.0) / 2.0).max(0.0);
+                let y = ((monitor.y - 520.0) / 2.0).max(0.0);
                 builder = builder.with_position(egui::pos2(x, y));
             }
 
@@ -596,8 +431,7 @@ impl eframe::App for RootApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
 
-                    // Handle close — this fires during repaint. Also check if
-                    // visibility was toggled off externally.
+                    // Handle close
                     if ctx.input(|i| i.viewport().close_requested()) {
                         shared.history_visible.store(false, Ordering::Relaxed);
                         shared.history_viewport_alive.store(false, Ordering::Relaxed);
@@ -605,12 +439,13 @@ impl eframe::App for RootApp {
                     render_history(ctx, &shared);
                 },
             );
-            // Keep root repainting while history is visible so close events
-            // from the deferred viewport are captured promptly.
-            ctx.request_repaint_after(Duration::from_millis(200));
+            // U-1: Keep root repainting while history is visible so close events
+            // from the deferred viewport are captured promptly. Use 50ms instead
+            // of 200ms to avoid phantom window re-entry.
+            ctx.request_repaint_after(Duration::from_millis(50));
         } else {
-            // Viewport should be hidden — reset alive flag so next open
-            // gets proper first-creation handling.
+            // History not visible — reset viewport_alive so next open
+            // gets fresh position and focus.
             self.shared.history_viewport_alive.store(false, Ordering::Relaxed);
         }
 
@@ -622,143 +457,6 @@ impl eframe::App for RootApp {
 // ---------------------------------------------------------------------------
 // Viewport renderers
 // ---------------------------------------------------------------------------
-
-fn render_hud(ctx: &egui::Context, shared: &SharedUiState) {
-    let hud_state = shared
-        .hud_state
-        .lock()
-        .ok()
-        .map(|g| g.clone())
-        .unwrap_or(HudState::Idle);
-    let gpu_enabled = shared.hud_gpu_enabled.load(Ordering::Relaxed);
-    let input_level = shared
-        .hud_input_level
-        .lock()
-        .ok()
-        .map(|g| *g)
-        .unwrap_or(0.0);
-    let recording_started_at = shared
-        .hud_recording_started_at
-        .lock()
-        .ok()
-        .and_then(|g| *g);
-
-    let bg = egui::Color32::from_rgb(18, 18, 28);
-
-    egui::CentralPanel::default()
-        .frame(
-            egui::Frame::none()
-                .fill(bg)
-                .inner_margin(egui::Margin::same(10.0)),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                match &hud_state {
-                    HudState::Recording => {
-                        // Pulsing red dot
-                        let (dot_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(14.0, 14.0),
-                            egui::Sense::hover(),
-                        );
-                        let t = ui.input(|i| i.time);
-                        let pulse = (t * 3.0).sin() as f32 * 0.3 + 0.7;
-                        ui.painter().circle_filled(
-                            dot_rect.center(),
-                            5.0,
-                            egui::Color32::from_rgb(
-                                (255.0 * pulse) as u8,
-                                50,
-                                50,
-                            ),
-                        );
-
-                        let elapsed = recording_started_at
-                            .map(|s| s.elapsed())
-                            .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Recording  {}",
-                                format_duration(elapsed)
-                            ))
-                            .size(14.0)
-                            .color(egui::Color32::from_rgb(230, 230, 230)),
-                        );
-                    }
-                    HudState::Transcribing { message, percent } => {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        let text = match percent {
-                            Some(p) => format!("{} ({}%)", message, p),
-                            None => message.clone(),
-                        };
-                        ui.label(
-                            egui::RichText::new(text)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(180, 180, 230)),
-                        );
-                    }
-                    HudState::Ready { message } => {
-                        let (dot_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(14.0, 14.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().circle_filled(
-                            dot_rect.center(),
-                            5.0,
-                            egui::Color32::from_rgb(78, 204, 163),
-                        );
-                        ui.label(
-                            egui::RichText::new(message)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(180, 230, 200)),
-                        );
-                    }
-                    HudState::Idle => {}
-                }
-
-                // GPU/CPU badge on right
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let (text, color) = if gpu_enabled {
-                            ("GPU", egui::Color32::from_rgb(78, 204, 163))
-                        } else {
-                            ("CPU", egui::Color32::from_rgb(130, 170, 230))
-                        };
-                        let badge_bg = egui::Color32::from_rgba_unmultiplied(
-                            color.r() / 4,
-                            color.g() / 4,
-                            color.b() / 4,
-                            180,
-                        );
-                        egui::Frame::none()
-                            .fill(badge_bg)
-                            .rounding(egui::Rounding::same(4.0))
-                            .inner_margin(egui::Margin {
-                                left: 6.0,
-                                right: 6.0,
-                                top: 2.0,
-                                bottom: 2.0,
-                            })
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(text)
-                                        .size(11.0)
-                                        .color(color)
-                                        .strong(),
-                                );
-                            });
-                    },
-                );
-            });
-
-            if matches!(hud_state, HudState::Recording) {
-                ui.add_space(6.0);
-                draw_level_bar(ui, input_level, ui.available_width(), 6.0);
-            }
-        });
-
-    ctx.request_repaint_after(Duration::from_millis(100));
-}
 
 fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
     let status = shared
@@ -906,11 +604,8 @@ fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
                 if let Some(device) = &status.input_device {
                     if !device.is_empty() {
                         ui.separator();
-                        let short = if device.len() > 25 {
-                            &device[..25]
-                        } else {
-                            device
-                        };
+                        let short: String = device.chars().take(25).collect();
+                        let short = short.as_str();
                         ui.label(
                             egui::RichText::new(short)
                                 .size(10.0)
@@ -935,9 +630,11 @@ fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
     let show_logs = shared.show_logs.load(Ordering::Relaxed);
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        // Filter text input
+        // U-3: Use unwrap_or_else to recover from poisoned filter mutex
+        let filter_lower;
         {
             let mut filter_guard = shared.filter.lock().unwrap_or_else(|e| e.into_inner());
+            filter_lower = filter_guard.trim().to_lowercase();
             ui.horizontal(|ui| {
                 ui.label("Search:");
                 ui.add(
@@ -952,12 +649,6 @@ fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
         ui.add_space(4.0);
 
         // Snapshot data for rendering (avoids holding locks during layout)
-        let filter_lower = shared
-            .filter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .trim()
-            .to_lowercase();
         let history: Vec<String> = shared
             .history
             .lock()
@@ -1003,10 +694,13 @@ fn render_history(ctx: &egui::Context, shared: &SharedUiState) {
                                     egui::Layout::right_to_left(egui::Align::Min),
                                     |ui| {
                                         if ui.small_button("Copy").clicked() {
-                                            if let Ok(mut clipboard) =
-                                                arboard::Clipboard::new()
-                                            {
-                                                let _ = clipboard.set_text(entry);
+                                            // U-4: arboard::Clipboard is created per-click.
+                                            // Win32 OpenClipboard serializes access; if the
+                                            // app thread holds the clipboard, this will fail
+                                            // gracefully with the warning below.
+                                            match arboard::Clipboard::new().and_then(|mut c| c.set_text(entry.to_string())) {
+                                                Ok(()) => {}
+                                                Err(e) => tracing::warn!("Clipboard copy failed (may be locked by another thread): {}", e),
                                             }
                                         }
                                     },
@@ -1096,13 +790,6 @@ fn draw_level_bar(ui: &mut egui::Ui, level: f32, width: f32, height: f32) {
         };
         painter.rect_filled(filled, height / 2.0, color);
     }
-}
-
-fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    let minutes = total_secs / 60;
-    let seconds = total_secs % 60;
-    format!("{:02}:{:02}", minutes, seconds)
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {

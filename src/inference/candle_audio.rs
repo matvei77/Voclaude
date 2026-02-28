@@ -17,6 +17,11 @@ pub const N_MELS: usize = 128;
 /// Compute 128-bin log-mel spectrogram from PCM samples.
 /// Returns tensor of shape `(1, N_MELS, n_frames)`.
 pub fn pcm_to_mel(samples: &[f32], device: &Device) -> Result<Tensor> {
+    // I-5: Guard against empty audio (usize underflow in reflect padding)
+    if samples.is_empty() {
+        return Err(candle_core::Error::Msg("Cannot compute mel spectrogram from empty audio".to_string()));
+    }
+
     // Center-pad the signal (like librosa / Whisper feature extractor)
     let pad = N_FFT / 2;
     let mut padded = vec![0.0f32; pad + samples.len() + pad];
@@ -31,16 +36,18 @@ pub fn pcm_to_mel(samples: &[f32], device: &Device) -> Result<Tensor> {
     }
 
     let magnitudes = stft_magnitudes(&padded);
-    let filters = compute_mel_filterbank();
+    // I-15: Use cached filterbank instead of recomputing each call
+    let filters = mel_filterbank();
     let n_freq = N_FFT / 2 + 1;
-    let n_frames = magnitudes[0].len();
+    // I-2: Drop last STFT frame to match Qwen3-ASR feature extractor (stft[..., :-1])
+    let n_frames = if magnitudes[0].len() > 1 { magnitudes[0].len() - 1 } else { magnitudes[0].len() };
 
-    // magnitudes: (n_freq, n_frames) as flat vec
-    let mag_flat: Vec<f32> = magnitudes.iter().flat_map(|row| row.iter().copied()).collect();
+    // magnitudes: (n_freq, n_frames) as flat vec — only take first n_frames columns
+    let mag_flat: Vec<f32> = magnitudes.iter().flat_map(|row| row[..n_frames].iter().copied()).collect();
     let mag_tensor = Tensor::from_vec(mag_flat, (n_freq, n_frames), device)?;
 
     // filters: (N_MELS, n_freq)
-    let filter_flat: Vec<f32> = filters.into_iter().flatten().collect();
+    let filter_flat: Vec<f32> = filters.iter().flat_map(|row| row.iter().copied()).collect();
     let filter_tensor = Tensor::from_vec(filter_flat, (N_MELS, n_freq), device)?;
 
     // mel_spec = filters @ magnitudes => (N_MELS, n_frames)
@@ -120,15 +127,41 @@ fn stft_magnitudes(samples: &[f32]) -> Vec<Vec<f32>> {
 }
 
 // ---------------------------------------------------------------------------
-// Mel filterbank (Slaney-style, matches librosa / Whisper)
+// Mel filterbank (Slaney-style piecewise, matches librosa / Whisper)
 // ---------------------------------------------------------------------------
 
+// I-1: Use Slaney piecewise mel scale instead of HTK formula.
+// Slaney: linear below 1000 Hz, logarithmic above.
+const SLANEY_F_MIN: f64 = 0.0;
+const SLANEY_F_SP: f64 = 200.0 / 3.0;
+const SLANEY_MIN_LOG_HZ: f64 = 1000.0;
+const SLANEY_MIN_LOG_MEL: f64 = (SLANEY_MIN_LOG_HZ - SLANEY_F_MIN) / SLANEY_F_SP;
+
+fn slaney_logstep() -> f64 {
+    6.4_f64.ln() / 27.0
+}
+
 fn hz_to_mel(hz: f64) -> f64 {
-    2595.0 * (1.0 + hz / 700.0).log10()
+    if hz >= SLANEY_MIN_LOG_HZ {
+        SLANEY_MIN_LOG_MEL + (hz / SLANEY_MIN_LOG_HZ).ln() / slaney_logstep()
+    } else {
+        (hz - SLANEY_F_MIN) / SLANEY_F_SP
+    }
 }
 
 fn mel_to_hz(mel: f64) -> f64 {
-    700.0 * (10.0f64.powf(mel / 2595.0) - 1.0)
+    if mel >= SLANEY_MIN_LOG_MEL {
+        SLANEY_MIN_LOG_HZ * (slaney_logstep() * (mel - SLANEY_MIN_LOG_MEL)).exp()
+    } else {
+        SLANEY_F_MIN + SLANEY_F_SP * mel
+    }
+}
+
+// I-15: Cache the mel filterbank (it never changes)
+fn mel_filterbank() -> &'static Vec<Vec<f32>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+    CACHE.get_or_init(compute_mel_filterbank)
 }
 
 fn compute_mel_filterbank() -> Vec<Vec<f32>> {

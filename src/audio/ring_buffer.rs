@@ -4,6 +4,11 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// SPSC ring buffer for f32 samples.
+///
+/// A-1: Safety invariant — `push_*` methods must only be called from a single
+/// producer thread (the CPAL audio callback), and `pop_*` from a single consumer
+/// thread (the writer thread). `clear()` must only be called when no concurrent
+/// push/pop is in progress (i.e., between recordings).
 pub struct RingBuffer {
     buffer: Box<[UnsafeCell<f32>]>,
     capacity: usize,
@@ -12,6 +17,10 @@ pub struct RingBuffer {
     tail: AtomicUsize,
 }
 
+// A-1: SAFETY: This is an SPSC buffer. The producer (audio callback) only writes
+// via push_* (advancing head), and the consumer (writer thread) only reads via
+// pop_* (advancing tail). The atomic head/tail with Acquire/Release ordering
+// ensures proper synchronization between the two threads.
 unsafe impl Send for RingBuffer {}
 unsafe impl Sync for RingBuffer {}
 
@@ -39,9 +48,11 @@ impl RingBuffer {
         self.len() == 0
     }
 
+    /// A-5: Clear must only be called when no concurrent push/pop is in progress.
+    /// Uses SeqCst to ensure full fence visibility.
     pub fn clear(&self) {
-        let head = self.head.load(Ordering::Relaxed);
-        self.tail.store(head, Ordering::Release);
+        let head = self.head.load(Ordering::SeqCst);
+        self.tail.store(head, Ordering::SeqCst);
     }
 
     pub fn push_slice(&self, input: &[f32]) -> usize {

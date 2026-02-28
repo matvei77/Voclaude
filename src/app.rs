@@ -6,7 +6,7 @@ use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
 use crate::inference::{AsrEngine, InferenceProgress, InferenceStage, QwenEngine};
 use crate::tray::TrayManager;
-use crate::ui::{HudManager, HudState, LogBuffer, UiManager, UiStatus};
+use crate::ui::{LogBuffer, UiManager, UiStatus};
 use crate::session::SessionStore;
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -51,6 +51,8 @@ pub enum AppEvent {
     },
     /// History updated (for UI listeners)
     HistoryUpdated(HistoryEntry),
+    /// E-8/S-7: Config reloaded successfully — apply runtime-updatable fields
+    ConfigReloaded(Config),
 }
 
 /// Application state
@@ -184,8 +186,6 @@ impl App {
 
         let mut notifications = NotificationManager::new(self.config.show_notifications);
 
-        let hud = HudManager::new(self.ui.command_sender(), self.ui.repaint_signal());
-
         // History storage
         let (history_update_tx, history_update_rx) = bounded::<HistoryEntry>(32);
         let mut history = HistoryStore::load(self.config.history_max_entries, history_update_tx)?;
@@ -236,23 +236,19 @@ impl App {
 
                         self.state = AppState::Transcribing;
                         _tray.set_state(AppState::Transcribing);
-                        hud.set_state(HudState::Transcribing {
-                            message: "Recovering recording...".to_string(),
-                            percent: None,
-                        });
                         transcribe_started_at = Some(Instant::now());
                         ui_status.state = "Recovering".to_string();
                         ui_status.last_message = Some("Recovering recording...".to_string());
                         self.ui.set_status(ui_status.clone());
 
-                        if let Err(err) = inference_tx.send(InferenceCommand::TranscribeFile(path)) {
+                        // E-2: Use try_send to avoid blocking main thread
+                        if let Err(err) = inference_tx.try_send(InferenceCommand::TranscribeFile(path)) {
                             warn!("Failed to start recovery transcription: {}", err);
                             let _ = session_store.mark_failed(
                                 "Failed to start recovery transcription".to_string(),
                             );
                             self.state = AppState::Idle;
                             _tray.set_state(AppState::Idle);
-                            hud.set_state(HudState::Idle);
                             ui_status.state = "Idle".to_string();
                             ui_status.last_message = Some("Recovery failed".to_string());
                             self.ui.set_status(ui_status.clone());
@@ -287,13 +283,34 @@ impl App {
         let mut last_status_log = Instant::now();
         let mut messages_pumped: u64 = 0;
 
+        // Watchdog respawn counter and backoff state
+        let mut watchdog_respawn_count: u32 = 0;
+        // E-3: Deferred respawn (avoid blocking main thread with sleep)
+        let mut deferred_respawn_at: Option<Instant> = None;
+        // E-4: Keep sentinel receiver alive so send() doesn't immediately error
+        let mut _sentinel_rx: Option<Receiver<InferenceCommand>> = None;
+        // E-7: Track audio file path for cleanup after transcription
+        let mut pending_audio_path: Option<PathBuf> = None;
+
+        // Settings watcher cancellation flag
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mut settings_watcher_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
         // Main event loop - runs on main thread with Windows message pump
         while self.is_running {
             loop_count += 1;
 
             // Pump Windows messages (required for hotkeys and tray to work)
-            let pumped = Self::pump_messages();
+            let (pumped, os_quit) = Self::pump_messages();
             messages_pumped += pumped as u64;
+            // E-1: Handle OS shutdown/logoff via WM_QUIT
+            if os_quit {
+                info!("OS requested shutdown via WM_QUIT");
+                let _ = inference_tx.try_send(InferenceCommand::Shutdown);
+                settings_watcher_cancel.store(true, Ordering::Relaxed);
+                self.is_running = false;
+            }
 
             // Log status every 10 seconds
             if last_status_log.elapsed() > Duration::from_secs(10) {
@@ -305,25 +322,55 @@ impl App {
                 last_status_log = Instant::now();
             }
 
+            // E-3: Check deferred respawn (non-blocking, no sleep on main thread)
+            if let Some(respawn_at) = deferred_respawn_at {
+                if Instant::now() >= respawn_at {
+                    deferred_respawn_at = None;
+                    let (new_tx, new_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+                    inference_tx = new_tx;
+                    inference_handle = new_handle;
+                    info!("Inference worker respawned (attempt {})", watchdog_respawn_count);
+                    notifications.notify("Inference engine restarted after error");
+                }
+            }
+
             // Watchdog: detect inference worker panic and respawn
-            if inference_handle.is_finished() {
-                error!("Inference worker thread exited unexpectedly — respawning");
+            if deferred_respawn_at.is_none() && inference_handle.is_finished() {
+                error!("Inference worker thread exited unexpectedly — scheduling respawn");
                 let _ = inference_handle.join();
-                let (new_tx, new_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
-                inference_tx = new_tx;
-                inference_handle = new_handle;
-                info!("Inference worker respawned");
-                notifications.notify("Inference engine restarted after error");
+                watchdog_respawn_count += 1;
+                if watchdog_respawn_count > 5 {
+                    error!("Inference worker failed {} times; disabling", watchdog_respawn_count);
+                    notifications.notify("Inference engine failed repeatedly — restart app");
+                    // E-4: Keep receiver alive so send() returns SendError, not panic
+                    let (dead_tx, dead_rx) = bounded::<InferenceCommand>(1);
+                    _sentinel_rx = Some(dead_rx);
+                    // E-5: Use a flag-based sentinel that can be joined on shutdown
+                    let sentinel_shutdown = Arc::new(AtomicBool::new(false));
+                    let sentinel_flag = sentinel_shutdown.clone();
+                    inference_handle = thread::spawn(move || {
+                        while !sentinel_flag.load(Ordering::Relaxed) {
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    });
+                    inference_tx = dead_tx;
+                } else {
+                    // E-15: Use saturating_sub(1) to fix off-by-one backoff
+                    let backoff = Duration::from_millis(500 * 2u64.pow(watchdog_respawn_count.saturating_sub(1).min(4)));
+                    deferred_respawn_at = Some(Instant::now() + backoff);
+                    // Spawn a no-op placeholder so is_finished() doesn't fire again
+                    inference_handle = thread::spawn(|| {});
+                }
                 if self.state == AppState::Transcribing {
                     self.state = AppState::Idle;
+                    pending_audio_metadata = None;
                     _tray.set_state(AppState::Idle);
-                    hud.set_state(HudState::Ready {
-                        message: "Inference engine restarted".to_string(),
-                    });
                     ui_status.state = "Idle".to_string();
                     ui_status.last_message = Some("Inference engine restarted after error".to_string());
                     self.ui.set_status(ui_status.clone());
                 }
+                // E-14: Reset idle_unload_requested on watchdog respawn
+                idle_unload_requested = false;
             }
 
             // Check for idle unload
@@ -333,7 +380,8 @@ impl App {
                     && !idle_unload_requested
                 {
                     info!("Unloading model after {} seconds idle", idle_duration.as_secs());
-                    if let Err(err) = inference_tx.send(InferenceCommand::Unload) {
+                    // E-2: Use try_send to avoid blocking main thread
+                    if let Err(err) = inference_tx.try_send(InferenceCommand::Unload) {
                         warn!("Failed to request model unload: {}", err);
                     }
                     idle_unload_requested = true;
@@ -353,9 +401,6 @@ impl App {
             if let Some(level) = latest_level {
                 ui_status.input_level = Some(level);
                 self.ui.set_status(ui_status.clone());
-                if self.state == AppState::Recording {
-                    hud.set_level(level);
-                }
             }
 
             // Process events (non-blocking)
@@ -364,11 +409,11 @@ impl App {
                     info!("=== APP EVENT RECEIVED ===");
                     info!("Event: {:?}", event);
                     info!("Time since last activity: {:?}", last_activity.elapsed());
-                    last_activity = Instant::now();
-                    idle_unload_requested = false;
 
                     match event {
                         AppEvent::HotkeyPressed => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             info!("Processing HotkeyPressed, current state: {:?}", self.state);
                             match self.state {
                                 AppState::Idle => {
@@ -389,7 +434,6 @@ impl App {
                                     pending_audio_metadata = None;
                                     last_progress_stage = None;
                                     _tray.set_state(AppState::Recording);
-                                    hud.set_state(HudState::Recording);
                                     ui_status.state = "Recording".to_string();
                                     ui_status.last_message = Some("Recording...".to_string());
                                     self.ui.set_status(ui_status.clone());
@@ -403,12 +447,10 @@ impl App {
                                                 let _ = session_store.mark_aborted(Some("no_audio".to_string()));
                                                 self.state = AppState::Idle;
                                                 _tray.set_state(AppState::Idle);
-                                                hud.set_state(HudState::Idle);
                                                 ui_status.state = "Idle".to_string();
                                                 ui_status.last_message = Some("No audio captured".to_string());
                                                 ui_status.input_level = Some(0.0);
                                                 self.ui.set_status(ui_status.clone());
-                                                hud.set_level(0.0);
                                                 continue;
                                             }
 
@@ -422,16 +464,16 @@ impl App {
                                             pending_audio_metadata = Some(metadata.clone());
                                             let _ = session_store.mark_transcribing(metadata);
                                             _tray.set_state(AppState::Transcribing);
-                                            hud.set_state(HudState::Transcribing {
-                                                message: "Transcribing audio...".to_string(),
-                                                percent: None,
-                                            });
                                             transcribe_started_at = Some(Instant::now());
                                             ui_status.state = "Transcribing".to_string();
                                             ui_status.last_message = Some("Transcribing audio...".to_string());
                                             self.ui.set_status(ui_status.clone());
 
-                                            if let Err(err) = inference_tx.send(
+                                            // E-7: Track audio file path for cleanup
+                                            pending_audio_path = Some(recording.path.clone());
+
+                                            // E-2: Use try_send to avoid blocking main thread
+                                            if let Err(err) = inference_tx.try_send(
                                                 InferenceCommand::TranscribeFile(recording.path),
                                             ) {
                                                 error!("Failed to start transcription: {}", err);
@@ -441,12 +483,10 @@ impl App {
                                                 self.state = AppState::Idle;
                                                 pending_audio_metadata = None;
                                                 _tray.set_state(AppState::Idle);
-                                                hud.set_state(HudState::Idle);
                                                 ui_status.state = "Idle".to_string();
                                                 ui_status.last_message = Some("Transcription failed to start".to_string());
                                                 ui_status.input_level = Some(0.0);
                                                 self.ui.set_status(ui_status.clone());
-                                                hud.set_level(0.0);
                                             }
                                         }
                                         Err(e) => {
@@ -455,12 +495,10 @@ impl App {
                                                 .mark_failed("Failed to stop recording".to_string());
                                             self.state = AppState::Idle;
                                             _tray.set_state(AppState::Idle);
-                                            hud.set_state(HudState::Idle);
                                             ui_status.state = "Idle".to_string();
                                             ui_status.last_message = Some("Failed to stop recording".to_string());
                                             ui_status.input_level = Some(0.0);
                                             self.ui.set_status(ui_status.clone());
-                                            hud.set_level(0.0);
                                         }
                                     }
                                 }
@@ -471,22 +509,15 @@ impl App {
                             }
                         }
                         AppEvent::InferenceProgress(progress) => {
+                            // E-9: Only process progress when actively transcribing
                             if self.state == AppState::Transcribing {
                                 _tray.set_progress(&progress.message);
-                            }
-
-                            if self.state == AppState::Transcribing {
-                                let _ = hud.set_state(HudState::Transcribing {
-                                    message: progress.message.clone(),
-                                    percent: progress.percent,
-                                });
                                 ui_status.last_message = Some(progress.message.clone());
                                 self.ui.set_status(ui_status.clone());
-                            }
-
-                            if last_progress_stage != Some(progress.stage) {
-                                notifications.notify(&progress.message);
-                                last_progress_stage = Some(progress.stage);
+                                if last_progress_stage != Some(progress.stage) {
+                                    notifications.notify(&progress.message);
+                                    last_progress_stage = Some(progress.stage);
+                                }
                             }
                         }
                         AppEvent::InferenceEngineInfo {
@@ -502,19 +533,42 @@ impl App {
                                     Some("GPU init failed; using CPU".to_string());
                             }
                             self.ui.set_status(ui_status.clone());
-                            hud.set_accel(using_gpu);
                         }
                         AppEvent::TranscriptionComplete(result) => {
+                            // E-6: Guard against stale results from respawned worker
+                            if self.state != AppState::Transcribing {
+                                warn!("Ignoring stale TranscriptionComplete (state={:?})", self.state);
+                                continue;
+                            }
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
+                            // Reset respawn counter on successful transcription
+                            if matches!(result, Ok(_)) {
+                                watchdog_respawn_count = 0;
+                            }
+                            // E-7: Clean up audio file after transcription
+                            if let Some(audio_path) = pending_audio_path.take() {
+                                if audio_path.exists() {
+                                    if let Err(err) = std::fs::remove_file(&audio_path) {
+                                        warn!("Failed to delete audio file {:?}: {}", audio_path, err);
+                                    } else {
+                                        debug!("Cleaned up audio file: {:?}", audio_path);
+                                    }
+                                }
+                            }
                             match result {
                                 Ok(text) => {
-                                    info!("Transcribed: {}", text);
+                                    // S-1: Don't log full transcript (may contain sensitive dictation)
+                                    info!("Transcription complete: {} chars", text.len());
 
                                     // Format text
                                     let mut formatted = text.trim().to_string();
+                                    // E-11: Use byte offset instead of char split to avoid
+                                    // corrupting multi-codepoint grapheme clusters
                                     if self.config.capitalize_first && !formatted.is_empty() {
-                                        let mut chars = formatted.chars();
-                                        if let Some(first) = chars.next() {
-                                            formatted = first.to_uppercase().collect::<String>() + chars.as_str();
+                                        if let Some(first_char) = formatted.chars().next() {
+                                            let upper: String = first_char.to_uppercase().collect();
+                                            formatted = upper + &formatted[first_char.len_utf8()..];
                                         }
                                     }
                                     if self.config.add_trailing_space {
@@ -604,18 +658,12 @@ impl App {
                                     // Copy to clipboard
                                     if let Err(e) = clipboard.set_text(&clipboard_text) {
                                         error!("Failed to copy to clipboard: {}", e);
-                                        hud.set_state(HudState::Ready {
-                                            message: "Clipboard copy failed".to_string(),
-                                        });
                                         ui_status.state = "Idle".to_string();
                                         ui_status.last_message = Some("Clipboard copy failed".to_string());
                                         self.ui.set_status(ui_status.clone());
                                     } else {
                                         info!("Copied to clipboard!");
                                         notifications.notify(notify_message);
-                                        hud.set_state(HudState::Ready {
-                                            message: notify_message.to_string(),
-                                        });
                                         ui_status.state = "Idle".to_string();
                                         ui_status.last_message = Some(notify_message.to_string());
                                         self.ui.set_status(ui_status.clone());
@@ -627,9 +675,6 @@ impl App {
                                         .mark_failed(format!("Transcription failed: {}", e));
                                     let short = shorten_error_message(&e, 140);
                                     notifications.notify(&format!("Transcription failed: {}", short));
-                                    hud.set_state(HudState::Ready {
-                                        message: "Transcription failed".to_string(),
-                                    });
                                     ui_status.state = "Idle".to_string();
                                     ui_status.last_message =
                                         Some(format!("Transcription failed: {}", short));
@@ -643,7 +688,6 @@ impl App {
                             _tray.set_state(AppState::Idle);
                             ui_status.input_level = Some(0.0);
                             self.ui.set_status(ui_status.clone());
-                            hud.set_level(0.0);
 
                             // Model stays resident for fast re-use.
                             // The idle_unload_seconds timer (default 30s) handles
@@ -656,6 +700,8 @@ impl App {
                             self.ui.set_status(ui_status.clone());
                         }
                         AppEvent::ToggleHistoryWindow => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             // Reload history from disk before showing so entries
                             // are always fresh, even across hide/show cycles.
                             let entries: Vec<String> = history
@@ -670,6 +716,8 @@ impl App {
                             }
                         }
                         AppEvent::ShowHistoryWindow => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             let entries: Vec<String> = history
                                 .entries()
                                 .iter()
@@ -683,6 +731,8 @@ impl App {
                             }
                         }
                         AppEvent::OpenLastTranscript => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             match last_transcript_path.as_ref() {
                                 Some(path) if path.exists() => {
                                     if let Err(err) = open_path(path) {
@@ -695,6 +745,8 @@ impl App {
                             }
                         }
                         AppEvent::OpenSettings => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             match ensure_config_file() {
                                 Ok(path) => {
                                     if let Err(err) = open_path(&path) {
@@ -708,28 +760,33 @@ impl App {
                                         let original_mtime = std::fs::metadata(&config_path)
                                             .and_then(|m| m.modified())
                                             .ok();
+                                        // BUG 16: cancel any previous watcher, then arm a fresh flag
+                                        settings_watcher_cancel.store(true, Ordering::Relaxed);
+                                        settings_watcher_cancel = Arc::new(AtomicBool::new(false));
+                                        let cancel = Arc::clone(&settings_watcher_cancel);
                                         thread::spawn(move || {
                                             // Wait up to 5 minutes for the user to save
                                             let deadline = Instant::now() + Duration::from_secs(300);
-                                            let mut last_check = Instant::now();
                                             while Instant::now() < deadline {
+                                                // BUG 16: check cancellation at top of each iteration
+                                                if cancel.load(Ordering::Relaxed) {
+                                                    break;
+                                                }
                                                 thread::sleep(Duration::from_secs(2));
+                                                if cancel.load(Ordering::Relaxed) {
+                                                    break;
+                                                }
                                                 let current_mtime = std::fs::metadata(&config_path)
                                                     .and_then(|m| m.modified())
                                                     .ok();
-                                                if current_mtime != original_mtime && last_check.elapsed() > Duration::from_secs(1) {
-                                                    last_check = Instant::now();
+                                                // BUG 46: removed last_check dead code — just check mtime
+                                                if current_mtime != original_mtime {
                                                     // File was modified — validate
                                                     match Config::load() {
-                                                        Ok(_new_config) => {
+                                                        Ok(new_config) => {
+                                                            // E-8/S-7: Send the new config so it's actually applied
                                                             info!("Config reloaded successfully after edit");
-                                                            let _ = event_tx_clone.send(AppEvent::InferenceProgress(
-                                                                InferenceProgress {
-                                                                    stage: InferenceStage::Transcribing,
-                                                                    message: "Settings saved successfully".to_string(),
-                                                                    percent: None,
-                                                                },
-                                                            ));
+                                                            let _ = event_tx_clone.send(AppEvent::ConfigReloaded(new_config));
                                                             break;
                                                         }
                                                         Err(err) => {
@@ -749,14 +806,56 @@ impl App {
                             }
                         }
                         AppEvent::OpenTranscriptsFolder => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             if let Err(err) = open_transcripts_folder() {
                                 warn!("Failed to open transcripts folder: {}", err);
                             }
                         }
                         AppEvent::Quit => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
                             info!("Quit requested");
-                            let _ = inference_tx.send(InferenceCommand::Shutdown);
+                            // E-2: Use try_send to avoid blocking main thread
+                            let _ = inference_tx.try_send(InferenceCommand::Shutdown);
+                            // E-13: Cancel settings watcher on quit
+                            settings_watcher_cancel.store(true, Ordering::Relaxed);
                             self.is_running = false;
+                        }
+                        // E-8/S-7: Apply runtime-updatable config fields
+                        AppEvent::ConfigReloaded(new_config) => {
+                            let mut needs_restart = Vec::new();
+                            if new_config.hotkey != self.config.hotkey {
+                                needs_restart.push("hotkey");
+                            }
+                            if new_config.history_hotkey != self.config.history_hotkey {
+                                needs_restart.push("history_hotkey");
+                            }
+                            if new_config.model != self.config.model {
+                                needs_restart.push("model");
+                            }
+                            if new_config.use_gpu != self.config.use_gpu {
+                                needs_restart.push("use_gpu");
+                            }
+                            // Apply runtime-updatable fields
+                            self.config.idle_unload_seconds = new_config.idle_unload_seconds;
+                            self.config.show_notifications = new_config.show_notifications;
+                            self.config.capitalize_first = new_config.capitalize_first;
+                            self.config.add_trailing_space = new_config.add_trailing_space;
+                            self.config.max_new_tokens = new_config.max_new_tokens;
+                            self.config.language = new_config.language.clone();
+                            self.config.history_max_entries = new_config.history_max_entries;
+                            self.config.require_gpu = new_config.require_gpu;
+                            notifications.enabled = new_config.show_notifications;
+                            let msg = if needs_restart.is_empty() {
+                                "Settings applied successfully".to_string()
+                            } else {
+                                format!("Settings saved (restart required for: {})", needs_restart.join(", "))
+                            };
+                            info!("{}", msg);
+                            notifications.notify(&msg);
+                            ui_status.last_message = Some(msg);
+                            self.ui.set_status(ui_status.clone());
                         }
                     }
                 }
@@ -771,7 +870,6 @@ impl App {
             }
         }
 
-        let _ = inference_tx.send(InferenceCommand::Shutdown);
         drop(inference_tx); // Close channel so worker exits iter() loop
         info!("Waiting for inference worker to shut down...");
         if let Err(e) = inference_handle.join() {
@@ -785,7 +883,7 @@ impl App {
         event_tx: Sender<AppEvent>,
         config: Config,
     ) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
-        let (inference_tx, inference_rx) = bounded::<InferenceCommand>(2);
+        let (inference_tx, inference_rx) = bounded::<InferenceCommand>(8);
         let handle = thread::spawn(move || Self::inference_worker(inference_rx, event_tx, config));
         (inference_tx, handle)
     }
@@ -839,31 +937,27 @@ impl App {
     }
 
     /// Pump Windows messages - MUST be called from main thread
-    /// Returns the number of messages processed
+    /// Returns (messages_processed, quit_received)
     #[cfg(target_os = "windows")]
-    fn pump_messages() -> u32 {
+    fn pump_messages() -> (u32, bool) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, PM_NOREMOVE,
             WM_HOTKEY, WM_QUIT, WM_TIMER, WM_NULL,
         };
 
         let mut count = 0u32;
+        let mut quit = false;
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
 
-            // First check if there are ANY messages (diagnostic)
             let has_messages = PeekMessageW(&mut msg, 0 as _, 0, 0, PM_NOREMOVE);
             if has_messages != 0 {
                 trace!("PeekMessage found messages waiting");
             }
 
-            // Process all pending messages (non-blocking)
-            // Use -1 as hwnd to get thread messages (not bound to a window)
-            // Actually, 0 should work for all thread messages including window messages
             while PeekMessageW(&mut msg, 0 as _, 0, 0, PM_REMOVE) != 0 {
                 count += 1;
 
-                // Log interesting messages (skip noisy ones)
                 match msg.message {
                     WM_HOTKEY => {
                         info!("=== WM_HOTKEY MESSAGE RECEIVED ===");
@@ -872,13 +966,13 @@ impl App {
                         info!("lParam: {:#x}", msg.lParam);
                     }
                     WM_QUIT => {
-                        info!("WM_QUIT received");
+                        // E-1: Handle WM_QUIT properly — don't dispatch, signal exit
+                        info!("WM_QUIT received — triggering shutdown");
+                        quit = true;
+                        continue; // Don't dispatch WM_QUIT
                     }
-                    WM_TIMER | WM_NULL => {
-                        // Skip noisy messages
-                    }
+                    WM_TIMER | WM_NULL => {}
                     _ => {
-                        // Log other messages at debug level to see what we're getting
                         debug!("Windows message: {} (hwnd: {:?}, wParam: {}, lParam: {})",
                                msg.message, msg.hwnd, msg.wParam, msg.lParam);
                     }
@@ -888,13 +982,12 @@ impl App {
                 DispatchMessageW(&msg);
             }
         }
-        count
+        (count, quit)
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn pump_messages() -> u32 {
-        // No-op on non-Windows platforms
-        0
+    fn pump_messages() -> (u32, bool) {
+        (0, false)
     }
 }
 

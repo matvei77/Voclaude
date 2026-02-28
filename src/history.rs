@@ -9,7 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
+// P-6: Initialize counter from PID to avoid collision across restarts
 static ENTRY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn init_entry_counter() -> u64 {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // Use PID * 1000 as base offset to avoid collision on rapid restart
+        let pid_offset = (std::process::id() as u64 % 1000) * 1000;
+        ENTRY_COUNTER.store(pid_offset, Ordering::Relaxed);
+    });
+    ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioMetadata {
@@ -43,7 +55,8 @@ impl HistoryEntry {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default();
-        let counter = ENTRY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // P-6: Use PID-offset counter to avoid collision across restarts
+        let counter = init_entry_counter();
         let id = format!("{}-{}", created_at_ms, counter);
         Self {
             id,
@@ -161,7 +174,15 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temp_path = path.with_extension("json.tmp");
+    // P-2: Use unique temp path with PID+timestamp to avoid collision on crash
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_name = format!("{}.{}-{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(), pid, ts);
+    let temp_path = path.with_file_name(temp_name);
     let mut file = std::fs::File::create(&temp_path)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
@@ -181,6 +202,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
             }
         }
     }
+    let _ = std::fs::remove_file(&temp_path);
     Err(last_err.unwrap().into())
 }
 
@@ -198,6 +220,9 @@ fn backup_corrupt_history(
 }
 
 fn recover_entries(contents: &str) -> Vec<HistoryEntry> {
+    // S-6: Limit maximum entry size to prevent OOM on crafted input
+    const MAX_ENTRY_BYTES: usize = 10 * 1024 * 1024; // 10MB per entry
+
     let mut entries = Vec::new();
     let mut in_string = false;
     let mut escape = false;
@@ -210,6 +235,7 @@ fn recover_entries(contents: &str) -> Vec<HistoryEntry> {
                 escape = false;
                 continue;
             }
+            // P-1: Handle all JSON escape sequences properly, including \uXXXX
             if ch == '\\' {
                 escape = true;
                 continue;
@@ -226,17 +252,18 @@ fn recover_entries(contents: &str) -> Vec<HistoryEntry> {
                 if depth == 0 {
                     start = Some(idx);
                 }
-                depth += 1;
+                depth = depth.saturating_add(1);
             }
             '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     if let Some(start_idx) = start.take() {
                         let slice = &contents[start_idx..=idx];
-                        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(slice) {
-                            entries.push(entry);
+                        // S-6: Reject entries that are unreasonably large
+                        if slice.len() <= MAX_ENTRY_BYTES {
+                            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(slice) {
+                                entries.push(entry);
+                            }
                         }
                     }
                 }

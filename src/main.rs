@@ -35,7 +35,8 @@ impl std::io::Write for CombinedWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let _ = std::io::Write::flush(&mut self.file);
+        // O-6: Propagate file flush errors instead of discarding
+        std::io::Write::flush(&mut self.file)?;
         Ok(())
     }
 }
@@ -98,8 +99,7 @@ fn main() {
         if let Ok(entries) = std::fs::read_dir(&log_dir) {
             let mut log_files: Vec<_> = entries
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|ext| ext == "log").unwrap_or(false)
-                    || e.file_name().to_string_lossy().starts_with("voclaude.log"))
+                .filter(|e| e.file_name().to_string_lossy().starts_with("voclaude.log"))
                 .collect();
             log_files.sort_by_key(|e| std::cmp::Reverse(e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
             for old_file in log_files.into_iter().skip(5) {
@@ -152,10 +152,24 @@ fn main() {
     };
 
     // CLI override: --model-dir <path> sets model_path for IT pre-staging
+    // O-5: Validate --model-dir has a value and the path exists
     if let Some(pos) = args.iter().position(|a| a == "--model-dir") {
-        if let Some(dir) = args.get(pos + 1) {
-            info!("Using --model-dir override: {}", dir);
-            config.model_path = Some(dir.clone());
+        match args.get(pos + 1) {
+            Some(dir) if !dir.starts_with('-') => {
+                let path = std::path::Path::new(dir);
+                if !path.exists() || !path.is_dir() {
+                    error!("--model-dir path does not exist or is not a directory: {}", dir);
+                    show_fatal_error_dialog(&format!("--model-dir path not found: {}", dir));
+                    std::process::exit(1);
+                }
+                info!("Using --model-dir override: {}", dir);
+                config.model_path = Some(dir.clone());
+            }
+            _ => {
+                error!("--model-dir requires a path argument");
+                show_fatal_error_dialog("--model-dir requires a path argument");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -168,31 +182,40 @@ fn main() {
                 AllocConsole();
             }
         }
-        println!("Voclaude {} — Validation Mode", env!("CARGO_PKG_VERSION"));
-        println!("Config: OK");
-        println!("  model: {}", config.model);
-        println!("  use_gpu: {}", config.use_gpu);
-        println!("  model_path: {}", config.model_path.as_deref().unwrap_or("(auto)"));
+        let validate_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            println!("Voclaude {} — Validation Mode", env!("CARGO_PKG_VERSION"));
+            println!("Config: OK");
+            println!("  model: {}", config.model);
+            println!("  use_gpu: {}", config.use_gpu);
+            println!("  model_path: {}", config.model_path.as_deref().unwrap_or("(auto)"));
 
-        match QwenEngine::new_with_config(&config) {
-            Ok(mut engine) => {
-                println!("Engine init: OK (gpu={})", engine.active_gpu());
-                match engine.prepare(None) {
-                    Ok(()) => println!("Model load: OK"),
-                    Err(e) => {
-                        println!("Model load: FAILED — {}", e);
-                        std::process::exit(1);
+            let mut engine = QwenEngine::new_with_config(&config)?;
+            println!("Engine init: OK (gpu={})", engine.active_gpu());
+            engine.prepare(None)?;
+            println!("Model load: OK");
+            drop(engine);
+
+            // O-4: Test audio device availability (previously missing)
+            {
+                use cpal::traits::HostTrait;
+                let host = cpal::default_host();
+                match host.default_input_device() {
+                    Some(device) => {
+                        use cpal::traits::DeviceTrait;
+                        let name = device.name().unwrap_or_else(|_| "(unknown)".to_string());
+                        println!("Audio device: OK ({})", name);
+                    }
+                    None => {
+                        println!("Audio device: WARN — no default input device detected");
                     }
                 }
             }
-            Err(e) => {
-                println!("Engine init: FAILED — {}", e);
-                std::process::exit(1);
-            }
+            Ok(())
+        })();
+        match validate_result {
+            Ok(()) => { println!("Validation passed."); return; }
+            Err(e) => { println!("Validation FAILED: {}", e); std::process::exit(1); }
         }
-
-        println!("Validation passed.");
-        return;
     }
 
     // Run the app

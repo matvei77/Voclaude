@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 pub const TARGET_SAMPLE_RATE: u32 = 16000;
 
 /// Ring buffer capacity in seconds of input audio.
-const RING_BUFFER_SECONDS: usize = 2;
+const RING_BUFFER_SECONDS: usize = 10;
 
 /// Writer thread chunk size in samples (interleaved).
 const WRITER_CHUNK_SAMPLES: usize = 4096;
@@ -149,12 +149,13 @@ impl AudioCapture {
 
     /// Start recording
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.is_recording.load(Ordering::Relaxed) {
+        // A-2: Check with SeqCst to avoid TOCTOU race with stop()
+        if self.is_recording.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         self.buffer.clear();
-        self.dropped_samples.store(0, Ordering::Relaxed);
+        self.dropped_samples.store(0, Ordering::SeqCst);
         self.writer_stop.store(false, Ordering::SeqCst);
 
         let channels = self.config.channels as usize;
@@ -247,10 +248,17 @@ impl AudioCapture {
             }
         };
 
+        // A-2: Store stream BEFORE setting is_recording to avoid TOCTOU
+        // where concurrent stop() sees is_recording=true but stream is None
+        {
+            let mut guard = self.stream.lock().unwrap();
+            *guard = Some(stream);
+            if let Some(ref s) = *guard {
+                s.play()?;
+            }
+        }
+        // Only set is_recording AFTER stream is stored and playing
         self.is_recording.store(true, Ordering::SeqCst);
-        stream.play()?;
-
-        *self.stream.lock().unwrap() = Some(stream);
 
         debug!("Recording started");
         Ok(())
@@ -262,7 +270,9 @@ impl AudioCapture {
 
         if let Ok(mut stream_guard) = self.stream.lock() {
             if let Some(stream) = stream_guard.take() {
-                let _ = stream.pause();
+                if let Err(e) = stream.pause() {
+                    tracing::warn!("Failed to pause audio stream: {}", e);
+                }
                 drop(stream);
                 debug!("Stream stopped and dropped");
             }
@@ -270,18 +280,21 @@ impl AudioCapture {
 
         self.writer_stop.store(true, Ordering::SeqCst);
 
-        let result = if let Some(handle) = self.writer_handle.lock().unwrap().take() {
+        // A-8: Take handle out of mutex BEFORE joining (don't hold lock across join)
+        let handle = self.writer_handle.lock().unwrap().take();
+        let result = if let Some(handle) = handle {
             match handle.join() {
                 Ok(Ok(result)) => result,
                 Ok(Err(err)) => return Err(err.into()),
                 Err(_) => return Err("Writer thread panicked".into()),
             }
         } else {
-            WriterResult {
-                path: audio_output_path()?,
+            // A-3: Return empty result instead of generating a fresh nonexistent path
+            return Ok(AudioRecording {
+                path: PathBuf::new(),
+                sample_rate: TARGET_SAMPLE_RATE,
                 sample_count: 0,
-                dropped_input_samples: 0,
-            }
+            });
         };
 
         if result.dropped_input_samples > 0 {
@@ -309,7 +322,8 @@ impl AudioCapture {
         is_recording: &AtomicBool,
         dropped: &AtomicUsize,
     ) {
-        if !is_recording.load(Ordering::Relaxed) {
+        // A-4: Use Acquire ordering to ensure final samples are visible to writer drain
+        if !is_recording.load(Ordering::Acquire) {
             return;
         }
 
@@ -329,7 +343,8 @@ impl AudioCapture {
         T: Copy,
         F: Fn(T) -> f32 + Copy,
     {
-        if !is_recording.load(Ordering::Relaxed) {
+        // A-4: Use Acquire ordering to ensure final samples are visible to writer drain
+        if !is_recording.load(Ordering::Acquire) {
             return;
         }
 
@@ -343,14 +358,19 @@ impl AudioCapture {
         sample as f32 / 32768.0
     }
 
+    // A-7: Use 32767.5 as divisor to avoid clipping positive half of u16 range
     fn u16_to_f32(sample: u16) -> f32 {
-        (sample as f32 - 32768.0) / 32768.0
+        (sample as f32 - 32768.0) / 32767.5
     }
 }
 
 fn audio_output_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     project_dirs()
-        .map(|dirs| dirs.data_dir().join("audio.f32"))
+        .map(|dirs| dirs.data_dir().join(format!("audio-{}.f32", ts)))
         .ok_or_else(|| "Could not determine audio output path".into())
 }
 

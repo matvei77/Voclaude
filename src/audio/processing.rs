@@ -89,21 +89,35 @@ impl LinearResampler {
         let estimate = ((input.len() as f64) / self.ratio).ceil() as usize + 2;
         let mut output = Vec::with_capacity(estimate);
 
-        while self.pos + 1.0 < end {
+        // A-6: Process up to `end` (not `end - 1`) to avoid losing samples
+        // at high downsample ratios. The s1 lookup handles boundary correctly.
+        while self.pos < end {
             let idx = self.pos.floor() as u64;
             let frac = self.pos - idx as f64;
 
             let s0 = if idx < self.src_offset {
                 self.prev.unwrap_or(input[0])
             } else {
-                input[(idx - self.src_offset) as usize]
+                let local = (idx - self.src_offset) as usize;
+                if local >= input.len() {
+                    input[input.len() - 1]
+                } else {
+                    input[local]
+                }
             };
 
             let s1_idx = idx + 1;
             let s1 = if s1_idx < self.src_offset {
                 self.prev.unwrap_or(input[0])
             } else {
-                input[(s1_idx - self.src_offset) as usize]
+                let local = (s1_idx - self.src_offset) as usize;
+                if local >= input.len() {
+                    // A-6: At chunk boundary, use s0 instead of clamping to last sample
+                    // which could be far away at high downsample ratios
+                    s0
+                } else {
+                    input[local]
+                }
             };
 
             let sample = s0 + (s1 - s0) * frac as f32;

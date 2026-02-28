@@ -18,5 +18,6 @@ fn main() {
 
     // Re-run if git HEAD changes (new commits)
     println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs/");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
 }

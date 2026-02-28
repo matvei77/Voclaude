@@ -260,9 +260,17 @@ impl AudioEncoder {
         let conv2d2 = candle_nn::conv2d(ds, ds, 3, conv_cfg_s2, vb.pp("conv2d2"))?;
         let conv2d3 = candle_nn::conv2d(ds, ds, 3, conv_cfg_s2, vb.pp("conv2d3"))?;
 
-        // After 3x stride-2 convs on (mel_bins=128): 128 -> 64 -> 32 -> 16
-        // Flattened: 16 * ds = 16 * 480 = 7680
-        let conv_out_dim = (cfg.num_mel_bins / 8) * ds;
+        // After 3x stride-2 convs on mel_bins: each conv halves spatially (with padding=1)
+        // I-10: Compute actual output dim from CNN spatial reduction instead of hardcoding /8
+        let freq_after_conv = |dim: usize| -> usize {
+            // Each Conv2d with stride=2, padding=1, kernel=3: out = floor((in + 2*1 - 3)/2 + 1)
+            let d1 = (dim + 2 - 3) / 2 + 1;
+            let d2 = (d1 + 2 - 3) / 2 + 1;
+            let d3 = (d2 + 2 - 3) / 2 + 1;
+            d3
+        };
+        let freq_out = freq_after_conv(cfg.num_mel_bins);
+        let conv_out_dim = freq_out * ds;
         let conv_out = candle_nn::linear_no_bias(conv_out_dim, cfg.d_model, vb.pp("conv_out"))?;
 
         // Sinusoidal positional embeddings (computed, not learned)
@@ -435,8 +443,9 @@ pub struct MRoPEEmbedding {
 }
 
 impl MRoPEEmbedding {
-    /// Maximum positions to precompute (audio prefix + max generated tokens).
-    const MAX_POSITIONS: usize = 4096;
+    /// I-3: Maximum positions to precompute (audio prefix + max generated tokens).
+    /// 5-min audio ≈ 3950 tokens + 2048 generated = ~6000; use 8192 for headroom.
+    const MAX_POSITIONS: usize = 8192;
 
     fn new(head_dim: usize, rope_theta: f64, _mrope_section: Vec<usize>, device: &Device, dtype: DType) -> Result<Self> {
         let half_dim = head_dim / 2;
@@ -591,6 +600,8 @@ impl DecoderAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
+        // BUG 12: capture dtype before reshape so we can restore it after F32 softmax.
+        let q_dtype = q.dtype();
         let q = q.reshape((b, seq, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape((b, seq, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape((b, seq, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
@@ -619,7 +630,9 @@ impl DecoderAttention {
             None => (k, v),
         };
         self.cache_len = k_full.dims()[2];
-        self.kv_cache = Some((k_full.clone(), v_full.clone()));
+        // BUG 4: store owned values, then borrow back — avoids a redundant clone.
+        self.kv_cache = Some((k_full, v_full));
+        let (k_full, v_full) = self.kv_cache.as_ref().unwrap();
 
         // GQA (Grouped Query Attention): Q has more heads than KV.
         // For seq=1 decode (hot path): reshape Q into KV groups instead of
@@ -636,7 +649,8 @@ impl DecoderAttention {
             let k_t = k_full.transpose(D::Minus2, D::Minus1)?.contiguous()?; // (b, kv_h, hd, kv_len)
             // (b, kv_h, n_rep, hd) @ (b, kv_h, hd, kv_len) → (b, kv_h, n_rep, kv_len)
             let attn = (q.matmul(&k_t)? / scale)?;
-            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?.to_dtype(q.dtype())?;
+            // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
+            let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
             // (b, kv_h, n_rep, kv_len) @ (b, kv_h, kv_len, hd) → (b, kv_h, n_rep, hd)
             let out = attn.matmul(&v_full)?;
             // (b, kv_h, n_rep, hd) → (b, num_heads, 1, hd) → (b, 1, hidden)
@@ -649,18 +663,19 @@ impl DecoderAttention {
                 let (b, h, s, d) = k_full.dims4()?;
                 k_full.unsqueeze(2)?.expand((b, h, n_rep, s, d))?.reshape((b, h * n_rep, s, d))?.contiguous()?
             } else {
-                k_full
+                k_full.clone()
             };
             let v_expanded = if n_rep > 1 {
                 let (b, h, s, d) = v_full.dims4()?;
                 v_full.unsqueeze(2)?.expand((b, h, n_rep, s, d))?.reshape((b, h * n_rep, s, d))?.contiguous()?
             } else {
-                v_full
+                v_full.clone()
             };
 
             let attn = (q.contiguous()?.matmul(&k_expanded.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / scale)?;
 
             // Causal mask for prefill (seq > 1)
+            // I-14: Build mask at target dtype directly to avoid CPU F32→GPU→F16 round-trip
             let attn = if seq > 1 {
                 let offset = (kv_len - seq) as i64;
                 let mut mask_data = vec![f32::NEG_INFINITY; seq * kv_len];
@@ -671,14 +686,16 @@ impl DecoderAttention {
                         }
                     }
                 }
-                let mask = Tensor::from_vec(mask_data, (1, 1, seq, kv_len), x.device())?
-                    .to_dtype(attn.dtype())?;
+                let mask = Tensor::from_vec(mask_data, (1, 1, seq, kv_len), &Device::Cpu)?
+                    .to_dtype(attn.dtype())?
+                    .to_device(x.device())?;
                 attn.broadcast_add(&mask)?
             } else {
                 attn
             };
 
-            let attn = candle_nn::ops::softmax(&attn, D::Minus1)?.to_dtype(q.dtype())?;
+            // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
+            let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
             let out = attn.matmul(&v_expanded)?;
             out.transpose(1, 2)?.contiguous()?.reshape((b, seq, self.num_heads * self.head_dim))?
         };
@@ -805,6 +822,18 @@ impl TextDecoder {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Cache guard — ensures KV cache is cleared on all exit paths from transcribe
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct CacheGuard<'a>(&'a mut TextDecoder);
+
+impl Drop for CacheGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clear_cache();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Top-level model
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -815,6 +844,8 @@ pub struct Qwen3ASRModel {
     config: ModelConfig,
     device: Device,
     dtype: DType,
+    /// I-6: Configurable max_new_tokens (was hardcoded to 2048)
+    pub max_new_tokens: usize,
 }
 
 impl Qwen3ASRModel {
@@ -846,6 +877,7 @@ impl Qwen3ASRModel {
             config,
             device: device.clone(),
             dtype,
+            max_new_tokens: 2048, // default, overridden by QwenEngine
         })
     }
 
@@ -892,7 +924,9 @@ impl Qwen3ASRModel {
             } else {
                 features
             };
-            (features, n_tokens)
+            // BUG 11: use the actual post-trim length, not the pre-trim estimate.
+            let actual_len = features.dims()[1];
+            (features, actual_len)
         }; // mel and encoder intermediates dropped here
 
         // 3. Build prompt
@@ -909,6 +943,9 @@ impl Qwen3ASRModel {
         // 5. Replace audio positions with audio features (batched)
         // Audio positions are contiguous — splice in the audio features as a
         // single block instead of N sequential narrow+cat operations.
+        // I-4: When encoder produces fewer tokens than predicted, skip ALL pad
+        // positions (not just the replaced ones) to prevent <audio_pad> embeddings
+        // from leaking into the model input.
         if !audio_positions.is_empty() {
             let n_replace = audio_positions.len().min(audio_features.dims()[1]);
             let first_pos = audio_positions[0];
@@ -919,32 +956,47 @@ impl Qwen3ASRModel {
                 parts.push(embeds.narrow(1, 0, first_pos)?);
             }
             parts.push(audio_block);
-            let after_start = first_pos + n_replace;
+            // Skip past ALL audio pad positions, not just the ones we replaced
+            let after_start = first_pos + audio_positions.len();
             let total_len = embeds.dims()[1];
             if after_start < total_len {
                 parts.push(embeds.narrow(1, after_start, total_len - after_start)?);
             }
             embeds = Tensor::cat(&parts, 1)?;
+            drop(audio_features);
         }
 
         // 6. Build position IDs for MRoPE (3, batch, seq_len)
         let seq_len = embeds.dims()[1];
         let position_ids = self.build_position_ids(seq_len, &audio_positions)?;
 
-        // 7. First forward pass with embeddings
+        // 7. First forward pass with embeddings.
+        // Clone device reference into a local so we can use it while the guard
+        // holds &mut self.text_decoder (two disjoint borrows on different fields).
+        let device = self.device.clone();
+
+        // The guard ensures clear_cache() is called on all exit paths (BUG 1).
         self.text_decoder.clear_cache();
-        let logits = self.text_decoder.forward_embeds(&embeds, &position_ids)?;
+        let _cache_guard = CacheGuard(&mut self.text_decoder);
+        let logits = _cache_guard.0.forward_embeds(&embeds, &position_ids)?;
+        drop(embeds);
+
+        // Extract last-token logits immediately and drop the full prefill tensor.
+        // Shape: logits is (1, seq_len, vocab_size) → extract (vocab_size,)
+        let mut last_logits = logits.i((0, logits.dims()[1] - 1))?;
+        drop(logits);
 
         // 8. Autoregressive generation
-        let max_new_tokens = 2048usize;
+        // I-6: Use configurable max_new_tokens instead of hardcoded value
+        let max_new_tokens = self.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut next_logits = logits;
         let mut cur_pos = seq_len;
 
         for _ in 0..max_new_tokens {
-            // Get logits for last position
-            let last_logits = next_logits.i((0, next_logits.dims()[1] - 1))?;
-            let next_token = last_logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            // last_logits is (vocab_size,) — argmax gives the next token
+            let next_token = last_logits
+                .argmax(D::Minus1)?
+                .to_scalar::<u32>()?;
 
             if EOS_TOKEN_IDS.contains(&next_token) {
                 break;
@@ -952,10 +1004,15 @@ impl Qwen3ASRModel {
 
             generated_tokens.push(next_token);
 
-            // Prepare next step
-            let next_ids = Tensor::from_vec(vec![next_token as i64], (1, 1), &self.device)?;
-            let pos_ids = self.build_position_ids_single(cur_pos)?;
-            next_logits = self.text_decoder.forward_ids(&next_ids, &pos_ids)?;
+            // Prepare next step; use local `device` to avoid reborrowing `self`
+            // while _cache_guard holds &mut self.text_decoder.
+            let next_ids = Tensor::from_vec(vec![next_token as i64], (1, 1), &device)?;
+            let p = cur_pos as i64;
+            let pos_ids = Tensor::from_vec(vec![p, p, p], (3, 1, 1), &device)?;
+            let full_logits = _cache_guard.0.forward_ids(&next_ids, &pos_ids)?;
+            // full_logits is (1, 1, vocab_size) → extract (vocab_size,)
+            last_logits = full_logits.i((0, full_logits.dims()[1] - 1))?;
+            drop(full_logits);
             cur_pos += 1;
         }
 
@@ -963,25 +1020,22 @@ impl Qwen3ASRModel {
         let text = tokenizer.decode(&generated_tokens)?;
 
         // 10. Clean up the output (strip language tags etc.)
+        // _cache_guard drops here, calling clear_cache() automatically (BUG 1).
         Ok(clean_transcription(&text))
     }
 
     /// Build 3-dimensional position IDs for MRoPE.
     /// All 3 dims have the same sequential positions (0, 1, 2, ..., seq_len-1),
     /// matching the Python reference which uses `attention_mask.cumsum(-1) - 1`.
+    ///
+    /// I-8: `_audio_positions` is retained as a parameter for future models that
+    /// need 2D audio position encoding. For Qwen3-ASR, the Python reference uses
+    /// uniform sequential positions for all tokens (including audio), so the
+    /// parameter is intentionally unused.
     fn build_position_ids(&self, seq_len: usize, _audio_positions: &[usize]) -> Result<Tensor> {
         let positions: Vec<i64> = (0..seq_len as i64).collect();
         let pos = Tensor::from_vec(positions, (1, seq_len), &self.device)?;
         Tensor::stack(&[&pos, &pos, &pos], 0)
-    }
-
-    /// Build position IDs for a single new token during generation.
-    fn build_position_ids_single(&self, pos: usize) -> Result<Tensor> {
-        let p = pos as i64;
-        let t = Tensor::from_vec(vec![p], (1, 1), &self.device)?;
-        let h = Tensor::from_vec(vec![p], (1, 1), &self.device)?;
-        let w = Tensor::from_vec(vec![p], (1, 1), &self.device)?;
-        Tensor::stack(&[t, h, w], 0)
     }
 }
 
@@ -998,8 +1052,9 @@ fn sinusoidal_position_embedding(
 ) -> Result<Tensor> {
     let half_dim = d_model / 2;
     let log_10000 = 10000.0_f64.ln();
+    // BUG 38: guard against division by zero when half_dim <= 1.
     let emb_scale: Vec<f64> = (0..half_dim)
-        .map(|i| (-log_10000 * i as f64 / (half_dim - 1) as f64).exp())
+        .map(|i| (-log_10000 * i as f64 / (half_dim.max(2) - 1) as f64).exp())
         .collect();
 
     let mut data = vec![0.0f32; max_positions * d_model];

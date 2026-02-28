@@ -17,6 +17,7 @@ pub struct Config {
     pub config_version: u32,
 
     /// Hotkey to toggle recording (e.g., "F4", "Ctrl+Alt+V")
+    #[serde(default = "default_hotkey")]
     pub hotkey: String,
 
     /// Hotkey to toggle the history window
@@ -24,18 +25,23 @@ pub struct Config {
     pub history_hotkey: String,
 
     /// Language hint for ASR (None = auto-detect)
+    #[serde(default)]
     pub language: Option<String>,
 
     /// Add trailing space after pasted text
+    #[serde(default = "default_add_trailing_space")]
     pub add_trailing_space: bool,
 
     /// Capitalize first letter
+    #[serde(default = "default_capitalize_first")]
     pub capitalize_first: bool,
 
     /// Unload model after N seconds idle (saves VRAM)
+    #[serde(default = "default_idle_unload_seconds")]
     pub idle_unload_seconds: u64,
 
     /// Show notifications
+    #[serde(default = "default_show_notifications")]
     pub show_notifications: bool,
 
     /// Maximum number of history entries to retain
@@ -102,6 +108,22 @@ impl Config {
 
         let config = if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
+            // P-3: Warn about unknown fields by round-tripping through Value
+            if let Ok(table) = contents.parse::<toml::Table>() {
+                let known_fields = [
+                    "config_version", "hotkey", "history_hotkey", "language",
+                    "add_trailing_space", "capitalize_first", "idle_unload_seconds",
+                    "show_notifications", "history_max_entries", "use_gpu",
+                    "model", "model_path", "max_new_tokens", "require_gpu",
+                    // Legacy aliases
+                    "qwen_model", "qwen_model_path", "qwen_max_new_tokens", "qwen_require_gpu",
+                ];
+                for key in table.keys() {
+                    if !known_fields.contains(&key.as_str()) {
+                        warn!("Unknown config field '{}' (possible typo)", key);
+                    }
+                }
+            }
             let config: Config = toml::from_str(&contents)?;
             config
         } else {
@@ -117,6 +139,13 @@ impl Config {
     /// Validate all config fields. Returns Err with a descriptive message
     /// on the first invalid value.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // P-4: Check config_version for forward compatibility
+        if self.config_version > default_config_version() {
+            warn!(
+                "Config version {} is newer than supported version {}; some fields may be ignored",
+                self.config_version, default_config_version()
+            );
+        }
         if self.hotkey.trim().is_empty() {
             return Err("hotkey cannot be empty".into());
         }
@@ -138,18 +167,40 @@ impl Config {
         Ok(())
     }
 
-    /// Save config to disk
+    /// Save config to disk atomically (write-temp-then-rename).
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = Self::config_path().ok_or("Could not determine config path")?;
-
-        // Ensure directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
-        Ok(())
+        // P-2: Use unique temp path with PID+timestamp to avoid collision on crash
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_name = format!("config.toml.{}-{}.tmp", pid, ts);
+        let temp_path = path.with_file_name(temp_name);
+        let mut file = std::fs::File::create(&temp_path)?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // Retry rename for Windows antivirus/indexer
+        let mut last_err = None;
+        for attempt in 0..5u32 {
+            match std::fs::rename(&temp_path, &path) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&temp_path);
+        Err(last_err.unwrap().into())
     }
 
     /// Extract a short display name from the model id.
@@ -188,6 +239,13 @@ impl Config {
                 warn!("Migration: failed to copy config.toml: {}", e);
             } else {
                 info!("Migration: copied config.toml from legacy path");
+                // Validate the migrated config
+                if let Ok(contents) = std::fs::read_to_string(&new_config) {
+                    if toml::from_str::<Config>(&contents).is_err() {
+                        warn!("Migration: copied config.toml is invalid; removing");
+                        let _ = std::fs::remove_file(&new_config);
+                    }
+                }
             }
         }
 
@@ -197,6 +255,15 @@ impl Config {
             let src = legacy.data_dir().join(name);
             let dst = current.data_dir().join(name);
             if src.exists() && !dst.exists() {
+                // P-5: Validate JSON files before copying to avoid propagating corruption
+                if *name == "history.json" || *name == "session.json" {
+                    if let Ok(contents) = std::fs::read_to_string(&src) {
+                        if serde_json::from_str::<serde_json::Value>(&contents).is_err() {
+                            warn!("Migration: skipping corrupt {}", name);
+                            continue;
+                        }
+                    }
+                }
                 if let Err(e) = copy_file(&src, &dst) {
                     warn!("Migration: failed to copy {}: {}", name, e);
                 } else {
@@ -268,6 +335,26 @@ fn default_max_new_tokens() -> u32 {
 
 fn default_require_gpu() -> bool {
     false
+}
+
+fn default_hotkey() -> String {
+    "F4".to_string()
+}
+
+fn default_add_trailing_space() -> bool {
+    true
+}
+
+fn default_capitalize_first() -> bool {
+    true
+}
+
+fn default_idle_unload_seconds() -> u64 {
+    30
+}
+
+fn default_show_notifications() -> bool {
+    true
 }
 
 #[cfg(test)]

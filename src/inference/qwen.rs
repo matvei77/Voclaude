@@ -86,7 +86,6 @@ impl QwenEngine {
             cb(InferenceProgress {
                 stage: InferenceStage::Transcribing,
                 message: "Transcribing...".to_string(),
-                percent: None,
             });
         }
 
@@ -108,10 +107,13 @@ impl QwenEngine {
         // 1. Explicit config path
         if let Some(path) = &self.model_path {
             let p = PathBuf::from(path);
-            if p.exists() && p.is_dir() {
-                return Ok(p);
+            // S-2: Canonicalize and validate the path
+            if !p.exists() || !p.is_dir() {
+                return Err(format!("Configured model_path not found: {}", path).into());
             }
-            return Err(format!("Configured model_path not found: {}", path).into());
+            let canonical = p.canonicalize()
+                .map_err(|e| format!("Cannot canonicalize model_path: {}", e))?;
+            return Ok(canonical);
         }
 
         // 2. Try HuggingFace cache
@@ -143,6 +145,10 @@ impl QwenEngine {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
                 for file in &files {
+                    // S-3: Reject filenames with path traversal components
+                    if file.contains("..") || file.contains('/') || file.contains('\\') {
+                        return Err(format!("Suspicious filename in weight_map: {}", file).into());
+                    }
                     repo.get(file)
                         .map_err(|e| format!("Failed to download {}: {}", file, e))?;
                 }
@@ -168,6 +174,21 @@ impl AsrEngine for QwenEngine {
             return Ok(());
         }
 
+        // Re-initialize CUDA device if it was released by unload() and GPU is requested.
+        if self.use_gpu && !self.device.is_cuda() {
+            match Device::new_cuda(0) {
+                Ok(device) => {
+                    self.device = device;
+                    self.dtype = DType::F16;
+                    self.active_gpu = true;
+                }
+                Err(e) => {
+                    warn!("Failed to reinitialize CUDA: {}", e);
+                    // Fall through to CPU
+                }
+            }
+        }
+
         if self.use_gpu && self.require_gpu && !self.active_gpu {
             return Err("CUDA is required but not available".into());
         }
@@ -176,7 +197,6 @@ impl AsrEngine for QwenEngine {
             cb(InferenceProgress {
                 stage: InferenceStage::LoadingModel,
                 message: "Loading model...".to_string(),
-                percent: None,
             });
         }
 
@@ -189,14 +209,15 @@ impl AsrEngine for QwenEngine {
             cb(InferenceProgress {
                 stage: InferenceStage::LoadingModel,
                 message: "Loading model weights (this may take a moment)...".to_string(),
-                percent: None,
             });
         }
 
         let tokenizer = Qwen3ASRTokenizer::load(&model_dir)
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-        let model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype)
+        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype)
             .map_err(|e| format!("Failed to load model: {}", e))?;
+        // I-6: Wire max_new_tokens config through to the model
+        model.max_new_tokens = self.max_new_tokens as usize;
 
         let elapsed = started.elapsed();
         info!("Model loaded in {:.2}s", elapsed.as_secs_f64());
@@ -229,6 +250,11 @@ impl AsrEngine for QwenEngine {
             info!("Unloading model from memory");
             self.model = None;
             self.tokenizer = None;
+            // Release CUDA context and its memory pool by dropping the Device handle.
+            // The device will be recreated on next prepare() call.
+            self.device = Device::Cpu;
+            self.active_gpu = false;
+            info!("CUDA context released");
         }
     }
 
@@ -300,30 +326,82 @@ fn load_wav_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         return Err("Not a valid WAV file".into());
     }
 
+    // Parse fmt chunk to get actual format info
+    let mut num_channels: u16 = 1;
+    let mut bits_per_sample: u16 = 16;
+    let mut audio_format: u16 = 1; // PCM
+
     // Find data chunk
     let mut pos = 12;
-    while pos + 8 < data.len() {
+    // I-11: Use <= to include final chunk when data chunk is at end
+    while pos + 8 <= data.len() {
         let chunk_id = &data[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]) as usize;
+        // S-5: Guard against integer overflow on crafted chunk_size
+        let raw_size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        let chunk_size = (raw_size as usize).min(data.len().saturating_sub(pos + 8));
 
-        if chunk_id == b"fmt " {
-            let format = u16::from_le_bytes([data[pos + 8], data[pos + 9]]);
-            let bits_per_sample = if pos + 22 < data.len() {
-                u16::from_le_bytes([data[pos + 22], data[pos + 23]])
-            } else {
-                16
-            };
-            debug!("WAV format: {}, bits: {}", format, bits_per_sample);
+        if chunk_id == b"fmt " && pos + 26 <= data.len() {
+            audio_format = u16::from_le_bytes([data[pos + 8], data[pos + 9]]);
+            num_channels = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
+            bits_per_sample = u16::from_le_bytes([data[pos + 22], data[pos + 23]]);
+            debug!("WAV format: {}, channels: {}, bits: {}", audio_format, num_channels, bits_per_sample);
         }
 
         if chunk_id == b"data" {
-            let audio_data = &data[pos + 8..pos + 8 + chunk_size.min(data.len() - pos - 8)];
-            // Assume 16-bit PCM
-            let mut samples = Vec::with_capacity(audio_data.len() / 2);
-            for chunk in audio_data.chunks_exact(2) {
-                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                samples.push(sample as f32 / 32768.0);
-            }
+            let audio_data = &data[pos + 8..pos + 8 + chunk_size];
+            // I-7: Handle different sample formats and channel counts
+            let raw_samples: Vec<f32> = match (audio_format, bits_per_sample) {
+                (1, 16) => {
+                    // 16-bit signed PCM
+                    audio_data.chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                        .collect()
+                }
+                (3, 32) | (1, 32) => {
+                    // 32-bit float or 32-bit PCM
+                    if audio_format == 3 {
+                        // IEEE float
+                        audio_data.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    } else {
+                        // 32-bit signed PCM
+                        audio_data.chunks_exact(4)
+                            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2147483648.0)
+                            .collect()
+                    }
+                }
+                (1, 24) => {
+                    // 24-bit signed PCM
+                    audio_data.chunks_exact(3)
+                        .map(|c| {
+                            let val = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
+                            let val = if val & 0x800000 != 0 { val | !0xFFFFFF } else { val };
+                            val as f32 / 8388608.0
+                        })
+                        .collect()
+                }
+                _ => {
+                    return Err(format!(
+                        "Unsupported WAV format: format={}, bits={}",
+                        audio_format, bits_per_sample
+                    ).into());
+                }
+            };
+
+            // Convert to mono if multi-channel
+            let channels = num_channels as usize;
+            let samples = if channels > 1 {
+                raw_samples.chunks(channels)
+                    .map(|frame| {
+                        let sum: f32 = frame.iter().sum();
+                        sum / channels as f32
+                    })
+                    .collect()
+            } else {
+                raw_samples
+            };
+
             return Ok(samples);
         }
 
@@ -347,25 +425,40 @@ fn resolve_hf_cache(model_id: &str) -> Option<PathBuf> {
         return None;
     }
 
-    // Find the latest snapshot
-    let mut latest: Option<PathBuf> = None;
-    if let Ok(entries) = std::fs::read_dir(&model_cache) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // Check if this snapshot has the required files
-                if path.join("config.json").exists() {
-                    latest = Some(path);
-                }
+    // I-9: Prefer refs/main symlink over mtime-based selection
+    // The refs/main file contains the commit hash of the default snapshot
+    let refs_main = cache_dir.join(&model_dir_name).join("refs").join("main");
+    if let Ok(commit_hash) = std::fs::read_to_string(&refs_main) {
+        let commit_hash = commit_hash.trim();
+        if !commit_hash.is_empty() {
+            let snapshot_dir = model_cache.join(commit_hash);
+            if snapshot_dir.is_dir() && snapshot_dir.join("config.json").exists() {
+                return Some(snapshot_dir);
             }
         }
     }
 
-    latest
+    // Fallback: find any valid snapshot (sorted by name for determinism)
+    let mut snapshots: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&model_cache) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("config.json").exists() {
+                snapshots.push(path);
+            }
+        }
+    }
+    snapshots.sort();
+    snapshots.into_iter().last()
 }
 
 fn dirs_for_hf_cache() -> Option<PathBuf> {
-    // Check HF_HOME first, then default
+    // I-12: Check HUGGINGFACE_HUB_CACHE first (enterprise deployments)
+    if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
+        return Some(PathBuf::from(cache));
+    }
+
+    // Check HF_HOME next, then default
     if let Ok(hf_home) = std::env::var("HF_HOME") {
         return Some(PathBuf::from(hf_home).join("hub"));
     }
