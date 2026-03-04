@@ -926,25 +926,14 @@ impl Qwen3ASRModel {
         })
     }
 
-    /// Maximum audio duration in seconds before we reject (to avoid OOM).
-    /// ~5 minutes is a safe limit for 8GB VRAM with F32 inference.
-    const MAX_AUDIO_SECONDS: usize = 300;
-
     /// Transcribe audio samples to text.
+    /// No duration limit — supports arbitrarily long recordings.
     pub fn transcribe(
         &mut self,
         samples: &[f32],
         language: Option<&str>,
         tokenizer: &Qwen3ASRTokenizer,
     ) -> Result<String> {
-        // Guard against excessively long audio that would OOM
-        let duration_secs = samples.len() / candle_audio::SAMPLE_RATE;
-        if duration_secs > Self::MAX_AUDIO_SECONDS {
-            return Err(candle_core::Error::Msg(format!(
-                "Audio too long ({} seconds, max {}). Please use shorter recordings.",
-                duration_secs, Self::MAX_AUDIO_SECONDS
-            )));
-        }
 
         // 1-2. Compute mel and run audio encoder in a scoped block so all
         // intermediate tensors (mel, conv outputs, attention matrices) are
