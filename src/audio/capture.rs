@@ -3,7 +3,7 @@
 use super::{mono_from_interleaved, LinearResampler, RingBuffer};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
 use crossbeam_channel::Sender;
 use crate::config::project_dirs;
 use std::fs::{self, OpenOptions};
@@ -40,12 +40,9 @@ impl AudioRecording {
 }
 
 pub struct AudioCapture {
-    device_name: String,
-    device: Device,
-    config: StreamConfig,
-    sample_format: SampleFormat,
-    buffer: Arc<RingBuffer>,
+    device_name: Mutex<String>,
     stream: Arc<Mutex<Option<Stream>>>,
+    buffer: Arc<Mutex<Option<Arc<RingBuffer>>>>,
     is_recording: Arc<AtomicBool>,
     writer_stop: Arc<AtomicBool>,
     writer_handle: Arc<Mutex<Option<JoinHandle<WriterThreadResult>>>>,
@@ -63,48 +60,26 @@ type WriterThreadResult = Result<WriterResult, String>;
 
 impl AudioCapture {
     pub fn new(level_tx: Option<Sender<f32>>) -> Result<Self, Box<dyn std::error::Error>> {
-        let host = cpal::default_host();
-
-        let device = host
-            .default_input_device()
-            .ok_or("No input device available")?;
-
-        let device_name = device.name()?;
-        info!("Using audio device: {}", device_name);
-
-        let supported_configs = device.supported_input_configs()?;
-        let config = Self::find_best_config(supported_configs)?;
-        info!(
-            "Audio config: {} Hz, {} channel(s), {:?}",
-            config.sample_rate().0,
-            config.channels(),
-            config.sample_format()
-        );
-
-        let ring_capacity = config.sample_rate().0 as usize
-            * config.channels() as usize
-            * RING_BUFFER_SECONDS;
-
-        let buffer = Arc::new(RingBuffer::new(ring_capacity));
-        let is_recording = Arc::new(AtomicBool::new(false));
-        let stream = Arc::new(Mutex::new(None));
-        let writer_stop = Arc::new(AtomicBool::new(false));
-        let writer_handle = Arc::new(Mutex::new(None));
-        let dropped_samples = Arc::new(AtomicUsize::new(0));
+        // Probe the default device at startup for the initial UI display name.
+        let device_name = Self::probe_default_device_name();
 
         Ok(Self {
-            device_name,
-            device,
-            config: config.clone().into(),
-            sample_format: config.sample_format(),
-            buffer,
-            stream,
-            is_recording,
-            writer_stop,
-            writer_handle,
-            dropped_samples,
+            device_name: Mutex::new(device_name),
+            stream: Arc::new(Mutex::new(None)),
+            buffer: Arc::new(Mutex::new(None)),
+            is_recording: Arc::new(AtomicBool::new(false)),
+            writer_stop: Arc::new(AtomicBool::new(false)),
+            writer_handle: Arc::new(Mutex::new(None)),
+            dropped_samples: Arc::new(AtomicUsize::new(0)),
             level_tx,
         })
+    }
+
+    fn probe_default_device_name() -> String {
+        cpal::default_host()
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_else(|| "(no device)".to_string())
     }
 
     fn find_best_config(
@@ -143,26 +118,55 @@ impl AudioCapture {
         Err("No supported audio config found".into())
     }
 
-    pub fn device_name(&self) -> &str {
-        &self.device_name
+    pub fn device_name(&self) -> String {
+        self.device_name.lock().unwrap().clone()
     }
 
-    /// Start recording
+    /// Start recording. Acquires the current default input device fresh each time.
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         // A-2: Check with SeqCst to avoid TOCTOU race with stop()
         if self.is_recording.load(Ordering::SeqCst) {
             return Ok(());
         }
 
-        self.buffer.clear();
+        // Acquire device fresh — immune to hot-plug/unplug between recordings.
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or("No audio input device available. Check that a microphone is connected.")?;
+
+        let name = device.name().unwrap_or_else(|_| "(unknown)".to_string());
+        info!("Recording with audio device: {}", name);
+        *self.device_name.lock().unwrap() = name;
+
+        let supported_configs = device.supported_input_configs().map_err(|e| {
+            format!("Failed to query audio device configs: {}. The device may have been disconnected.", e)
+        })?;
+        let config = Self::find_best_config(supported_configs)?;
+        info!(
+            "Audio config: {} Hz, {} channel(s), {:?}",
+            config.sample_rate().0,
+            config.channels(),
+            config.sample_format()
+        );
+
+        let stream_config: StreamConfig = config.clone().into();
+        let sample_format = config.sample_format();
+
+        let ring_capacity = stream_config.sample_rate.0 as usize
+            * stream_config.channels as usize
+            * RING_BUFFER_SECONDS;
+        let ring = Arc::new(RingBuffer::new(ring_capacity));
+        *self.buffer.lock().unwrap() = Some(Arc::clone(&ring));
+
         self.dropped_samples.store(0, Ordering::SeqCst);
         self.writer_stop.store(false, Ordering::SeqCst);
 
-        let channels = self.config.channels as usize;
-        let source_rate = self.config.sample_rate.0;
+        let channels = stream_config.channels as usize;
+        let source_rate = stream_config.sample_rate.0;
         let output_path = audio_output_path()?;
 
-        let buffer = self.buffer.clone();
+        let writer_buffer = Arc::clone(&ring);
         let stop = self.writer_stop.clone();
         let dropped = self.dropped_samples.clone();
         let level_tx = self.level_tx.clone();
@@ -171,7 +175,7 @@ impl AudioCapture {
             .name("audio-writer".to_string())
             .spawn(move || {
                 writer_thread(
-                    buffer,
+                    writer_buffer,
                     stop,
                     dropped,
                     channels,
@@ -187,17 +191,16 @@ impl AudioCapture {
             error!("Audio stream error: {}", err);
         };
 
-        let buffer = self.buffer.clone();
         let is_recording = self.is_recording.clone();
         let dropped = self.dropped_samples.clone();
 
-        let stream = match self.sample_format {
+        let stream = match sample_format {
             SampleFormat::F32 => {
-                let buffer = buffer.clone();
+                let buffer = Arc::clone(&ring);
                 let is_recording = is_recording.clone();
                 let dropped = dropped.clone();
-                self.device.build_input_stream(
-                    &self.config,
+                device.build_input_stream(
+                    &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         Self::handle_input_f32(data, &buffer, &is_recording, &dropped);
                     },
@@ -206,11 +209,11 @@ impl AudioCapture {
                 )?
             }
             SampleFormat::I16 => {
-                let buffer = buffer.clone();
+                let buffer = Arc::clone(&ring);
                 let is_recording = is_recording.clone();
                 let dropped = dropped.clone();
-                self.device.build_input_stream(
-                    &self.config,
+                device.build_input_stream(
+                    &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         Self::handle_input_mapped(
                             data,
@@ -225,11 +228,11 @@ impl AudioCapture {
                 )?
             }
             SampleFormat::U16 => {
-                let buffer = buffer.clone();
+                let buffer = Arc::clone(&ring);
                 let is_recording = is_recording.clone();
                 let dropped = dropped.clone();
-                self.device.build_input_stream(
-                    &self.config,
+                device.build_input_stream(
+                    &stream_config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
                         Self::handle_input_mapped(
                             data,
@@ -296,6 +299,9 @@ impl AudioCapture {
                 sample_count: 0,
             });
         };
+
+        // Drop the ring buffer reference — frees memory between recordings
+        *self.buffer.lock().unwrap() = None;
 
         if result.dropped_input_samples > 0 {
             warn!(

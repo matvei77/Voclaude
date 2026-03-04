@@ -201,7 +201,7 @@ impl App {
             None,
         );
         ui_status.history_count = history.len();
-        ui_status.input_device = Some(audio.device_name().to_string());
+        ui_status.input_device = Some(audio.device_name());
         ui_status.input_level = Some(0.0);
         self.ui.set_status(ui_status.clone());
 
@@ -423,10 +423,12 @@ impl App {
                                         _tray.set_state(AppState::Idle);
                                         notifications.notify("Failed to start recording");
                                         ui_status.state = "Idle".to_string();
-                                        ui_status.last_message = Some("Failed to start recording".to_string());
+                                        ui_status.last_message = Some(format!("Recording failed: {}", e));
                                         self.ui.set_status(ui_status.clone());
                                         continue;
                                     }
+                                    // Update displayed device name (may have changed since last recording)
+                                    ui_status.input_device = Some(audio.device_name());
                                     if let Err(err) = session_store.start() {
                                         warn!("Failed to start session metadata: {}", err);
                                     }
