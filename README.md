@@ -27,6 +27,11 @@ If someone gave you a `voclaude-vX.Y.Z-gpu.zip`:
 
 The ASR model (~4.5 GB) downloads automatically from Hugging Face on first use. After that, everything works offline.
 
+> **Tip:** If you mostly dictate in a non-English language (e.g. German, French,
+> Portuguese), set `language = "de"` (or your code) in the config — see
+> [Languages](#languages) below. Without a language hint Qwen3-ASR auto-detects,
+> which can collapse short German utterances into noisy English.
+
 ### Requirements (download)
 
 - **Windows 10/11** (64-bit)
@@ -123,6 +128,34 @@ model = "Qwen/Qwen3-ASR-1.7B"
 
 See [`config.example.toml`](config.example.toml) for all options.
 
+### Languages
+
+Voclaude transcribes 100+ languages via Qwen3-ASR. By default the model
+auto-detects the spoken language, but a hint sharply improves accuracy for
+non-English speech (German, in particular, is much more reliable with the
+hint set explicitly).
+
+Set the hint in `config.toml`:
+
+```toml
+language = "de"     # German
+# language = "fr"   # French
+# language = "es"   # Spanish
+# language = "pt"   # Portuguese
+# language = "auto" # auto-detect (same as omitting)
+```
+
+Accepts ISO codes (`de`, `fr`), regional codes (`de-DE`, `pt-BR`), and English
+names (`German`, `French`). Officially supported by Qwen3-ASR-1.7B:
+`en`, `zh`, `yue`, `de`, `fr`, `es`, `it`, `pt`, `ja`, `ko`, `ru`, `ar`.
+Also recognised: `nl`, `pl`, `tr`, `sv`, `vi`, `th`, `id`, `hi`.
+
+You can also override it for a single session via the CLI:
+
+```bash
+voclaude --lang de
+```
+
 ### Supported Hotkeys
 
 - **Modifiers:** `Ctrl`, `Alt`, `Shift`, `Super`/`Win`
@@ -171,6 +204,12 @@ Check that your microphone is set as the default input device in your system sou
 ### Hotkey not working
 - Make sure no other application has registered the same global hotkey (F4)
 - Try a different hotkey in the config file (e.g. `hotkey = "Ctrl+Shift+Space"`)
+
+### Non-English transcription is garbled
+Qwen3-ASR auto-detects language, but the hint catches edge cases (especially
+short utterances). Set `language = "de"` (or your code) in `config.toml` —
+see [Languages](#languages). After a settings change, restart Voclaude or
+re-save the config so the hint is picked up.
 
 ### Linux: Hotkey not working on Wayland
 Global hotkeys may require X11 compatibility:

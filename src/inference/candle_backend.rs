@@ -1144,18 +1144,102 @@ fn find_safetensors(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
+/// Strip Qwen3-ASR control tokens and `<asr_text>` framing from raw decoded text.
+///
+/// The model can prefix transcriptions with a detected-language tag such as
+/// `<|de|>` or `<|fr|>`. Earlier we stripped only a hand-picked subset, which
+/// left tags like German untouched and produced "collapsed" (garbage-prefixed)
+/// output for non-English speech. This walker removes any token of the shape
+/// `<|alphanum_-|>` (max 16 chars between the delimiters) so all 100+ language
+/// codes are handled without an explicit allow-list. Legitimate text rarely
+/// contains `<|...|>` runs, and the length cap prevents accidental gobbling of
+/// real punctuation.
 fn clean_transcription(text: &str) -> String {
     let text = text.trim();
-    // Extract text after <asr_text> tag if present
-    let result = if let Some(pos) = text.find("<asr_text>") {
-        &text[pos + "<asr_text>".len()..]
+
+    // Prefer the inside of <asr_text>...</asr_text> when present.
+    let inner = if let Some(start) = text.find("<asr_text>") {
+        let after = &text[start + "<asr_text>".len()..];
+        match after.find("</asr_text>") {
+            Some(end) => &after[..end],
+            None => after,
+        }
     } else {
         text
     };
-    // Remove closing tag and other artifacts
-    let mut result = result.to_string();
-    for tag in &["</asr_text>", "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|yue|>", "<|nospeech|>"] {
-        result = result.replace(tag, "");
+
+    let mut out = String::with_capacity(inner.len());
+    let mut rest = inner;
+    while !rest.is_empty() {
+        match rest.find("<|") {
+            Some(start) => {
+                out.push_str(&rest[..start]);
+                let tail = &rest[start + 2..];
+                match tail.find("|>") {
+                    Some(end)
+                        if end > 0
+                            && end <= 16
+                            && tail[..end]
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+                    {
+                        rest = &tail[end + 2..];
+                    }
+                    _ => {
+                        // Not a control token — emit the literal `<|` and continue.
+                        out.push_str("<|");
+                        rest = tail;
+                    }
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
     }
-    result.trim().to_string()
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::clean_transcription;
+
+    #[test]
+    fn strips_known_language_tokens() {
+        assert_eq!(clean_transcription("<|en|>hello world"), "hello world");
+        assert_eq!(clean_transcription("<|de|>Guten Tag"), "Guten Tag");
+        assert_eq!(clean_transcription("<|fr|>Bonjour le monde"), "Bonjour le monde");
+        assert_eq!(clean_transcription("<|pt|>Olá mundo"), "Olá mundo");
+    }
+
+    #[test]
+    fn strips_asr_text_framing() {
+        assert_eq!(
+            clean_transcription("<asr_text>Servus<|de|></asr_text>"),
+            "Servus"
+        );
+        assert_eq!(
+            clean_transcription("<|de|><asr_text>Hallo Welt</asr_text>"),
+            "Hallo Welt"
+        );
+    }
+
+    #[test]
+    fn preserves_user_text_with_pipes() {
+        // A literal `<|` followed by something that isn't a short alphanum tag
+        // must survive (e.g. someone dictates math).
+        assert_eq!(
+            clean_transcription("Compare a <| b in pseudo-code"),
+            "Compare a <| b in pseudo-code"
+        );
+    }
+
+    #[test]
+    fn preserves_unicode() {
+        assert_eq!(
+            clean_transcription("<|de|>Schöne Grüße — alles ok?"),
+            "Schöne Grüße — alles ok?"
+        );
+    }
 }

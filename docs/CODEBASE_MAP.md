@@ -450,7 +450,7 @@ sequenceDiagram
 ### Correctness
 - **WAV loader assumes 16-bit PCM**: format/bits fields are logged but never validated. Non-PCM WAVs produce silent garbage.
 - **Hardcoded special token IDs**: not validated against loaded tokenizer vocabulary at runtime.
-- **`_language` parameter unused**: language-conditional transcription prompts are not implemented.
+- **Language hint scope**: `language` biases the prompt ("Transcribe the audio to text in {Language}.") for ~20 mapped languages but does not constrain decoding — speakers in unmapped languages still rely on auto-detect.
 - **History brace-depth recovery**: cannot handle unbalanced `{`/`}` inside JSON string values.
 
 ### Windows-Specific

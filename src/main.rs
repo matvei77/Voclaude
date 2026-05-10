@@ -51,6 +51,12 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
+    // --help / -h: print usage and exit
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+
     // --version: print version and exit
     if args.iter().any(|a| a == "--version") {
         println!("voclaude {} ({})", env!("CARGO_PKG_VERSION"), option_env!("VOCLAUDE_GIT_HASH").unwrap_or("unknown"));
@@ -158,6 +164,27 @@ fn main() {
         }
     };
 
+    // CLI override: --lang <code> sets the language hint for this session.
+    // Accepts ISO codes ("de"), regional codes ("de-DE"), or English names.
+    if let Some(pos) = args.iter().position(|a| a == "--lang" || a == "--language") {
+        match args.get(pos + 1) {
+            Some(value) if !value.starts_with('-') => {
+                let normalized = value.trim();
+                config.language = if normalized.is_empty() || normalized.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(normalized.to_string())
+                };
+                info!("Using --lang override: {}", config.language.as_deref().unwrap_or("auto"));
+            }
+            _ => {
+                error!("--lang requires a language code (e.g. de, fr, en, auto)");
+                show_fatal_error_dialog("--lang requires a language code (e.g. de, fr, en, auto)");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // CLI override: --model-dir <path> sets model_path for IT pre-staging
     // O-5: Validate --model-dir has a value and the path exists
     if let Some(pos) = args.iter().position(|a| a == "--model-dir") {
@@ -195,6 +222,7 @@ fn main() {
             println!("  model: {}", config.model);
             println!("  use_gpu: {}", config.use_gpu);
             println!("  model_path: {}", config.model_path.as_deref().unwrap_or("(auto)"));
+            println!("  language: {}", config.language.as_deref().unwrap_or("auto"));
 
             let mut engine = QwenEngine::new_with_config(&config)?;
             println!("Engine init: OK (gpu={})", engine.active_gpu());
@@ -260,6 +288,30 @@ fn run_test(audio_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n>>> TRANSCRIPTION:\n{}\n", text);
 
     Ok(())
+}
+
+fn print_help() {
+    println!("voclaude {} — voice-to-text dictation for your system tray", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("USAGE:");
+    println!("    voclaude [OPTIONS]");
+    println!("    voclaude --test <audio.wav|audio.f32>");
+    println!();
+    println!("OPTIONS:");
+    println!("    -h, --help               Show this help and exit");
+    println!("        --version            Show version and exit");
+    println!("        --validate           Run startup self-check (config, model, audio) and exit");
+    println!("        --test <PATH>        Transcribe an audio file once and print the result");
+    println!("        --lang <CODE>        Language hint for this session (overrides config)");
+    println!("                             Accepts ISO codes (de, fr, en), regional codes");
+    println!("                             (de-DE, pt-BR), English names (German), or 'auto'.");
+    println!("                             Officially supported: en, zh, yue, de, fr, es, it,");
+    println!("                             pt, ja, ko, ru, ar.");
+    println!("        --model-dir <PATH>   Use a pre-staged local model directory (skips download)");
+    println!();
+    println!("Once running, press F4 to start/stop recording. Right-click the tray icon");
+    println!("for History, Settings, and Quit. Configuration lives in config.toml — see");
+    println!("https://github.com/matvei77/Voclaude for details.");
 }
 
 #[cfg(target_os = "windows")]

@@ -7,8 +7,14 @@ hotkey = "F4"
 # Hotkey to toggle history window
 history_hotkey = "Ctrl+Shift+H"
 
-# Language hint (comment out for auto-detect)
-# language = "en"
+# Language hint. Leave commented out for auto-detect.
+# Setting this biases the model toward the chosen language and noticeably
+# improves accuracy for non-English speech (e.g. German, French, Portuguese).
+# Accepts ISO codes ("de", "fr"), regional codes ("de-DE", "pt-BR"), or
+# English names ("German", "French").
+# Officially supported: en, zh, yue, de, fr, es, it, pt, ja, ko, ru, ar
+# Also recognised: nl, pl, tr, sv, vi, th, id, hi
+# language = "de"
 
 # Formatting
 add_trailing_space = true
