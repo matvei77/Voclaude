@@ -15,6 +15,8 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crate::config::project_dirs;
 use std::collections::VecDeque;
 use std::fs;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -309,6 +311,7 @@ impl App {
     }
 
     fn run_event_loop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering;
         info!("Initializing components...");
 
         // Initialize tray icon - MUST keep alive!
@@ -336,7 +339,9 @@ impl App {
         // If it fails, the user gets immediate feedback via the HUD.
 
         // Initialize inference worker (lazy - loads model on demand)
-        let (mut inference_tx, mut inference_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+        let inference_shutdown = Arc::new(AtomicBool::new(false));
+        let (mut inference_tx, mut inference_handle) =
+            Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone(), inference_shutdown.clone());
         info!("Inference worker ready (model will load on first use)");
 
         // Clipboard
@@ -428,8 +433,6 @@ impl App {
         let mut _sentinel_rx: Option<Receiver<InferenceCommand>> = None;
 
         // Settings watcher cancellation flag
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
         let mut settings_watcher_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         // Main event loop - runs on main thread with Windows message pump
@@ -442,6 +445,7 @@ impl App {
             // E-1: Handle OS shutdown/logoff via WM_QUIT
             if os_quit {
                 info!("OS requested shutdown via WM_QUIT");
+                inference_shutdown.store(true, Ordering::SeqCst);
                 let _ = inference_tx.try_send(InferenceCommand::Shutdown);
                 settings_watcher_cancel.store(true, Ordering::Relaxed);
                 self.is_running = false;
@@ -461,7 +465,8 @@ impl App {
             if let Some(respawn_at) = deferred_respawn_at {
                 if Instant::now() >= respawn_at {
                     deferred_respawn_at = None;
-                    let (new_tx, new_handle) = Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone());
+                    let (new_tx, new_handle) =
+                        Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone(), inference_shutdown.clone());
                     inference_tx = new_tx;
                     inference_handle = new_handle;
                     info!("Inference worker respawned (attempt {})", watchdog_respawn_count);
@@ -1241,6 +1246,7 @@ impl App {
                             last_activity = Instant::now();
                             idle_unload_requested = false;
                             info!("Quit requested");
+                            inference_shutdown.store(true, Ordering::SeqCst);
                             // E-2: Use try_send to avoid blocking main thread
                             let _ = inference_tx.try_send(InferenceCommand::Shutdown);
                             // E-13: Cancel settings watcher on quit
@@ -1256,12 +1262,8 @@ impl App {
                             if new_config.history_hotkey != self.config.history_hotkey {
                                 needs_restart.push("history_hotkey");
                             }
-                            if new_config.model != self.config.model {
-                                needs_restart.push("model");
-                            }
-                            if new_config.use_gpu != self.config.use_gpu {
-                                needs_restart.push("use_gpu");
-                            }
+                            // Model/GPU settings take effect when the inference worker
+                            // next starts (it is restarted below if it is idle).
                             // Apply runtime-updatable fields
                             self.config.idle_unload_seconds = new_config.idle_unload_seconds;
                             self.config.show_notifications = new_config.show_notifications;
@@ -1272,6 +1274,17 @@ impl App {
                             self.config.history_max_entries = new_config.history_max_entries;
                             self.config.require_gpu = new_config.require_gpu;
                             self.config.audio_retention_count = new_config.audio_retention_count;
+                            self.config.model = new_config.model.clone();
+                            self.config.model_path = new_config.model_path.clone();
+                            self.config.model_tier = new_config.model_tier.clone();
+                            self.config.use_gpu = new_config.use_gpu;
+                            self.config.quantization = new_config.quantization.clone();
+                            self.config.adaptive_max_new_tokens = new_config.adaptive_max_new_tokens;
+                            self.config.max_chunk_seconds = new_config.max_chunk_seconds;
+                            self.config.legacy_prompt = new_config.legacy_prompt;
+                            if let Err(err) = inference_tx.try_send(InferenceCommand::UpdateConfig(self.config.clone())) {
+                                warn!("Could not forward settings to the inference worker: {}", err);
+                            }
                             self.config.streaming = new_config.streaming;
                             self.config.segment_context = new_config.segment_context;
                             self.config.segment_min_seconds = new_config.segment_min_seconds;
@@ -1314,8 +1327,9 @@ impl App {
     fn spawn_inference_worker(
         event_tx: Sender<AppEvent>,
         config: Config,
+        shutdown: Arc<AtomicBool>,
     ) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
-        crate::worker::spawn_proxy(event_tx, config)
+        crate::worker::spawn_proxy(event_tx, config, shutdown)
     }
 
     /// Pump Windows messages - MUST be called from main thread

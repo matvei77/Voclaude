@@ -460,7 +460,8 @@ impl AsrEngine for QwenEngine {
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
         // Quantized kernels only exist for the GPU path; CPU keeps dense weights.
         let quant = if self.device.is_cuda() { self.quantization } else { Quantization::None };
-        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant)
+        let cache_path = quant_cache_path(&self.model_id, quant);
+        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant, cache_path.as_deref())
             .map_err(|e| format!("Failed to load model: {}", e))?;
         // I-6: Wire max_new_tokens config through to the model
         model.max_new_tokens = self.max_new_tokens as usize;
@@ -668,6 +669,27 @@ fn load_wav_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     }
 
     Err("No data chunk found in WAV file".into())
+}
+
+/// Where the quantized projections of `model_id` are cached
+/// (`%LOCALAPPDATA%\voclaude\Voclaude\cache\weights\<model>-<quant>.gguf`).
+fn quant_cache_path(model_id: &str, quant: Quantization) -> Option<PathBuf> {
+    if quant == Quantization::None {
+        return None;
+    }
+    let dirs = crate::config::project_dirs()?;
+    let name = model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect::<String>();
+    Some(
+        dirs.cache_dir()
+            .join("weights")
+            .join(format!("{}-{}.gguf", name, format!("{:?}", quant).to_ascii_lowercase())),
+    )
 }
 
 /// Directory holding `tokenizer.json` for the model. Some snapshots (e.g.

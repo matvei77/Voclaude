@@ -3,7 +3,9 @@
 //! Loads safetensors weights from a local directory and runs inference entirely
 //! in Rust via `candle-core`.
 
+use candle_core::quantized::gguf_file;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+use std::sync::{Arc, Mutex};
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
 
@@ -41,7 +43,55 @@ impl Quantization {
 /// (candle's CUDA ggml kernels: int8 dot products for decode, q8_1 GEMM for prefill).
 enum ProjLinear {
     Dense(Linear),
-    Quant(QMatMul),
+    Quant { name: String, q: QMatMul },
+}
+
+/// A GGUF file holding this model's quantized projections (read side).
+pub struct QuantCache {
+    content: gguf_file::Content,
+    file: std::fs::File,
+}
+
+impl QuantCache {
+    /// Open the cache if it exists and was written for exactly these weights.
+    fn open(path: &Path, source_tag: &str) -> Option<Self> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let content = gguf_file::Content::read(&mut file).ok()?;
+        let tag_ok = matches!(
+            content.metadata.get("voclaude.source"),
+            Some(gguf_file::Value::String(s)) if s == source_tag
+        );
+        if !tag_ok {
+            tracing::info!("Ignoring stale quantized weight cache {}", path.display());
+            return None;
+        }
+        Some(Self { content, file })
+    }
+
+    fn tensor(&mut self, name: &str, device: &Device) -> Result<QTensor> {
+        self.content.tensor(&mut self.file, name, device)
+    }
+}
+
+/// Identifies the safetensors a cache was built from (names, sizes, mtimes).
+pub fn source_tag(files: &[std::path::PathBuf]) -> String {
+    let mut parts = Vec::new();
+    for f in files {
+        let meta = std::fs::metadata(f).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        parts.push(format!(
+            "{}:{}:{}",
+            f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            size,
+            mtime
+        ));
+    }
+    format!("v1|{}", parts.join(","))
 }
 
 /// Where decoder projection weights are read from at load time.
@@ -51,6 +101,10 @@ struct ProjSource<'a> {
     vb: VarBuilder<'a>,
     /// F32 weights on the CPU (quantized path: quantize on CPU, upload once).
     vb_cpu: Option<VarBuilder<'a>>,
+    /// Previously quantized projections (quantized path, fast reload).
+    cache: Option<Arc<Mutex<QuantCache>>>,
+    /// Name prefix inside the cache file.
+    prefix: String,
     device: Device,
     quant: Quantization,
 }
@@ -60,8 +114,19 @@ impl<'a> ProjSource<'a> {
         Self {
             vb: self.vb.pp(name),
             vb_cpu: self.vb_cpu.as_ref().map(|v| v.pp(name)),
+            cache: self.cache.clone(),
+            prefix: if self.prefix.is_empty() { name.to_string() } else { format!("{}.{}", self.prefix, name) },
             device: self.device.clone(),
             quant: self.quant,
+        }
+    }
+
+    fn cache_name(&self, parts: &[(&str, usize)]) -> String {
+        let joined: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
+        if self.prefix.is_empty() {
+            joined.join("+")
+        } else {
+            format!("{}.{}", self.prefix, joined.join("+"))
         }
     }
 
@@ -70,14 +135,22 @@ impl<'a> ProjSource<'a> {
     fn linear(&self, parts: &[(&str, usize)], in_dim: usize) -> Result<ProjLinear> {
         match (self.quant.ggml(), self.vb_cpu.as_ref()) {
             (Some(dtype), Some(vb_cpu)) if in_dim % dtype.block_size() == 0 => {
+                let name = self.cache_name(parts);
+                if let Some(cache) = self.cache.as_ref() {
+                    let q = cache
+                        .lock()
+                        .map_err(|_| candle_core::Error::Msg("quant cache lock poisoned".into()))?
+                        .tensor(&name, &self.device)?;
+                    return Ok(ProjLinear::Quant { name, q: QMatMul::from_qtensor(q)? });
+                }
                 let mut ws = Vec::with_capacity(parts.len());
-                for (name, out) in parts {
-                    ws.push(vb_cpu.pp(name).get((*out, in_dim), "weight")?);
+                for (pname, out) in parts {
+                    ws.push(vb_cpu.pp(pname).get((*out, in_dim), "weight")?);
                 }
                 let w = if ws.len() == 1 { ws.pop().unwrap() } else { Tensor::cat(&ws, 0)? };
                 drop(ws);
                 let q = QTensor::quantize_onto(&w, dtype, &self.device)?;
-                Ok(ProjLinear::Quant(QMatMul::from_qtensor(q)?))
+                Ok(ProjLinear::Quant { name, q: QMatMul::from_qtensor(q)? })
             }
             _ => {
                 let mut ws = Vec::with_capacity(parts.len());
@@ -93,10 +166,18 @@ impl<'a> ProjSource<'a> {
 
 impl ProjLinear {
 
+    /// The quantized tensor, for writing the cache.
+    fn qtensor(&self) -> Option<(&str, Arc<QTensor>)> {
+        match self {
+            Self::Quant { name, q: QMatMul::QTensor(t) } => Some((name.as_str(), t.clone())),
+            _ => None,
+        }
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
-            Self::Quant(q) => {
+            Self::Quant { q, .. } => {
                 // The CUDA quantized kernels take f32 activations.
                 let in_dtype = x.dtype();
                 let x = if in_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
@@ -898,10 +979,12 @@ pub struct TextDecoder {
 }
 
 impl TextDecoder {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         vb_model: VarBuilder,
         vb_lm_head: VarBuilder,
         vb_cpu: Option<(VarBuilder, VarBuilder)>,
+        cache: Option<Arc<Mutex<QuantCache>>>,
         cfg: &ThinkerConfig,
         device: &Device,
         dtype: DType,
@@ -916,13 +999,16 @@ impl TextDecoder {
         let src = ProjSource {
             vb: vb_model.clone(),
             vb_cpu: vb_cpu_model,
+            cache: cache.clone(),
+            prefix: String::new(),
             device: device.clone(),
             quant,
         };
 
-        // Quantization runs on the CPU, so spread the layers over threads.
+        // Quantization runs on the CPU, so spread the layers over threads
+        // (reading the cache is sequential I/O: one thread).
         let n_layers = cfg.num_hidden_layers;
-        let threads = if quant == Quantization::None {
+        let threads = if quant == Quantization::None || cache.is_some() {
             1
         } else {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8)
@@ -966,14 +1052,24 @@ impl TextDecoder {
         let lm_src = ProjSource {
             vb: vb_lm_head.clone(),
             vb_cpu: vb_cpu_lm_head,
+            cache: cache.clone(),
+            prefix: "lm_head".to_string(),
             device: device.clone(),
             quant,
         };
         // lm_head lives at the prefix itself: load it as a single-part projection.
         let lm_head = match (quant.ggml(), lm_src.vb_cpu.as_ref()) {
             (Some(qdt), Some(vbc)) if cfg.hidden_size % qdt.block_size() == 0 => {
-                let w = vbc.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
-                ProjLinear::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(&w, qdt, device)?)?)
+                let name = "lm_head".to_string();
+                let q = if let Some(c) = lm_src.cache.as_ref() {
+                    c.lock()
+                        .map_err(|_| candle_core::Error::Msg("quant cache lock poisoned".into()))?
+                        .tensor(&name, device)?
+                } else {
+                    let w = vbc.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+                    QTensor::quantize_onto(&w, qdt, device)?
+                };
+                ProjLinear::Quant { name, q: QMatMul::from_qtensor(q)? }
             }
             _ => {
                 let w = vb_lm_head.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
@@ -1007,6 +1103,27 @@ impl TextDecoder {
 
         let x = self.norm.forward(&x)?;
         self.lm_head.forward(&x)
+    }
+
+    /// Every quantized projection, for writing the weight cache.
+    fn quantized_tensors(&self) -> Vec<(String, Arc<QTensor>)> {
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            for p in [
+                &layer.self_attn.qkv_proj,
+                &layer.self_attn.o_proj,
+                &layer.mlp.gate_up_proj,
+                &layer.mlp.down_proj,
+            ] {
+                if let Some((n, t)) = p.qtensor() {
+                    out.push((n.to_string(), t));
+                }
+            }
+        }
+        if let Some((n, t)) = self.lm_head.qtensor() {
+            out.push((n.to_string(), t));
+        }
+        out
     }
 
     /// Pre-allocate KV cache buffers across all layers for the given max sequence length.
@@ -1089,7 +1206,17 @@ impl TranscribeStats {
 
 impl Qwen3ASRModel {
     /// Load from a directory containing safetensors + config.json.
-    pub fn load(model_dir: &Path, device: &Device, dtype: DType, quant: Quantization) -> Result<Self> {
+    ///
+    /// `quant_cache` is an optional GGUF path where the quantized projections
+    /// are cached: read from it when it matches the safetensors, written after
+    /// the first quantized load otherwise.
+    pub fn load(
+        model_dir: &Path,
+        device: &Device,
+        dtype: DType,
+        quant: Quantization,
+        quant_cache: Option<&Path>,
+    ) -> Result<Self> {
         // Parse config
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
@@ -1103,12 +1230,24 @@ impl Qwen3ASRModel {
             VarBuilder::from_mmaped_safetensors(&safetensor_files, dtype, device)?
         };
         // Quantized path: read projections as F32 on the CPU, quantize there,
-        // upload once (avoids a GPU round-trip per tensor).
-        let vb_cpu = if quant != Quantization::None {
+        // upload once (avoids a GPU round-trip per tensor) — unless a cache of
+        // the quantized tensors exists for exactly these files.
+        let tag = source_tag(&safetensor_files);
+        let cache = match (quant, quant_cache) {
+            (Quantization::None, _) | (_, None) => None,
+            (_, Some(path)) => QuantCache::open(path, &format!("{}|{:?}", tag, quant)).map(|c| Arc::new(Mutex::new(c))),
+        };
+        if cache.is_some() {
+            tracing::info!("Loading {:?} weights from cache {}", quant, quant_cache.unwrap().display());
+        }
+        let vb_cpu = if quant != Quantization::None && cache.is_none() {
             let vbc = unsafe {
                 VarBuilder::from_mmaped_safetensors(&safetensor_files, DType::F32, &Device::Cpu)?
             };
             Some((vbc.pp("thinker.model"), vbc.pp("thinker.lm_head")))
+        } else if quant != Quantization::None {
+            // Cache path still needs a "cpu" builder for the type; reuse the device one (unused).
+            Some((vb.pp("thinker.model"), vb.pp("thinker.lm_head")))
         } else {
             None
         };
@@ -1118,10 +1257,26 @@ impl Qwen3ASRModel {
         let vb_lm_head = vb.pp("thinker.lm_head");
 
         let audio_encoder = AudioEncoder::load(vb_audio, &config.thinker_config.audio_config)?;
-        let text_decoder = TextDecoder::load(vb_model, vb_lm_head, vb_cpu, &config.thinker_config.text_config, device, dtype, quant)?;
+        let wrote_from_cache = cache.is_some();
+        let text_decoder = TextDecoder::load(
+            vb_model,
+            vb_lm_head,
+            vb_cpu,
+            cache,
+            &config.thinker_config.text_config,
+            device,
+            dtype,
+            quant,
+        )?;
         if quant != Quantization::None {
             // Make sure every quantization round-trip has landed before we start.
             device.synchronize()?;
+            if let (false, Some(path)) = (wrote_from_cache, quant_cache) {
+                let tensors = text_decoder.quantized_tensors();
+                if let Err(e) = write_quant_cache(path, &format!("{}|{:?}", tag, quant), &tensors) {
+                    tracing::warn!("Could not write quantized weight cache {}: {}", path.display(), e);
+                }
+            }
         }
 
         Ok(Self {
@@ -1361,6 +1516,32 @@ fn sinusoidal_position_embedding(
     }
 
     Tensor::from_vec(data, (max_positions, d_model), device)
+}
+
+/// Write the quantized projections to `path` (atomically via a temp file).
+fn write_quant_cache(path: &Path, source: &str, tensors: &[(String, Arc<QTensor>)]) -> Result<()> {
+    let started = Instant::now();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let source_v = gguf_file::Value::String(source.to_string());
+        let format_v = gguf_file::Value::U32(1);
+        let metadata: Vec<(&str, &gguf_file::Value)> = vec![("voclaude.source", &source_v), ("voclaude.format", &format_v)];
+        let refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t.as_ref())).collect();
+        gguf_file::write(&mut file, &metadata, &refs)?;
+        file.sync_all().map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    tracing::info!(
+        "Wrote quantized weight cache {} ({} tensors) in {:.1}s",
+        path.display(),
+        tensors.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn find_safetensors(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {

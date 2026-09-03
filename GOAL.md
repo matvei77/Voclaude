@@ -116,7 +116,7 @@ bench and the streaming pipeline to be meaningful.
 |---|---|---|
 | Stop → clipboard, any length | ≤ 3 s | 0.3–2.4 s live; simulation over the 29-min set: mean 1.2 s, max 2.7 s |
 | Short clip, model already loaded | ≤ 1.5 s | 0.3–0.6 s |
-| Short clip, model cold | ≤ 4 s | worker start 0.15 s + Q8 load 4.4 s, overlapped with the recording; a 2 s clip waits ~3 s |
+| Short clip, model cold | ≤ 4 s | worker start 0.7 s + Q8 load 1.7 s from the GGUF cache (5.8 s only on the very first run, which writes the cache), overlapped with the recording; measured 0.26 s after stop for a 6 s clip |
 | Decode speed | ≥ 45 tok/s | 99 tok/s (Q8_0, fused kernels) |
 | VRAM while loaded | ≤ 3.5 GB | ~3.6 GB |
 | VRAM idle | 0 within 60 s | 0 (worker process exits at 60 s) |
@@ -125,5 +125,6 @@ bench and the streaming pipeline to be meaningful.
 | Transcription failure | zero loss, retry | verified: inference child killed mid-recording, restarted on next segment, all text delivered |
 | Multilingual quality | measured, model chosen from data | Qwen3-ASR-1.7B kept; Whisper large-v3-turbo dropped the Russian passage entirely; Q4_K lost text; see docs/bench/README.md |
 
-Not done: single-digit-MB idle RAM (out of scope by design; 8 MB private / 20 MB working set achieved),
-GGUF caching of the quantized weights (would cut the cold load from 4.4 s to ~2 s).
+Not done: single-digit-MB idle RAM (out of scope by design; 8 MB private / 20 MB working set achieved).
+A code review of the day's diff found two issues, both fixed: settings edits now reach the inference
+worker, and quitting during an in-flight segment no longer waits for the segment timeout.

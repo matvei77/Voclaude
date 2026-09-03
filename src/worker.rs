@@ -15,6 +15,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -44,6 +46,9 @@ pub enum InferenceCommand {
         use_context: bool,
     },
     TranscribeFile(PathBuf),
+    /// Settings changed: use this config for the next worker start. A running
+    /// idle worker is stopped so the change takes effect on the next recording.
+    UpdateConfig(Config),
     Unload,
     Shutdown,
 }
@@ -255,12 +260,18 @@ fn engine_is_loaded(engine: &QwenEngine) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Spawn the proxy thread. Same shape as the old in-process worker: a bounded
-/// command channel and a join handle the watchdog can poll.
-pub fn spawn_proxy(event_tx: Sender<AppEvent>, config: Config) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
+/// command channel and a join handle the watchdog can poll. `shutdown` makes
+/// an in-flight wait return immediately (the child is killed) so quitting
+/// never blocks on a long segment.
+pub fn spawn_proxy(
+    event_tx: Sender<AppEvent>,
+    config: Config,
+    shutdown: Arc<AtomicBool>,
+) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
     let (tx, rx) = bounded::<InferenceCommand>(8);
     let handle = thread::Builder::new()
         .name("inference-proxy".to_string())
-        .spawn(move || proxy_loop(rx, event_tx, config))
+        .spawn(move || proxy_loop(rx, event_tx, config, shutdown))
         .expect("spawn inference proxy");
     (tx, handle)
 }
@@ -361,14 +372,25 @@ enum Wait {
     Timeout,
 }
 
-fn wait_for(child: &mut ChildHandle, event_tx: &Sender<AppEvent>, timeout: Duration, is_terminal: impl Fn(&WireEvent) -> bool) -> Wait {
+fn wait_for(
+    child: &mut ChildHandle,
+    event_tx: &Sender<AppEvent>,
+    shutdown: &AtomicBool,
+    timeout: Duration,
+    is_terminal: impl Fn(&WireEvent) -> bool,
+) -> Wait {
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            child.kill();
+            return Wait::Died;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Wait::Timeout;
         }
-        match child.lines.recv_timeout(remaining) {
+        // Poll in short slices so a shutdown request is noticed promptly.
+        match child.lines.recv_timeout(remaining.min(Duration::from_millis(250))) {
             Ok(line) => {
                 let ev: WireEvent = match serde_json::from_str(&line) {
                     Ok(ev) => ev,
@@ -382,7 +404,7 @@ fn wait_for(child: &mut ChildHandle, event_tx: &Sender<AppEvent>, timeout: Durat
                 }
                 forward_event(&ev, event_tx);
             }
-            Err(RecvTimeoutError::Timeout) => return Wait::Timeout,
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Wait::Died,
         }
     }
@@ -407,10 +429,11 @@ fn forward_event(ev: &WireEvent, event_tx: &Sender<AppEvent>) {
     }
 }
 
-fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config: Config) {
+fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config: Config, shutdown: Arc<AtomicBool>) {
     let mut child: Option<ChildHandle> = None;
+    let mut config = config;
 
-    let ensure_child = |child: &mut Option<ChildHandle>| -> Result<(), String> {
+    let ensure_child = |child: &mut Option<ChildHandle>, config: &Config| -> Result<(), String> {
         if let Some(c) = child.as_mut() {
             // Still alive?
             match c.child.try_wait() {
@@ -429,14 +452,36 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
             stage: InferenceStage::LoadingModel,
             message: "Starting inference worker...".to_string(),
         }));
-        *child = Some(spawn_child(&config)?);
+        *child = Some(spawn_child(config)?);
         Ok(())
     };
 
     for command in rx.iter() {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         match command {
+            InferenceCommand::UpdateConfig(new_config) => {
+                let changed = new_config.model != config.model
+                    || new_config.model_path != config.model_path
+                    || new_config.use_gpu != config.use_gpu
+                    || new_config.quantization != config.quantization
+                    || new_config.max_new_tokens != config.max_new_tokens
+                    || new_config.adaptive_max_new_tokens != config.adaptive_max_new_tokens
+                    || new_config.max_chunk_seconds != config.max_chunk_seconds
+                    || new_config.language != config.language
+                    || new_config.legacy_prompt != config.legacy_prompt
+                    || new_config.require_gpu != config.require_gpu;
+                config = new_config;
+                if changed {
+                    if let Some(mut c) = child.take() {
+                        info!("Inference settings changed; restarting worker on next use");
+                        stop_child(&mut c);
+                    }
+                }
+            }
             InferenceCommand::Preload => {
-                if let Err(e) = ensure_child(&mut child) {
+                if let Err(e) = ensure_child(&mut child, &config) {
                     warn!("Preload: {}", e);
                     continue;
                 }
@@ -447,7 +492,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                     child = None;
                     continue;
                 }
-                match wait_for(c, &event_tx, PRELOAD_TIMEOUT, |ev| matches!(ev, WireEvent::Preloaded { .. })) {
+                match wait_for(c, &event_tx, &shutdown, PRELOAD_TIMEOUT, |ev| matches!(ev, WireEvent::Preloaded { .. })) {
                     Wait::Done(WireEvent::Preloaded { ok: false, error }) => {
                         warn!("Preload failed: {}", error.unwrap_or_default());
                     }
@@ -471,7 +516,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                         result: Err(msg),
                     });
                 };
-                if let Err(e) = ensure_child(&mut child) {
+                if let Err(e) = ensure_child(&mut child, &config) {
                     fail(format!("worker start failed: {}", e));
                     continue;
                 }
@@ -490,7 +535,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                     fail(format!("worker send failed: {}", e));
                     continue;
                 }
-                match wait_for(c, &event_tx, SEGMENT_TIMEOUT, |ev| matches!(ev, WireEvent::Segment { .. })) {
+                match wait_for(c, &event_tx, &shutdown, SEGMENT_TIMEOUT, |ev| matches!(ev, WireEvent::Segment { .. })) {
                     Wait::Done(WireEvent::Segment { ok, text, error, .. }) => {
                         let result = if ok { Ok(text.unwrap_or_default()) } else { Err(error.unwrap_or_else(|| "unknown worker error".into())) };
                         let _ = event_tx.send(AppEvent::SegmentTranscribed { session_id, index, result });
@@ -511,7 +556,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                 let fail = |msg: String| {
                     let _ = event_tx.send(AppEvent::TranscriptionComplete(Err(msg)));
                 };
-                if let Err(e) = ensure_child(&mut child) {
+                if let Err(e) = ensure_child(&mut child, &config) {
                     fail(format!("worker start failed: {}", e));
                     continue;
                 }
@@ -522,7 +567,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                     fail(format!("worker send failed: {}", e));
                     continue;
                 }
-                match wait_for(c, &event_tx, FILE_TIMEOUT, |ev| matches!(ev, WireEvent::File { .. })) {
+                match wait_for(c, &event_tx, &shutdown, FILE_TIMEOUT, |ev| matches!(ev, WireEvent::File { .. })) {
                     Wait::Done(WireEvent::File { ok, text, error }) => {
                         let result = if ok { Ok(text.unwrap_or_default()) } else { Err(error.unwrap_or_else(|| "unknown worker error".into())) };
                         let _ = event_tx.send(AppEvent::TranscriptionComplete(result));

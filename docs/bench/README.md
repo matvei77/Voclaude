@@ -17,6 +17,7 @@ audio as `<file>.<tag>.hyp.txt` (audio is not in the repo).
 | `q8` | + Q8_0 decoder weights (ggml kernels) | **98.3** | 31.9x | 9.8 s → 4.5 s after CPU-side quantization | punctuation-level diffs only |
 | `q4k` | Q4_K decoder weights | 127.5 | 42.5x | 38 s | **rejected**: lost most of a 10-min file, "you"→"we" swaps |
 | `q8b` / `dyn` | Q8_0 quantized on the CPU from the mmapped weights, uploaded once; CUDA libraries loaded at runtime | 98.4–99.0 | 31.9x | 4.4 s | identical to `q8` |
+| `gguf` | quantized projections cached as GGUF under `%LOCALAPPDATA%oclaude\Voclaude\cache\weights` | 105 | – | **1.4 s** (5.8 s on the run that writes the cache) | identical |
 
 ### Model bake-off: Whisper large-v3-turbo (`--engine whisper`, F32, 30 s windows, per-window language detection)
 
@@ -26,7 +27,7 @@ audio as `<file>.<tag>.hyp.txt` (audio is not in the repo).
 | Mixed RU/EN recording (4.5 min with a Russian passage) | Russian passage transcribed correctly, script switches back to English seamlessly | **Russian passage lost** (0 Cyrillic characters in the output; whole window detected as "en") |
 | English dictation | full casing and punctuation | some windows come out lowercase and unpunctuated; drops short phrases ("top right", "a bit"); "Vo Cloud" → "war cloud" |
 | Silence / non-speech file | empty output | hallucinated "you you you you" |
-| Load | 4.4 s (Q8 quantization at load) | 0.75 s |
+| Load | 1.4 s from the GGUF cache (4.4 s when quantizing) | 0.75 s |
 
 Verdict: Qwen3-ASR-1.7B stays the default. Whisper turbo is faster to load and decode but fails the core
 requirement of this app (seamless Russian/English mixing) and is noisier on English dictation.
