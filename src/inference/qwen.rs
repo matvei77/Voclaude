@@ -5,8 +5,8 @@
 
 use crate::audio::TARGET_SAMPLE_RATE;
 use crate::config::Config;
-use crate::inference::candle_backend::Qwen3ASRModel;
-use crate::inference::candle_tokenizer::Qwen3ASRTokenizer;
+use crate::inference::candle_backend::{Qwen3ASRModel, TranscribeStats};
+use crate::inference::candle_tokenizer::{PromptStyle, Qwen3ASRTokenizer};
 use crate::inference::{AsrEngine, InferenceProgress, InferenceStage};
 use candle_core::{DType, Device};
 use std::fs;
@@ -44,6 +44,10 @@ pub struct QwenEngine {
     dtype: DType,
     /// Tracks consecutive transcriptions since last model load/reload.
     transcription_count: u32,
+    /// Chat template to use (official unless `legacy_prompt` is configured).
+    prompt_style: PromptStyle,
+    /// Per-phase timing accumulated since the last `take_stats()`.
+    stats: TranscribeStats,
 }
 
 impl QwenEngine {
@@ -77,6 +81,8 @@ impl QwenEngine {
             device,
             dtype,
             transcription_count: 0,
+            prompt_style: PromptStyle::Official,
+            stats: TranscribeStats::default(),
         })
     }
 
@@ -90,7 +96,87 @@ impl QwenEngine {
         engine.max_chunk_samples = ((config.max_chunk_seconds as usize) * SAMPLE_RATE)
             .clamp(MIN_CHUNK_SAMPLES, MAX_CHUNK_SAMPLES);
         engine.require_gpu = config.require_gpu;
+        engine.prompt_style = if config.legacy_prompt {
+            PromptStyle::Legacy
+        } else {
+            PromptStyle::Official
+        };
         Ok(engine)
+    }
+
+    /// Per-phase timing accumulated since the previous call; resets the counter.
+    pub fn take_stats(&mut self) -> TranscribeStats {
+        std::mem::take(&mut self.stats)
+    }
+
+    pub fn prompt_style(&self) -> PromptStyle {
+        self.prompt_style
+    }
+
+    pub fn set_prompt_style(&mut self, style: PromptStyle) {
+        self.prompt_style = style;
+        if let Some(model) = self.model.as_mut() {
+            model.prompt_style = style;
+        }
+    }
+
+    /// Transcribe one segment of a live recording.
+    ///
+    /// `context` is the tail of the previous segment's transcript; it is fed to
+    /// the model's system slot so language and vocabulary carry over. Loads the
+    /// model if needed and retries once after a CUDA out-of-memory error.
+    pub fn transcribe_segment(
+        &mut self,
+        samples: &[f32],
+        context: Option<&str>,
+    ) -> Result<(String, TranscribeStats), Box<dyn std::error::Error>> {
+        self.prepare(None)?;
+        match self.run_segment(samples, context) {
+            Ok(out) => {
+                self.transcription_count += 1;
+                Ok(out)
+            }
+            Err(e) => {
+                let msg = format!("{}", e);
+                if Self::is_cuda_oom(&msg) && self.use_gpu {
+                    warn!("CUDA OOM on segment, reloading model and retrying once");
+                    self.unload();
+                    self.prepare(None)?;
+                    let out = self.run_segment(samples, context)?;
+                    self.transcription_count = 1;
+                    Ok(out)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    fn run_segment(
+        &mut self,
+        samples: &[f32],
+        context: Option<&str>,
+    ) -> Result<(String, TranscribeStats), Box<dyn std::error::Error>> {
+        if samples.is_empty() {
+            return Ok((String::new(), TranscribeStats::default()));
+        }
+        let model = self.model.as_mut().ok_or("Model not loaded")?;
+        let tokenizer = self.tokenizer.as_ref().ok_or("Tokenizer not loaded")?;
+        model.max_new_tokens = adaptive_token_limit(
+            samples.len(),
+            self.max_new_tokens as usize,
+            self.adaptive_max_new_tokens,
+        );
+        let (text, stats) = model
+            .transcribe_with_stats(samples, context, tokenizer)
+            .map_err(|e| format!("{}", e))?;
+        self.stats.add(&stats);
+        debug!(
+            "Segment: {:.1}s audio, mel {:.0}ms, encode {:.0}ms, prefill {:.0}ms, decode {:.0}ms ({} tok, {:.1} tok/s)",
+            stats.audio_secs, stats.mel_ms, stats.encode_ms, stats.prefill_ms, stats.decode_ms,
+            stats.n_generated, stats.decode_tokens_per_sec()
+        );
+        Ok((text, stats))
     }
 
     #[allow(dead_code)]
@@ -202,9 +288,10 @@ impl QwenEngine {
                 self.max_new_tokens as usize,
                 self.adaptive_max_new_tokens,
             );
-            let text = model
-                .transcribe(samples, self.language.as_deref(), tokenizer)
+            let (text, stats) = model
+                .transcribe_with_stats(samples, None, tokenizer)
                 .map_err(|e| format!("{}", e))?;
+            self.stats.add(&stats);
             return Ok(text);
         }
 
@@ -231,9 +318,10 @@ impl QwenEngine {
                 chunk.len() as f64 / SAMPLE_RATE as f64,
                 model.max_new_tokens
             );
-            let text = model
-                .transcribe(chunk, self.language.as_deref(), tokenizer)
+            let (text, stats) = model
+                .transcribe_with_stats(chunk, None, tokenizer)
                 .map_err(|e| format!("Chunk {}/{} failed: {}", i + 1, chunks.len(), e))?;
+            self.stats.add(&stats);
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 texts.push(trimmed.to_string());
@@ -364,6 +452,7 @@ impl AsrEngine for QwenEngine {
             .map_err(|e| format!("Failed to load model: {}", e))?;
         // I-6: Wire max_new_tokens config through to the model
         model.max_new_tokens = self.max_new_tokens as usize;
+        model.prompt_style = self.prompt_style;
 
         let elapsed = started.elapsed();
         info!("Model loaded in {:.2}s", elapsed.as_secs_f64());
@@ -378,16 +467,7 @@ impl AsrEngine for QwenEngine {
         path: &Path,
         progress: Option<&mut dyn FnMut(InferenceProgress)>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let samples = if path
-            .extension()
-            .map(|v| v.to_string_lossy().eq_ignore_ascii_case("f32"))
-            .unwrap_or(false)
-        {
-            load_f32_file(path)?
-        } else {
-            load_wav_file(path)?
-        };
-
+        let samples = load_audio_file(path)?;
         self.transcribe_with_progress(&samples, progress)
     }
 
@@ -446,6 +526,19 @@ fn normalize_language(lang: Option<&str>) -> Option<String> {
         Some("auto") => None,
         Some(value) => Some(value.to_string()),
         None => None,
+    }
+}
+
+/// Load a `.f32` (raw little-endian 16 kHz mono) or `.wav` file as samples.
+pub fn load_audio_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    if path
+        .extension()
+        .map(|v| v.to_string_lossy().eq_ignore_ascii_case("f32"))
+        .unwrap_or(false)
+    {
+        load_f32_file(path)
+    } else {
+        load_wav_file(path)
     }
 }
 

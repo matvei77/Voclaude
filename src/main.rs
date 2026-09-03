@@ -5,6 +5,7 @@
 
 mod app;
 mod audio;
+mod bench;
 mod config;
 mod history;
 mod hotkey;
@@ -60,6 +61,27 @@ fn main() {
     if args.iter().any(|a| a == "--list-models") {
         attach_console_for_cli();
         print_model_list();
+        return;
+    }
+
+    if args.len() > 1 && args[1] == "--bench" {
+        attach_console_for_cli();
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_target(false)
+            .compact()
+            .with_writer(std::io::stderr)
+            .init();
+        let mut bench_config = Config::load().unwrap_or_default();
+        bench_config.require_gpu = false;
+        if let Err(err) = apply_cli_overrides(&mut bench_config, &args) {
+            eprintln!("Invalid CLI option: {}", err);
+            std::process::exit(1);
+        }
+        if let Err(e) = bench::run(&bench_config, &args[2..]) {
+            eprintln!("Bench failed: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -261,6 +283,10 @@ fn apply_cli_overrides(config: &mut Config, args: &[String]) -> Result<(), Strin
 
     if args.iter().any(|a| a == "--no-adaptive-tokens") {
         config.adaptive_max_new_tokens = false;
+    }
+
+    if args.iter().any(|a| a == "--legacy-prompt") {
+        config.legacy_prompt = true;
     }
 
     config.validate().map_err(|err| err.to_string())

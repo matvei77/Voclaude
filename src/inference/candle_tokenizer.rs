@@ -14,6 +14,19 @@ pub const ENDOFTEXT_TOKEN_ID: u32 = 151643;
 /// EOS token IDs — generation stops when any of these is produced.
 pub const EOS_TOKEN_IDS: &[u32] = &[IM_END_TOKEN_ID, ENDOFTEXT_TOKEN_ID];
 
+/// Which chat template to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStyle {
+    /// The template shipped in the model's `chat_template.json`:
+    /// `<|im_start|>system\n{context}<|im_end|>\n<|im_start|>user\n<audio><|im_end|>\n<|im_start|>assistant\n`
+    /// The system slot is empty by default and is the model's context/biasing slot.
+    Official,
+    /// The template Voclaude used before 2026-09-04: a "You are a helpful
+    /// assistant." system turn plus a "Transcribe the audio to text."
+    /// instruction after the audio. Kept only for A/B benchmarking.
+    Legacy,
+}
+
 pub struct Qwen3ASRTokenizer {
     tokenizer: tokenizers::Tokenizer,
 }
@@ -32,28 +45,30 @@ impl Qwen3ASRTokenizer {
     /// Returns `(input_ids, audio_token_positions)` where `audio_token_positions`
     /// are the indices within `input_ids` that should be replaced with audio features.
     ///
-    /// I-13: This prompt template was verified against Qwen3-ASR's
-    /// `tokenizer_config.json` chat_template. The instruction text and newline
-    /// placement match the reference implementation. The `_language` parameter
-    /// is unused because Qwen3-ASR's default template does not include a
-    /// language specifier — it always uses "Transcribe the audio to text."
+    /// `context` is placed in the system slot (official template only). It is
+    /// used to carry the tail of the previous segment's transcript so that
+    /// language and vocabulary stay consistent across segment boundaries.
     pub fn encode_asr_prompt(
         &self,
         n_audio_tokens: usize,
-        _language: Option<&str>,
+        context: Option<&str>,
+        style: PromptStyle,
     ) -> CandleResult<(Vec<u32>, Vec<usize>)> {
-        // Build the prompt template (verified against tokenizer_config.json):
-        // <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
-        // <|im_start|>user\n
-        // <|audio_start|><|audio_pad|>...(N)...<|audio_pad|><|audio_end|>
-        // \nTranscribe the audio to text.<|im_end|>\n
-        // <|im_start|>assistant\n
-
         let mut ids: Vec<u32> = Vec::new();
 
         // System turn
         ids.push(IM_START_TOKEN_ID);
-        ids.extend(self.encode_text("system\nYou are a helpful assistant.")?);
+        match style {
+            PromptStyle::Official => {
+                ids.extend(self.encode_text("system\n")?);
+                if let Some(ctx) = context.map(str::trim).filter(|c| !c.is_empty()) {
+                    ids.extend(self.encode_text(ctx)?);
+                }
+            }
+            PromptStyle::Legacy => {
+                ids.extend(self.encode_text("system\nYou are a helpful assistant.")?);
+            }
+        }
         ids.push(IM_END_TOKEN_ID);
         ids.extend(self.encode_text("\n")?);
 
@@ -70,8 +85,9 @@ impl Qwen3ASRTokenizer {
         let audio_positions: Vec<usize> = (audio_start_pos..audio_start_pos + n_audio_tokens).collect();
         ids.push(AUDIO_END_TOKEN_ID);
 
-        // Text instruction
-        ids.extend(self.encode_text("\nTranscribe the audio to text.")?);
+        if style == PromptStyle::Legacy {
+            ids.extend(self.encode_text("\nTranscribe the audio to text.")?);
+        }
         ids.push(IM_END_TOKEN_ID);
         ids.extend(self.encode_text("\n")?);
 

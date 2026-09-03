@@ -1,18 +1,20 @@
 //! Main application orchestration.
 
-use crate::audio::{AudioCapture, TARGET_SAMPLE_RATE};
+use crate::audio::segmenter::segment_all;
+use crate::audio::{AudioCapture, SegmentBounds, SegmentReady, SegmenterConfig, TARGET_SAMPLE_RATE};
 use crate::config::Config;
 use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
 use crate::inference::{AsrEngine, InferenceProgress, InferenceStage, QwenEngine};
 use crate::tray::TrayManager;
 use crate::ui::{LogBuffer, UiManager, UiStatus};
-use crate::session::SessionStore;
+use crate::session::{RecordingSession, SessionStore};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crate::config::project_dirs;
+use std::collections::VecDeque;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -53,6 +55,16 @@ pub enum AppEvent {
     HistoryUpdated(HistoryEntry),
     /// E-8/S-7: Config reloaded successfully — apply runtime-updatable fields
     ConfigReloaded(Config),
+    /// A live segment closed on the audio writer thread
+    SegmentReady(SegmentReady),
+    /// One segment finished transcribing (or failed)
+    SegmentTranscribed {
+        session_id: String,
+        index: usize,
+        result: Result<String, String>,
+    },
+    /// Tray: re-run whatever the last recording is still missing
+    RecoverLastRecording,
 }
 
 /// Application state
@@ -68,9 +80,207 @@ const LONG_TRANSCRIPT_CHARS: usize = 20000;
 
 #[derive(Debug)]
 enum InferenceCommand {
+    /// Load the model now (sent when recording starts, so the load overlaps speech).
+    Preload,
+    /// Transcribe samples `[start, end)` of the file.
+    TranscribeSegment {
+        session_id: String,
+        index: usize,
+        path: PathBuf,
+        start: usize,
+        end: usize,
+        use_context: bool,
+    },
     TranscribeFile(PathBuf),
     Unload,
     Shutdown,
+}
+
+/// Maximum characters of the previous segment fed back as context.
+const SEGMENT_CONTEXT_CHARS: usize = 200;
+/// Attempts per segment before it is declared failed.
+const SEGMENT_MAX_ATTEMPTS: u8 = 2;
+
+/// App-side view of one live segment.
+#[derive(Debug, Clone)]
+struct LiveSegment {
+    bounds: SegmentBounds,
+    text: Option<String>,
+    failed: Option<String>,
+    attempts: u8,
+    in_flight: bool,
+}
+
+/// The recording currently being captured or finished.
+#[derive(Debug)]
+struct LiveSession {
+    id: String,
+    audio_path: PathBuf,
+    segments: Vec<LiveSegment>,
+    /// True once the recorder has stopped and every segment is known.
+    recording_done: bool,
+    started_at: Instant,
+}
+
+impl LiveSession {
+    fn new(id: String, audio_path: PathBuf) -> Self {
+        Self {
+            id,
+            audio_path,
+            segments: Vec::new(),
+            recording_done: false,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn from_session(session: &RecordingSession, audio_path: PathBuf) -> Self {
+        let mut live = Self::new(session.id.clone(), audio_path);
+        for rec in &session.segments {
+            while live.segments.len() < rec.index {
+                // Gap in the journal — should not happen, keep indices aligned.
+                live.segments.push(LiveSegment {
+                    bounds: SegmentBounds { start: 0, end: 0 },
+                    text: Some(String::new()),
+                    failed: None,
+                    attempts: 0,
+                    in_flight: false,
+                });
+            }
+            live.segments.push(LiveSegment {
+                bounds: SegmentBounds { start: rec.start_sample, end: rec.end_sample },
+                text: rec.text.clone(),
+                failed: None,
+                attempts: 0,
+                in_flight: false,
+            });
+        }
+        live
+    }
+
+    /// Add a segment if its index is new. Returns true when added.
+    fn add_segment(&mut self, index: usize, bounds: SegmentBounds) -> bool {
+        if index == self.segments.len() {
+            self.segments.push(LiveSegment { bounds, text: None, failed: None, attempts: 0, in_flight: false });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn done_count(&self) -> usize {
+        self.segments.iter().filter(|s| s.text.is_some()).count()
+    }
+
+    fn all_done(&self) -> bool {
+        self.segments.iter().all(|s| s.text.is_some())
+    }
+
+    /// Every segment has either text or a final failure.
+    fn all_settled(&self) -> bool {
+        self.segments.iter().all(|s| s.text.is_some() || s.failed.is_some())
+    }
+
+    fn any_failed(&self) -> bool {
+        self.segments.iter().any(|s| s.failed.is_some())
+    }
+
+    fn joined_text(&self) -> String {
+        let parts: Vec<&str> = self
+            .segments
+            .iter()
+            .filter_map(|s| s.text.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        parts.join(" ")
+    }
+
+    fn covered_end(&self) -> usize {
+        self.segments.iter().map(|s| s.bounds.end).max().unwrap_or(0)
+    }
+
+    fn pending_indices(&self) -> Vec<usize> {
+        self.segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.text.is_none() && s.failed.is_none() && !s.in_flight)
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+fn partial_transcript_path(session_id: &str) -> Option<PathBuf> {
+    transcripts_dir().map(|dir| dir.join(format!("{}.partial.txt", session_id)))
+}
+
+/// Read samples `[start, end)` from a raw little-endian f32 file.
+fn read_f32_range(path: &Path, start: usize, end: usize) -> Result<Vec<f32>, String> {
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len() as usize / 4;
+    let end = end.min(len);
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start((start * 4) as u64)).map_err(|e| e.to_string())?;
+    let mut bytes = vec![0u8; (end - start) * 4];
+    file.read_exact(&mut bytes).map_err(|e| format!("read segment: {}", e))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Last `max_chars` characters of `text`, cut at a word boundary.
+fn context_tail(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.trim().to_string();
+    }
+    let skip = total - max_chars;
+    let tail: String = text.chars().skip(skip).collect();
+    match tail.find(' ') {
+        Some(pos) => tail[pos + 1..].trim().to_string(),
+        None => tail.trim().to_string(),
+    }
+}
+
+fn segmenter_config_from(config: &Config) -> SegmenterConfig {
+    SegmenterConfig {
+        min_secs: config.segment_min_seconds,
+        max_secs: config.segment_max_seconds,
+        pause_secs: config.segment_pause_seconds,
+    }
+}
+
+/// Build a `LiveSession` for a journaled session whose audio is on disk,
+/// segmenting any audio the journal does not cover. Returns the session and
+/// the bounds of segments that were newly created (so the caller can journal them).
+fn recover_live_session(
+    session: &RecordingSession,
+    audio_path: &Path,
+    seg_cfg: SegmenterConfig,
+) -> Result<(LiveSession, Vec<(usize, SegmentBounds)>, usize), String> {
+    let total = fs::metadata(audio_path)
+        .map_err(|e| format!("audio file: {}", e))?
+        .len() as usize
+        / 4;
+    let mut live = LiveSession::from_session(session, audio_path.to_path_buf());
+    let covered = live.covered_end().min(total);
+    let mut new_bounds = Vec::new();
+    if total > covered {
+        let rest = read_f32_range(audio_path, covered, total)?;
+        for b in segment_all(&rest, seg_cfg) {
+            let bounds = SegmentBounds { start: b.start + covered, end: b.end + covered };
+            let index = live.segments.len();
+            live.add_segment(index, bounds);
+            new_bounds.push((index, bounds));
+        }
+    }
+    live.recording_done = true;
+    Ok((live, new_bounds, total))
 }
 
 struct NotificationManager {
@@ -169,9 +379,10 @@ impl App {
         )?;
         info!("Hotkeys registered: {} (record), {} (history)", self.config.hotkey, self.config.history_hotkey);
 
-        // Initialize audio capture
+        // Initialize audio capture (segments are announced through event_tx)
         let (level_tx, level_rx) = bounded::<f32>(64);
-        let audio = AudioCapture::new(Some(level_tx))?;
+        let (segment_tx, segment_rx) = unbounded::<SegmentReady>();
+        let audio = AudioCapture::new(Some(level_tx), Some(segment_tx), segmenter_config_from(&self.config))?;
         info!("Audio capture ready");
 
         // No preflight — model loads lazily on first transcription.
@@ -215,50 +426,29 @@ impl App {
         let mut transcribe_started_at: Option<Instant> = None;
         let mut last_transcript_path: Option<PathBuf> = None;
 
+        // Live (streaming) session bookkeeping
+        let mut live: Option<LiveSession> = None;
+        let mut dispatch_queue: VecDeque<usize> = VecDeque::new();
+        let mut pending_audio_path: Option<PathBuf> = None;
+        let mut last_recording_tick = Instant::now();
+        let mut recover_request_at_start = false;
+
         if let Some(session) = session_store.current().cloned() {
             if session.is_recoverable() {
-                if let Some(path) = session.audio_path() {
-                    if path.exists() {
+                match session.audio_path() {
+                    Some(path) if path.exists() => {
                         info!("Recovering previous session: {}", session.id);
-                        if let Some(audio) = session.audio.clone() {
-                            pending_audio_metadata = Some(audio);
-                        } else if let Ok(metadata) = std::fs::metadata(&path) {
-                            let sample_count = (metadata.len() / 4) as usize;
-                            pending_audio_metadata = Some(AudioMetadata::from_samples(
-                                sample_count,
-                                TARGET_SAMPLE_RATE,
-                            ));
-                        }
-
-                        if let Some(audio) = pending_audio_metadata.clone() {
-                            let _ = session_store.mark_transcribing(audio);
-                        }
-
-                        self.state = AppState::Transcribing;
-                        _tray.set_state(AppState::Transcribing);
-                        transcribe_started_at = Some(Instant::now());
-                        ui_status.state = "Recovering".to_string();
-                        ui_status.last_message = Some("Recovering recording...".to_string());
-                        self.ui.set_status(ui_status.clone());
-
-                        // E-2: Use try_send to avoid blocking main thread
-                        if let Err(err) = inference_tx.try_send(InferenceCommand::TranscribeFile(path)) {
-                            warn!("Failed to start recovery transcription: {}", err);
-                            let _ = session_store.mark_failed(
-                                "Failed to start recovery transcription".to_string(),
-                            );
-                            self.state = AppState::Idle;
-                            _tray.set_state(AppState::Idle);
-                            ui_status.state = "Idle".to_string();
-                            ui_status.last_message = Some("Recovery failed".to_string());
-                            self.ui.set_status(ui_status.clone());
-                        }
-                    } else {
+                        recover_request_at_start = true;
+                    }
+                    _ => {
                         warn!("Recovery audio file missing; marking session failed");
                         let _ = session_store.mark_failed("Recovery audio file missing".to_string());
                     }
                 }
             }
+        }
+        if recover_request_at_start {
+            let _ = self.event_tx.send(AppEvent::RecoverLastRecording);
         }
 
         info!("=== VOCLAUDE READY ===");
@@ -289,8 +479,6 @@ impl App {
         let mut deferred_respawn_at: Option<Instant> = None;
         // E-4: Keep sentinel receiver alive so send() doesn't immediately error
         let mut _sentinel_rx: Option<Receiver<InferenceCommand>> = None;
-        // E-7: Track audio file path for cleanup after transcription
-        let mut pending_audio_path: Option<PathBuf> = None;
 
         // Settings watcher cancellation flag
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -331,6 +519,17 @@ impl App {
                     inference_handle = new_handle;
                     info!("Inference worker respawned (attempt {})", watchdog_respawn_count);
                     notifications.notify("Inference engine restarted after error");
+                    // Anything that was in flight died with the old worker: re-queue it.
+                    if let Some(live) = live.as_mut() {
+                        for seg in live.segments.iter_mut() {
+                            if seg.in_flight {
+                                seg.in_flight = false;
+                                seg.attempts = seg.attempts.saturating_add(1);
+                            }
+                        }
+                        dispatch_queue.clear();
+                        dispatch_queue.extend(live.pending_indices());
+                    }
                 }
             }
 
@@ -361,7 +560,7 @@ impl App {
                     // Spawn a no-op placeholder so is_finished() doesn't fire again
                     inference_handle = thread::spawn(|| {});
                 }
-                if self.state == AppState::Transcribing {
+                if self.state == AppState::Transcribing && live.is_none() {
                     self.state = AppState::Idle;
                     pending_audio_metadata = None;
                     _tray.set_state(AppState::Idle);
@@ -394,6 +593,68 @@ impl App {
                 }
             }
 
+            // Live segments closed by the writer thread
+            while let Ok(seg) = segment_rx.try_recv() {
+                let _ = self.event_tx.send(AppEvent::SegmentReady(seg));
+            }
+
+            // Feed queued segments to the inference worker (bounded channel: keep
+            // what does not fit for the next iteration).
+            if let Some(live_ref) = live.as_mut() {
+                while let Some(&index) = dispatch_queue.front() {
+                    let Some(seg) = live_ref.segments.get(index) else {
+                        dispatch_queue.pop_front();
+                        continue;
+                    };
+                    if seg.text.is_some() || seg.failed.is_some() || seg.in_flight {
+                        dispatch_queue.pop_front();
+                        continue;
+                    }
+                    let cmd = InferenceCommand::TranscribeSegment {
+                        session_id: live_ref.id.clone(),
+                        index,
+                        path: live_ref.audio_path.clone(),
+                        start: seg.bounds.start,
+                        end: seg.bounds.end,
+                        use_context: self.config.segment_context,
+                    };
+                    match inference_tx.try_send(cmd) {
+                        Ok(()) => {
+                            dispatch_queue.pop_front();
+                            live_ref.segments[index].in_flight = true;
+                            live_ref.segments[index].attempts += 1;
+                        }
+                        Err(crossbeam_channel::TrySendError::Full(_)) => break,
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                            warn!("Inference worker channel closed; segment {} waits for respawn", index);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Recording status tick (elapsed time + segment progress)
+            if self.state == AppState::Recording && last_recording_tick.elapsed() >= Duration::from_secs(1) {
+                last_recording_tick = Instant::now();
+                if let Some(live_ref) = live.as_ref() {
+                    let secs = live_ref.started_at.elapsed().as_secs();
+                    let total = live_ref.segments.len();
+                    let msg = if total == 0 {
+                        format!("Recording {}:{:02}", secs / 60, secs % 60)
+                    } else {
+                        format!(
+                            "Recording {}:{:02} · {}/{} segments transcribed",
+                            secs / 60,
+                            secs % 60,
+                            live_ref.done_count(),
+                            total
+                        )
+                    };
+                    ui_status.last_message = Some(msg);
+                    self.ui.set_status(ui_status.clone());
+                }
+            }
+
             let mut latest_level: Option<f32> = None;
             while let Ok(level) = level_rx.try_recv() {
                 latest_level = Some(level.clamp(0.0, 1.0));
@@ -418,23 +679,37 @@ impl App {
                             match self.state {
                                 AppState::Idle => {
                                     info!("Starting recording...");
-                                    if let Err(e) = audio.start() {
-                                        error!("Failed to start recording: {}", e);
-                                        _tray.set_state(AppState::Idle);
-                                        notifications.notify("Failed to start recording");
-                                        ui_status.state = "Idle".to_string();
-                                        ui_status.last_message = Some(format!("Recording failed: {}", e));
-                                        self.ui.set_status(ui_status.clone());
-                                        continue;
-                                    }
+                                    let audio_path = match audio.start() {
+                                        Ok(path) => path,
+                                        Err(e) => {
+                                            error!("Failed to start recording: {}", e);
+                                            _tray.set_state(AppState::Idle);
+                                            notifications.notify("Failed to start recording");
+                                            ui_status.state = "Idle".to_string();
+                                            ui_status.last_message = Some(format!("Recording failed: {}", e));
+                                            self.ui.set_status(ui_status.clone());
+                                            continue;
+                                        }
+                                    };
                                     // Update displayed device name (may have changed since last recording)
                                     ui_status.input_device = Some(audio.device_name());
-                                    if let Err(err) = session_store.start() {
-                                        warn!("Failed to start session metadata: {}", err);
+                                    let session_id = match session_store.start(&audio_path) {
+                                        Ok(session) => session.id,
+                                        Err(err) => {
+                                            warn!("Failed to start session metadata: {}", err);
+                                            fallback_session_id()
+                                        }
+                                    };
+                                    live = Some(LiveSession::new(session_id, audio_path));
+                                    dispatch_queue.clear();
+                                    // Load the model while the user is still speaking.
+                                    if let Err(err) = inference_tx.try_send(InferenceCommand::Preload) {
+                                        debug!("Preload not queued: {}", err);
                                     }
                                     self.state = AppState::Recording;
                                     pending_audio_metadata = None;
                                     last_progress_stage = None;
+                                    last_recording_tick = Instant::now();
                                     _tray.set_state(AppState::Recording);
                                     ui_status.state = "Recording".to_string();
                                     ui_status.last_message = Some("Recording...".to_string());
@@ -447,6 +722,8 @@ impl App {
                                             if recording.is_empty() {
                                                 warn!("No audio recorded");
                                                 let _ = session_store.mark_aborted(Some("no_audio".to_string()));
+                                                live = None;
+                                                dispatch_queue.clear();
                                                 self.state = AppState::Idle;
                                                 _tray.set_state(AppState::Idle);
                                                 ui_status.state = "Idle".to_string();
@@ -474,27 +751,63 @@ impl App {
                                             // E-7: Track audio file path for cleanup
                                             pending_audio_path = Some(recording.path.clone());
 
-                                            // E-2: Use try_send to avoid blocking main thread
-                                            if let Err(err) = inference_tx.try_send(
-                                                InferenceCommand::TranscribeFile(recording.path),
-                                            ) {
-                                                error!("Failed to start transcription: {}", err);
-                                                let _ = session_store.mark_failed(
-                                                    "Failed to start transcription".to_string(),
+                                            let streaming_ok = self.config.streaming
+                                                && live.as_ref().map(|l| l.audio_path == recording.path).unwrap_or(false);
+                                            if streaming_ok {
+                                                let live_ref = live.as_mut().unwrap();
+                                                // Register every segment the writer produced (the tail is new;
+                                                // earlier ones may already be known from SegmentReady events).
+                                                for (index, bounds) in recording.segments.iter().enumerate() {
+                                                    if live_ref.add_segment(index, *bounds) {
+                                                        let _ = session_store.set_segment_bounds(index, bounds.start, bounds.end);
+                                                    }
+                                                }
+                                                live_ref.recording_done = true;
+                                                dispatch_queue.clear();
+                                                dispatch_queue.extend(live_ref.pending_indices());
+                                                info!(
+                                                    "Recording stopped: {} segments, {} already transcribed, {} to go",
+                                                    live_ref.segments.len(),
+                                                    live_ref.done_count(),
+                                                    dispatch_queue.len()
                                                 );
-                                                self.state = AppState::Idle;
-                                                pending_audio_metadata = None;
-                                                _tray.set_state(AppState::Idle);
-                                                ui_status.state = "Idle".to_string();
-                                                ui_status.last_message = Some("Transcription failed to start".to_string());
-                                                ui_status.input_level = Some(0.0);
+                                                ui_status.last_message = Some(format!(
+                                                    "Finishing ({}/{} segments)...",
+                                                    live_ref.done_count(),
+                                                    live_ref.segments.len()
+                                                ));
                                                 self.ui.set_status(ui_status.clone());
+                                                if live_ref.all_done() {
+                                                    let text = live_ref.joined_text();
+                                                    let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Ok(text)));
+                                                }
+                                            } else {
+                                                live = None;
+                                                dispatch_queue.clear();
+                                                // E-2: Use try_send to avoid blocking main thread
+                                                if let Err(err) = inference_tx.try_send(
+                                                    InferenceCommand::TranscribeFile(recording.path),
+                                                ) {
+                                                    error!("Failed to start transcription: {}", err);
+                                                    let _ = session_store.mark_failed(
+                                                        "Failed to start transcription".to_string(),
+                                                    );
+                                                    self.state = AppState::Idle;
+                                                    pending_audio_metadata = None;
+                                                    _tray.set_state(AppState::Idle);
+                                                    ui_status.state = "Idle".to_string();
+                                                    ui_status.last_message = Some("Transcription failed to start".to_string());
+                                                    ui_status.input_level = Some(0.0);
+                                                    self.ui.set_status(ui_status.clone());
+                                                }
                                             }
                                         }
                                         Err(e) => {
                                             error!("Failed to stop recording: {}", e);
                                             let _ = session_store
                                                 .mark_failed("Failed to stop recording".to_string());
+                                            live = None;
+                                            dispatch_queue.clear();
                                             self.state = AppState::Idle;
                                             _tray.set_state(AppState::Idle);
                                             ui_status.state = "Idle".to_string();
@@ -512,7 +825,10 @@ impl App {
                         }
                         AppEvent::InferenceProgress(progress) => {
                             // E-9: Only process progress when actively transcribing
-                            if self.state == AppState::Transcribing {
+                            // (or preloading during a recording).
+                            if self.state == AppState::Transcribing
+                                || (self.state == AppState::Recording && progress.stage == InferenceStage::LoadingModel)
+                            {
                                 _tray.set_progress(&progress.message);
                                 ui_status.last_message = Some(progress.message.clone());
                                 self.ui.set_status(ui_status.clone());
@@ -542,6 +858,9 @@ impl App {
                                 warn!("Ignoring stale TranscriptionComplete (state={:?})", self.state);
                                 continue;
                             }
+                            let stop_to_result_secs = transcribe_started_at
+                                .map(|t| t.elapsed().as_secs_f64())
+                                .unwrap_or(0.0);
                             last_activity = Instant::now();
                             idle_unload_requested = false;
                             // Reset respawn counter on successful transcription
@@ -682,6 +1001,17 @@ impl App {
                                 }
                             }
 
+                            if let Some(finished) = live.take() {
+                                if let Some(path) = partial_transcript_path(&finished.id) {
+                                    let _ = fs::remove_file(path);
+                                }
+                                info!(
+                                    "Stop-to-result latency: {:.2}s ({} segments)",
+                                    stop_to_result_secs,
+                                    finished.segments.len()
+                                );
+                            }
+                            dispatch_queue.clear();
                             self.state = AppState::Idle;
                             pending_audio_metadata = None;
                             last_progress_stage = None;
@@ -692,6 +1022,154 @@ impl App {
                             // Model stays resident for fast re-use.
                             // The idle_unload_seconds timer (default 30s) handles
                             // VRAM reclamation when the user stops using the app.
+                        }
+                        AppEvent::SegmentReady(seg) => {
+                            let Some(live_ref) = live.as_mut() else { continue };
+                            if live_ref.audio_path != seg.path || live_ref.recording_done {
+                                debug!("Ignoring segment for another recording: {:?}", seg.path);
+                                continue;
+                            }
+                            if live_ref.add_segment(seg.index, seg.bounds) {
+                                let _ = session_store.set_segment_bounds(seg.index, seg.bounds.start, seg.bounds.end);
+                                if self.config.streaming {
+                                    dispatch_queue.push_back(seg.index);
+                                }
+                                debug!(
+                                    "Segment {} closed: {:.1}s-{:.1}s",
+                                    seg.index,
+                                    seg.bounds.start as f64 / TARGET_SAMPLE_RATE as f64,
+                                    seg.bounds.end as f64 / TARGET_SAMPLE_RATE as f64
+                                );
+                            }
+                        }
+                        AppEvent::SegmentTranscribed { session_id, index, result } => {
+                            let Some(live_ref) = live.as_mut() else {
+                                debug!("Ignoring segment result for finished session {}", session_id);
+                                continue;
+                            };
+                            if live_ref.id != session_id || index >= live_ref.segments.len() {
+                                debug!("Ignoring stale segment result {}#{}", session_id, index);
+                                continue;
+                            }
+                            last_activity = Instant::now();
+                            live_ref.segments[index].in_flight = false;
+                            match result {
+                                Ok(text) => {
+                                    info!("Segment {} transcribed: {} chars", index, text.chars().count());
+                                    live_ref.segments[index].text = Some(text.clone());
+                                    let _ = session_store.set_segment_result(index, Ok(text));
+                                    if let Some(path) = partial_transcript_path(&live_ref.id) {
+                                        if let Err(err) = write_transcript_file(&path, &live_ref.joined_text()) {
+                                            warn!("Failed to write partial transcript: {}", err);
+                                        }
+                                    }
+                                    watchdog_respawn_count = 0;
+                                }
+                                Err(err) => {
+                                    warn!("Segment {} failed (attempt {}): {}", index, live_ref.segments[index].attempts, err);
+                                    if live_ref.segments[index].attempts < SEGMENT_MAX_ATTEMPTS {
+                                        dispatch_queue.push_back(index);
+                                    } else {
+                                        live_ref.segments[index].failed = Some(err.clone());
+                                        let _ = session_store.set_segment_result(index, Err(err));
+                                    }
+                                }
+                            }
+
+                            let done = live_ref.done_count();
+                            let total = live_ref.segments.len();
+                            if self.state == AppState::Transcribing {
+                                ui_status.last_message = Some(format!("Finishing ({}/{} segments)...", done, total));
+                                self.ui.set_status(ui_status.clone());
+                            }
+
+                            if live_ref.recording_done && live_ref.all_settled() {
+                                if live_ref.any_failed() {
+                                    let partial = live_ref.joined_text();
+                                    let failed: Vec<String> = live_ref
+                                        .segments
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, s)| s.failed.as_ref().map(|e| format!("#{}: {}", i + 1, e)))
+                                        .collect();
+                                    if !partial.is_empty() {
+                                        if let Err(e) = clipboard.set_text(&partial) {
+                                            error!("Failed to copy partial transcript: {}", e);
+                                        }
+                                    }
+                                    let msg = format!(
+                                        "{} of {} segments failed ({}). Partial text copied; use tray > Recover Last Recording",
+                                        failed.len(),
+                                        total,
+                                        failed.join("; ")
+                                    );
+                                    let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Err(msg)));
+                                } else {
+                                    let text = live_ref.joined_text();
+                                    let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Ok(text)));
+                                }
+                            }
+                        }
+                        AppEvent::RecoverLastRecording => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
+                            if self.state != AppState::Idle {
+                                notifications.notify("Busy — try again when idle");
+                                continue;
+                            }
+                            let Some(session) = session_store.current().cloned() else {
+                                notifications.notify("No previous recording to recover");
+                                continue;
+                            };
+                            if !session.can_retry() {
+                                notifications.notify("Last recording already completed");
+                                ui_status.last_message = Some("Last recording already completed".to_string());
+                                self.ui.set_status(ui_status.clone());
+                                continue;
+                            }
+                            let Some(path) = session.audio_path().filter(|p| p.exists()) else {
+                                notifications.notify("Audio for the last recording is gone");
+                                let _ = session_store.mark_failed("Recovery audio file missing".to_string());
+                                continue;
+                            };
+                            match recover_live_session(&session, &path, segmenter_config_from(&self.config)) {
+                                Ok((recovered, new_bounds, total_samples)) => {
+                                    info!(
+                                        "Recovering session {}: {} segments ({} done, {} new)",
+                                        recovered.id,
+                                        recovered.segments.len(),
+                                        recovered.done_count(),
+                                        new_bounds.len()
+                                    );
+                                    for (index, bounds) in new_bounds {
+                                        let _ = session_store.set_segment_bounds(index, bounds.start, bounds.end);
+                                    }
+                                    let metadata = AudioMetadata::from_samples(total_samples, TARGET_SAMPLE_RATE);
+                                    let _ = session_store.reopen_for_retry(metadata.clone());
+                                    pending_audio_metadata = Some(metadata);
+                                    pending_audio_path = Some(path);
+                                    transcribe_started_at = Some(Instant::now());
+                                    dispatch_queue.clear();
+                                    dispatch_queue.extend(recovered.pending_indices());
+                                    let all_done = recovered.all_done();
+                                    let text = recovered.joined_text();
+                                    live = Some(recovered);
+                                    self.state = AppState::Transcribing;
+                                    _tray.set_state(AppState::Transcribing);
+                                    ui_status.state = "Recovering".to_string();
+                                    ui_status.last_message = Some("Recovering last recording...".to_string());
+                                    self.ui.set_status(ui_status.clone());
+                                    if all_done {
+                                        let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Ok(text)));
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("Recovery failed: {}", err);
+                                    notifications.notify("Recovery failed");
+                                    ui_status.last_message = Some(format!("Recovery failed: {}", err));
+                                    self.ui.set_status(ui_status.clone());
+                                }
+                            }
                         }
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
@@ -847,6 +1325,12 @@ impl App {
                             self.config.history_max_entries = new_config.history_max_entries;
                             self.config.require_gpu = new_config.require_gpu;
                             self.config.audio_retention_count = new_config.audio_retention_count;
+                            self.config.streaming = new_config.streaming;
+                            self.config.segment_context = new_config.segment_context;
+                            self.config.segment_min_seconds = new_config.segment_min_seconds;
+                            self.config.segment_max_seconds = new_config.segment_max_seconds;
+                            self.config.segment_pause_seconds = new_config.segment_pause_seconds;
+                            audio.set_segmenter_config(segmenter_config_from(&self.config));
                             notifications.enabled = new_config.show_notifications;
                             let msg = if needs_restart.is_empty() {
                                 "Settings applied successfully".to_string()
@@ -905,8 +1389,53 @@ impl App {
             }
         };
 
+        // Context carried between consecutive segments of one session.
+        let mut ctx_session: Option<String> = None;
+        let mut ctx_text = String::new();
+
         for command in inference_rx.iter() {
             match command {
+                InferenceCommand::Preload => {
+                    let mut callback = |progress: InferenceProgress| {
+                        let _ = event_tx.send(AppEvent::InferenceProgress(progress));
+                    };
+                    match engine.prepare(Some(&mut callback)) {
+                        Ok(()) => {
+                            let _ = event_tx.send(AppEvent::InferenceEngineInfo {
+                                using_gpu: engine.active_gpu(),
+                                model: engine.model_label(),
+                                model_size_mb: engine.model_size_mb(),
+                            });
+                        }
+                        Err(err) => {
+                            // Not fatal here: the segment that needs the model will report it.
+                            warn!("Preload failed: {}", err);
+                        }
+                    }
+                }
+                InferenceCommand::TranscribeSegment { session_id, index, path, start, end, use_context } => {
+                    if ctx_session.as_deref() != Some(session_id.as_str()) {
+                        ctx_session = Some(session_id.clone());
+                        ctx_text.clear();
+                    }
+                    let context = if use_context && !ctx_text.is_empty() {
+                        Some(context_tail(&ctx_text, SEGMENT_CONTEXT_CHARS))
+                    } else {
+                        None
+                    };
+                    let result = read_f32_range(&path, start, end).and_then(|samples| {
+                        engine
+                            .transcribe_segment(&samples, context.as_deref())
+                            .map(|(text, _stats)| text)
+                            .map_err(|e| e.to_string())
+                    });
+                    if let Ok(text) = &result {
+                        if !text.trim().is_empty() {
+                            ctx_text = text.clone();
+                        }
+                    }
+                    let _ = event_tx.send(AppEvent::SegmentTranscribed { session_id, index, result });
+                }
                 InferenceCommand::TranscribeFile(path) => {
                     let mut callback = |progress: InferenceProgress| {
                         let _ = event_tx.send(AppEvent::InferenceProgress(progress));

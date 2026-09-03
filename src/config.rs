@@ -93,6 +93,31 @@ pub struct Config {
     /// Failed transcriptions always keep their audio file.
     #[serde(default = "default_audio_retention_count")]
     pub audio_retention_count: usize,
+
+    /// Use the pre-2026-09 chat template (A/B benchmarking only).
+    #[serde(default)]
+    pub legacy_prompt: bool,
+
+    /// Transcribe while recording (segments are sent to the model as they
+    /// close). When false, the whole file is transcribed after stop.
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+
+    /// Segments are at least this long before a pause may close them.
+    #[serde(default = "default_segment_min_seconds")]
+    pub segment_min_seconds: f32,
+
+    /// Segments are force-cut at the quietest recent point past this length.
+    #[serde(default = "default_segment_max_seconds")]
+    pub segment_max_seconds: f32,
+
+    /// A pause of this length closes a segment once it is long enough.
+    #[serde(default = "default_segment_pause_seconds")]
+    pub segment_pause_seconds: f32,
+
+    /// Feed the tail of the previous segment's text to the model as context.
+    #[serde(default = "default_true")]
+    pub segment_context: bool,
 }
 
 impl Default for Config {
@@ -117,6 +142,12 @@ impl Default for Config {
             max_chunk_seconds: default_max_chunk_seconds(),
             require_gpu: false,
             audio_retention_count: default_audio_retention_count(),
+            legacy_prompt: false,
+            streaming: true,
+            segment_min_seconds: default_segment_min_seconds(),
+            segment_max_seconds: default_segment_max_seconds(),
+            segment_pause_seconds: default_segment_pause_seconds(),
+            segment_context: true,
         }
     }
 }
@@ -150,7 +181,9 @@ impl Config {
                     "show_notifications", "history_max_entries", "use_gpu",
                     "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
-                    "require_gpu", "audio_retention_count",
+                    "require_gpu", "audio_retention_count", "legacy_prompt",
+                    "streaming", "segment_min_seconds", "segment_max_seconds",
+                    "segment_pause_seconds", "segment_context",
                     // Legacy aliases
                     "qwen_model", "qwen_model_path", "qwen_max_new_tokens", "qwen_require_gpu",
                 ];
@@ -211,6 +244,15 @@ impl Config {
         }
         if self.model.trim().is_empty() {
             return Err("model cannot be empty".into());
+        }
+        if !(3.0..=120.0).contains(&self.segment_min_seconds) {
+            return Err("segment_min_seconds must be between 3 and 120".into());
+        }
+        if self.segment_max_seconds <= self.segment_min_seconds || self.segment_max_seconds > 300.0 {
+            return Err("segment_max_seconds must be greater than segment_min_seconds and at most 300".into());
+        }
+        if !(0.2..=5.0).contains(&self.segment_pause_seconds) {
+            return Err("segment_pause_seconds must be between 0.2 and 5".into());
         }
         Ok(())
     }
@@ -438,6 +480,22 @@ fn default_show_notifications() -> bool {
 
 fn default_audio_retention_count() -> usize {
     10
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_segment_min_seconds() -> f32 {
+    20.0
+}
+
+fn default_segment_max_seconds() -> f32 {
+    45.0
+}
+
+fn default_segment_pause_seconds() -> f32 {
+    0.5
 }
 
 pub fn model_for_tier(tier: &str, use_gpu: bool) -> Option<&'static str> {

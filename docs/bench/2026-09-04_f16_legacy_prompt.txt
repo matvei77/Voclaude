@@ -1,0 +1,65 @@
+Loading Qwen/Qwen3-ASR-1.7B (gpu=true, prompt=Legacy)...
+[2m2026-09-03T22:08:50.311822Z[0m [32m INFO[0m Loading model from "C:\\Users\\matvei\\.cache\\huggingface\\hub\\models--Qwen--Qwen3-ASR-1.7B\\snapshots\\7278e1e70fe206f11671096ffdd38061171dd6e5" on Cuda(CudaDevice(DeviceId(1)))
+[2m2026-09-03T22:08:52.328799Z[0m [32m INFO[0m Model loaded in 2.02s
+Model loaded in 2.02s
+file                         audio_s  wall_ms    mel  encode prefill   decode   toks   tok/s    xRT    WER
+[2m2026-09-03T22:08:53.049126Z[0m [32m INFO[0m Transcription #2 complete: infer=0.37s
+audio-1772018863864.f32         32.6      368      6      98     186       77      3    38.8   88.6      -
+[2m2026-09-03T22:08:54.091713Z[0m [32m INFO[0m Transcription #3 complete: infer=1.04s
+audio-1772019995026.f32         10.0     1042      3      36      64      938     36    38.4    9.6      -
+[2m2026-09-03T22:08:58.192613Z[0m [32m INFO[0m Transcription #4 complete: infer=4.10s
+audio-1772020028560.f32         43.1     4101      7     124     297     3671    134    36.5   10.5      -
+[2m2026-09-03T22:08:58.219041Z[0m [32m INFO[0m Audio too long (656.5s), split into 3 chunks (limit=300s)
+[2m2026-09-03T22:08:58.219073Z[0m [32m INFO[0m Transcribing chunk 1/3 (297.9s, max_new_tokens=2048)
+[2m2026-09-03T22:09:18.012866Z[0m [32m INFO[0m Transcribing chunk 2/3 (299.8s, max_new_tokens=2048)
+[2m2026-09-03T22:09:38.907026Z[0m [32m INFO[0m Transcribing chunk 3/3 (58.8s, max_new_tokens=1070)
+[2m2026-09-03T22:09:41.400646Z[0m [32m INFO[0m Transcription #5 complete: infer=43.18s
+audio-1773150920220.f32        656.5    43209    112    1914   13854    27301    755    27.7   15.2      -
+[2m2026-09-03T22:09:41.573534Z[0m [32m INFO[0m Transcription #6 complete: infer=0.17s
+audio-1773340924322.f32          8.2      171      3      30      60       77      3    38.8   47.7      -
+[2m2026-09-03T22:09:41.757976Z[0m [32m INFO[0m Transcription #7 complete: infer=0.18s
+audio-1773340950299.f32         10.2      184      2      37      67       78      3    38.6   55.6      -
+[2m2026-09-03T22:09:41.902275Z[0m [32m INFO[0m Transcription #8 complete: infer=0.14s
+audio-1773340970849.f32          6.2      143      1      18      47       77      3    39.2   43.3      -
+[2m2026-09-03T22:09:43.458594Z[0m [32m INFO[0m Transcription #9 complete: infer=1.55s
+audio-1773399098147.f32        122.5     1556     18     330    1114       89      3    33.8   78.7      -
+[2m2026-09-03T22:09:43.963589Z[0m [32m INFO[0m Transcription #10 complete: infer=0.50s
+audio-1777367631015.f32         42.3      505      9     117     294       82      3    36.7   83.9      -
+[2m2026-09-03T22:09:47.191809Z[0m [32m INFO[0m Transcription #11 complete: infer=3.22s
+audio-1777454329098.f32        207.0     3228     31     547    2545       97      3    30.8   64.1      -
+[2m2026-09-03T22:09:47.349677Z[0m [32m INFO[0m Transcription #12 complete: infer=0.16s
+audio-1778946665094.f32          7.6      157      8      22      50       76      3    39.4   48.6      -
+[2m2026-09-03T22:09:47.683376Z[0m [32m INFO[0m Transcription #13 complete: infer=0.33s
+audio-1779143845306.f32         28.3      333      4      78     171       79      3    37.7   84.8      -
+[2m2026-09-03T22:09:50.449514Z[0m [32m INFO[0m Transcription #14 complete: infer=2.76s
+audio-1780055971333.f32        184.8     2766     28     502    2128      101      3    29.6   66.8      -
+[2m2026-09-03T22:09:51.939588Z[0m [32m INFO[0m Transcription #15 complete: infer=1.49s
+audio-1780058681606.f32        116.3     1490     24     325    1048       89      3    33.7   78.1      -
+[2m2026-09-03T22:09:52.141327Z[0m [32m INFO[0m Transcription #16 complete: infer=0.20s
+audio-1781098315240.f32         12.1      201      5      45      75       75      3    39.8   60.2      -
+[2m2026-09-03T22:09:53.111234Z[0m [32m INFO[0m Transcription #17 complete: infer=0.97s
+audio-1782127396375.f32         82.7      970     12     226     643       85      3    35.1   85.3      -
+[2m2026-09-03T22:09:53.626411Z[0m [32m INFO[0m Transcription #18 complete: infer=0.51s
+audio-1787737008426.f32         43.9      515      9     123     300       81      3    37.1   85.2      -
+[2m2026-09-03T22:09:53.831194Z[0m [32m INFO[0m Transcription #19 complete: infer=0.20s
+audio-1787769417631.f32         13.1      204      3      44      82       75      3    40.0   64.2      -
+[2m2026-09-03T22:10:01.025516Z[0m [32m INFO[0m Transcription #20 complete: infer=7.19s
+audio-1788381557645.f32         68.9     7194     10     187     491     6503    220    33.8    9.6      -
+[2m2026-09-03T22:10:10.611470Z[0m [32m INFO[0m Transcription #21 complete: infer=9.58s
+audio-1788420081247.f32        105.4     9586     17     308     913     8343    282    33.8   11.0      -
+[2m2026-09-03T22:10:34.083655Z[0m [32m INFO[0m Transcription #22 complete: infer=23.46s
+audio-1788421219149.f32        207.7    23472     31     561    2528    20344    604    29.7    8.9      -
+[2m2026-09-03T22:10:43.032315Z[0m [32m INFO[0m Transcription #23 complete: infer=8.94s
+audio-1788421621695.f32        143.9     8948     24     378    1399     7142    230    32.2   16.1      -
+[2m2026-09-03T22:10:44.563230Z[0m [32m INFO[0m Transcription #24 complete: infer=1.53s
+audio-1788422551284.f32         18.3     1530      3      54     108     1363     52    38.1   11.9      -
+[2m2026-09-03T22:10:47.312728Z[0m [32m INFO[0m Transcription #25 complete: infer=2.75s
+audio-1788422585905.f32         32.6     2749      6      97     185     2460     91    37.0   11.8      -
+[2m2026-09-03T22:10:54.701177Z[0m [32m INFO[0m Transcription #26 complete: infer=7.39s
+audio-1788471237661.f32         76.6     7388     11     212     593     6569    230    35.0   10.4      -
+[2m2026-09-03T22:11:25.912232Z[0m [32m INFO[0m Transcription #27 complete: infer=31.20s
+audio-1788471750664.f32        270.9    31211     40     727    4151    26283    715    27.2    8.7      -
+TOTAL audio 2551.7s, wall 153.2s (16.7x realtime), mean decode 33.6 tok/s
+Wrote ../../docs/bench/2026-09-04_f16_legacy_prompt.json
+[2m2026-09-03T22:11:25.913592Z[0m [32m INFO[0m Unloading model from memory (after 27 transcriptions)
+[2m2026-09-03T22:11:25.953480Z[0m [32m INFO[0m CUDA context released

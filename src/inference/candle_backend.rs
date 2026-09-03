@@ -10,8 +10,9 @@ use std::path::Path;
 
 use crate::inference::candle_audio;
 use crate::inference::candle_tokenizer::{
-    get_feat_extract_output_lengths, EOS_TOKEN_IDS, Qwen3ASRTokenizer,
+    get_feat_extract_output_lengths, PromptStyle, EOS_TOKEN_IDS, Qwen3ASRTokenizer,
 };
+use std::time::Instant;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Config structs (parsed from config.json in model directory)
@@ -892,6 +893,40 @@ pub struct Qwen3ASRModel {
     dtype: DType,
     /// I-6: Configurable max_new_tokens (was hardcoded to 2048)
     pub max_new_tokens: usize,
+    /// Which chat template to build (official by default).
+    pub prompt_style: PromptStyle,
+}
+
+/// Per-phase timing for one `transcribe_with_stats` call.
+#[derive(Debug, Clone, Default)]
+pub struct TranscribeStats {
+    pub audio_secs: f64,
+    pub mel_ms: f64,
+    pub encode_ms: f64,
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub total_ms: f64,
+    pub n_audio_tokens: usize,
+    pub n_prompt_tokens: usize,
+    pub n_generated: usize,
+}
+
+impl TranscribeStats {
+    pub fn decode_tokens_per_sec(&self) -> f64 {
+        if self.decode_ms <= 0.0 { 0.0 } else { self.n_generated as f64 * 1000.0 / self.decode_ms }
+    }
+    /// Accumulate another call's stats (used when a file is transcribed in chunks).
+    pub fn add(&mut self, other: &TranscribeStats) {
+        self.audio_secs += other.audio_secs;
+        self.mel_ms += other.mel_ms;
+        self.encode_ms += other.encode_ms;
+        self.prefill_ms += other.prefill_ms;
+        self.decode_ms += other.decode_ms;
+        self.total_ms += other.total_ms;
+        self.n_audio_tokens += other.n_audio_tokens;
+        self.n_prompt_tokens += other.n_prompt_tokens;
+        self.n_generated += other.n_generated;
+    }
 }
 
 impl Qwen3ASRModel {
@@ -924,24 +959,48 @@ impl Qwen3ASRModel {
             device: device.clone(),
             dtype,
             max_new_tokens: 2048, // default, overridden by QwenEngine
+            prompt_style: PromptStyle::Official,
         })
     }
 
-    /// Transcribe audio samples to text.
-    /// No duration limit — supports arbitrarily long recordings.
+    /// Transcribe audio samples to text (no context, default prompt style).
     pub fn transcribe(
         &mut self,
         samples: &[f32],
-        language: Option<&str>,
+        _language: Option<&str>,
         tokenizer: &Qwen3ASRTokenizer,
     ) -> Result<String> {
+        self.transcribe_with_stats(samples, None, tokenizer).map(|(text, _)| text)
+    }
+
+    /// Transcribe audio samples to text, returning per-phase timing.
+    ///
+    /// `context` (tail of the previous segment's transcript) is placed in the
+    /// model's system slot so language and vocabulary carry across segments.
+    /// No duration limit — supports arbitrarily long recordings.
+    pub fn transcribe_with_stats(
+        &mut self,
+        samples: &[f32],
+        context: Option<&str>,
+        tokenizer: &Qwen3ASRTokenizer,
+    ) -> Result<(String, TranscribeStats)> {
+        let t_start = Instant::now();
+        let mut stats = TranscribeStats {
+            audio_secs: samples.len() as f64 / candle_audio::SAMPLE_RATE as f64,
+            ..Default::default()
+        };
 
         // 1-2. Compute mel and run audio encoder in a scoped block so all
         // intermediate tensors (mel, conv outputs, attention matrices) are
         // dropped before the decode phase begins — frees ~200-400MB VRAM.
         let (audio_features, n_audio_tokens) = {
+            let t_mel = Instant::now();
             let mel = candle_audio::pcm_to_mel(samples, &self.device)?.to_dtype(self.dtype)?;
             let n_mel_frames = mel.dims()[2];
+            self.device.synchronize()?;
+            stats.mel_ms = t_mel.elapsed().as_secs_f64() * 1000.0;
+
+            let t_enc = Instant::now();
             let features = self.audio_encoder.forward(&mel)?;
             let n_tokens = get_feat_extract_output_lengths(n_mel_frames);
             let encoder_output_len = features.dims()[1];
@@ -961,14 +1020,18 @@ impl Qwen3ASRModel {
             };
             // BUG 11: use the actual post-trim length, not the pre-trim estimate.
             let actual_len = features.dims()[1];
+            self.device.synchronize()?;
+            stats.encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
             (features, actual_len)
         }; // mel and encoder intermediates dropped here
+        stats.n_audio_tokens = n_audio_tokens;
 
-        // Sync device to reclaim mel/encoder intermediate VRAM before decode phase.
-        self.device.synchronize()?;
+        let t_prefill = Instant::now();
 
         // 3. Build prompt
-        let (input_ids, audio_positions) = tokenizer.encode_asr_prompt(n_audio_tokens, language)?;
+        let (input_ids, audio_positions) =
+            tokenizer.encode_asr_prompt(n_audio_tokens, context, self.prompt_style)?;
+        stats.n_prompt_tokens = input_ids.len();
 
         // 4. Embed text tokens
         let input_ids_tensor = Tensor::from_vec(
@@ -1013,9 +1076,6 @@ impl Qwen3ASRModel {
         // holds &mut self.text_decoder (two disjoint borrows on different fields).
         let device = self.device.clone();
 
-        // Sync device before KV cache allocation to ensure splicing intermediates are freed.
-        device.synchronize()?;
-
         // The guard ensures clear_cache() is called on all exit paths (BUG 1).
         self.text_decoder.clear_cache();
 
@@ -1035,8 +1095,11 @@ impl Qwen3ASRModel {
         // surviving through a view reference until the first decode step.
         let mut last_logits = logits.i((0, logits.dims()[1] - 1))?.contiguous()?;
         drop(logits);
+        device.synchronize()?;
+        stats.prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
         // 8. Autoregressive generation
+        let t_decode = Instant::now();
         // I-6: Use configurable max_new_tokens instead of hardcoded value
         let max_new_tokens = self.max_new_tokens;
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -1070,13 +1133,16 @@ impl Qwen3ASRModel {
                 device.synchronize()?;
             }
         }
+        stats.decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
+        stats.n_generated = generated_tokens.len();
 
         // 9. Decode tokens to text
         let text = tokenizer.decode(&generated_tokens)?;
+        stats.total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
         // 10. Clean up the output (strip language tags etc.)
         // _cache_guard drops here, calling clear_cache() automatically (BUG 1).
-        Ok(clean_transcription(&text))
+        Ok((clean_transcription(&text), stats))
     }
 
     /// Build 3-dimensional position IDs for MRoPE.
@@ -1150,16 +1216,30 @@ fn find_safetensors(model_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
 
 fn clean_transcription(text: &str) -> String {
     let text = text.trim();
-    // Extract text after <asr_text> tag if present
-    let result = if let Some(pos) = text.find("<asr_text>") {
-        &text[pos + "<asr_text>".len()..]
+    // Qwen3-ASR emits "language {Name}<asr_text>{text}</asr_text>".
+    // Keep only what is inside <asr_text> when the tag is present.
+    let mut result = if let Some(pos) = text.find("<asr_text>") {
+        text[pos + "<asr_text>".len()..].to_string()
     } else {
-        text
+        text.to_string()
     };
-    // Remove closing tag and other artifacts
-    let mut result = result.to_string();
-    for tag in &["</asr_text>", "<|en|>", "<|zh|>", "<|ja|>", "<|ko|>", "<|yue|>", "<|nospeech|>"] {
-        result = result.replace(tag, "");
+    result = result.replace("</asr_text>", "");
+    // Strip any <|xx|> special tokens (language tags, <|nospeech|>, ...).
+    while let Some(start) = result.find("<|") {
+        match result[start..].find("|>") {
+            Some(rel_end) => {
+                result.replace_range(start..start + rel_end + 2, "");
+            }
+            None => break,
+        }
+    }
+    // Strip a leaked "language English" prefix when no <asr_text> tag was emitted.
+    let trimmed = result.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("language ") {
+        let after_word = rest.trim_start_matches(|c: char| c.is_alphabetic());
+        if after_word.len() < rest.len() {
+            result = after_word.to_string();
+        }
     }
     result.trim().to_string()
 }

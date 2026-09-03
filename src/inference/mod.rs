@@ -5,7 +5,7 @@ pub mod candle_backend;
 pub mod candle_tokenizer;
 mod qwen;
 
-pub use qwen::QwenEngine;
+pub use qwen::{load_audio_file, QwenEngine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceStage {

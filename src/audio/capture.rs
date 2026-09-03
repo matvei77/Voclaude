@@ -1,5 +1,6 @@
 //! Audio capture using cpal.
 
+use super::segmenter::{SegmentBounds, Segmenter, SegmenterConfig};
 use super::{mono_from_interleaved, LinearResampler, RingBuffer};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -27,10 +28,26 @@ const WRITER_CHUNK_SAMPLES: usize = 4096;
 /// Writer idle sleep to avoid busy spinning.
 const WRITER_IDLE_SLEEP_MS: u64 = 2;
 
+/// How often the audio file is flushed to the OS and synced to disk while
+/// recording, so a power cut loses at most this much audio.
+const DURABILITY_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A segment closed by the live segmenter. Its bytes are already flushed to
+/// `path`, so a reader may open the file and read `[start, end)` samples.
+#[derive(Debug, Clone)]
+pub struct SegmentReady {
+    pub path: PathBuf,
+    pub index: usize,
+    pub bounds: SegmentBounds,
+}
+
 pub struct AudioRecording {
     pub path: PathBuf,
     pub sample_rate: u32,
     pub sample_count: usize,
+    /// Every segment of the recording, including the final tail. Segments
+    /// before the tail were already announced through the segment channel.
+    pub segments: Vec<SegmentBounds>,
 }
 
 impl AudioRecording {
@@ -48,18 +65,25 @@ pub struct AudioCapture {
     writer_handle: Arc<Mutex<Option<JoinHandle<WriterThreadResult>>>>,
     dropped_samples: Arc<AtomicUsize>,
     level_tx: Option<Sender<f32>>,
+    segment_tx: Option<Sender<SegmentReady>>,
+    segmenter_config: Mutex<SegmenterConfig>,
 }
 
 struct WriterResult {
     path: PathBuf,
     sample_count: usize,
     dropped_input_samples: usize,
+    segments: Vec<SegmentBounds>,
 }
 
 type WriterThreadResult = Result<WriterResult, String>;
 
 impl AudioCapture {
-    pub fn new(level_tx: Option<Sender<f32>>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        level_tx: Option<Sender<f32>>,
+        segment_tx: Option<Sender<SegmentReady>>,
+        segmenter_config: SegmenterConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Probe the default device at startup for the initial UI display name.
         let device_name = Self::probe_default_device_name();
 
@@ -72,7 +96,15 @@ impl AudioCapture {
             writer_handle: Arc::new(Mutex::new(None)),
             dropped_samples: Arc::new(AtomicUsize::new(0)),
             level_tx,
+            segment_tx,
+            segmenter_config: Mutex::new(segmenter_config),
         })
+    }
+
+    pub fn set_segmenter_config(&self, cfg: SegmenterConfig) {
+        if let Ok(mut guard) = self.segmenter_config.lock() {
+            *guard = cfg;
+        }
     }
 
     fn probe_default_device_name() -> String {
@@ -123,10 +155,11 @@ impl AudioCapture {
     }
 
     /// Start recording. Acquires the current default input device fresh each time.
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Returns the path of the file being written.
+    pub fn start(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         // A-2: Check with SeqCst to avoid TOCTOU race with stop()
         if self.is_recording.load(Ordering::SeqCst) {
-            return Ok(());
+            return Err("Already recording".into());
         }
 
         // Acquire device fresh — immune to hot-plug/unplug between recordings.
@@ -170,6 +203,9 @@ impl AudioCapture {
         let stop = self.writer_stop.clone();
         let dropped = self.dropped_samples.clone();
         let level_tx = self.level_tx.clone();
+        let segment_tx = self.segment_tx.clone();
+        let segmenter_config = self.segmenter_config.lock().map(|g| *g).unwrap_or_default();
+        let result_path = output_path.clone();
 
         let writer_handle = thread::Builder::new()
             .name("audio-writer".to_string())
@@ -182,6 +218,8 @@ impl AudioCapture {
                     source_rate,
                     output_path,
                     level_tx,
+                    segment_tx,
+                    segmenter_config,
                 )
             })?;
 
@@ -264,7 +302,7 @@ impl AudioCapture {
         self.is_recording.store(true, Ordering::SeqCst);
 
         debug!("Recording started");
-        Ok(())
+        Ok(result_path)
     }
 
     /// Stop recording and return recording info
@@ -297,6 +335,7 @@ impl AudioCapture {
                 path: PathBuf::new(),
                 sample_rate: TARGET_SAMPLE_RATE,
                 sample_count: 0,
+                segments: Vec::new(),
             });
         };
 
@@ -319,6 +358,7 @@ impl AudioCapture {
             path: result.path,
             sample_rate: TARGET_SAMPLE_RATE,
             sample_count: result.sample_count,
+            segments: result.segments,
         })
     }
 
@@ -393,6 +433,7 @@ fn write_f32_le<W: Write>(
     writer.write_all(scratch)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn writer_thread(
     buffer: Arc<RingBuffer>,
     stop: Arc<AtomicBool>,
@@ -401,6 +442,8 @@ fn writer_thread(
     source_rate: u32,
     output_path: PathBuf,
     level_tx: Option<Sender<f32>>,
+    segment_tx: Option<Sender<SegmentReady>>,
+    segmenter_config: SegmenterConfig,
 ) -> WriterThreadResult {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -426,6 +469,9 @@ fn writer_thread(
     let mut sample_count = 0usize;
     let level_interval = Duration::from_millis(60);
     let mut last_level_sent = Instant::now() - level_interval;
+    let mut segmenter = Segmenter::new(segmenter_config);
+    let mut segments: Vec<SegmentBounds> = Vec::new();
+    let mut last_sync = Instant::now();
 
     loop {
         let read = buffer.pop_slice(&mut scratch);
@@ -455,6 +501,28 @@ fn writer_thread(
             write_f32_le(&mut writer, &resampled, &mut bytes).map_err(|e| e.to_string())?;
             sample_count += resampled.len();
 
+            // Live segmentation: announce closed segments once their bytes are
+            // flushed to the OS so the inference worker can read them.
+            let closed = segmenter.push(&resampled);
+            if !closed.is_empty() {
+                writer.flush().map_err(|e| e.to_string())?;
+                for bounds in closed {
+                    let index = segments.len();
+                    segments.push(bounds);
+                    if let Some(tx) = &segment_tx {
+                        let _ = tx.send(SegmentReady { path: output_path.clone(), index, bounds });
+                    }
+                }
+            }
+
+            // Durability: push bytes to disk periodically so a crash or power
+            // cut loses at most a few seconds.
+            if last_sync.elapsed() >= DURABILITY_SYNC_INTERVAL {
+                writer.flush().map_err(|e| e.to_string())?;
+                let _ = writer.get_ref().sync_data();
+                last_sync = Instant::now();
+            }
+
             if let Some(tx) = &level_tx {
                 if last_level_sent.elapsed() >= level_interval {
                     let mut peak = 0.0f32;
@@ -471,11 +539,16 @@ fn writer_thread(
         }
     }
 
+    if let Some(tail) = segmenter.finish() {
+        segments.push(tail);
+    }
     writer.flush().map_err(|e| e.to_string())?;
+    let _ = writer.get_ref().sync_data();
 
     Ok(WriterResult {
         path: output_path,
         sample_count,
         dropped_input_samples: dropped.load(Ordering::Relaxed),
+        segments,
     })
 }

@@ -28,3 +28,6 @@ nul
 # Claude Code local settings
 .claude/settings.local.json
 .claude/*.local.md
+
+# Local benchmark audio (not for the repo)
+bench_data/

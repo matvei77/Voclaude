@@ -54,3 +54,26 @@ max_chunk_seconds = 300
 
 # Require GPU (fail if CUDA unavailable)
 require_gpu = false
+
+# ---------------------------------------------------------------------------
+# Live transcription (added 2026-09-04)
+# ---------------------------------------------------------------------------
+
+# Transcribe while you are still speaking. The recording is cut into segments
+# at pauses; each segment is transcribed in the background, so after you stop
+# only the last few seconds remain. Set to false to transcribe the whole file
+# after stop (old behaviour).
+streaming = true
+
+# A segment is at least this long before a pause may close it (seconds).
+segment_min_seconds = 20
+
+# A segment is force-cut at its quietest recent point past this length (seconds).
+segment_max_seconds = 45
+
+# A pause of this length closes a segment once it is long enough (seconds).
+segment_pause_seconds = 0.5
+
+# Feed the tail of the previous segment's text to the model as context so
+# language and vocabulary carry across segment boundaries.
+segment_context = true

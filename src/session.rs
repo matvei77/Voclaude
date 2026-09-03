@@ -21,6 +21,19 @@ pub enum SessionState {
     Aborted,
 }
 
+/// One segment of a recording and, once transcribed, its text.
+/// Persisted after every change so a crash loses at most the open segment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentRecord {
+    pub index: usize,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingSession {
     pub id: String,
@@ -32,6 +45,8 @@ pub struct RecordingSession {
     pub transcript: Option<String>,
     pub error: Option<String>,
     pub history_entry_id: Option<String>,
+    #[serde(default)]
+    pub segments: Vec<SegmentRecord>,
 }
 
 impl RecordingSession {
@@ -39,8 +54,30 @@ impl RecordingSession {
         matches!(self.state, SessionState::Recording | SessionState::Transcribing)
     }
 
+    /// A Failed session with audio on disk can be re-run from the tray.
+    pub fn can_retry(&self) -> bool {
+        matches!(
+            self.state,
+            SessionState::Recording | SessionState::Transcribing | SessionState::Failed
+        )
+    }
+
     pub fn audio_path(&self) -> Option<PathBuf> {
         self.audio_path.as_ref().map(PathBuf::from)
+    }
+
+    /// Text of every transcribed segment, in order, joined with spaces.
+    pub fn joined_text(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for seg in &self.segments {
+            if let Some(t) = seg.text.as_deref() {
+                let t = t.trim();
+                if !t.is_empty() {
+                    parts.push(t);
+                }
+            }
+        }
+        parts.join(" ")
     }
 }
 
@@ -79,21 +116,90 @@ impl SessionStore {
         self.current.as_ref()
     }
 
-    pub fn start(&mut self) -> Result<RecordingSession, Box<dyn std::error::Error>> {
+    pub fn start(&mut self, audio_path: &Path) -> Result<RecordingSession, Box<dyn std::error::Error>> {
         let session = RecordingSession {
             id: new_session_id(),
             started_at_ms: now_ms(),
             ended_at_ms: None,
             state: SessionState::Recording,
-            audio_path: Some(Self::audio_path()?.to_string_lossy().to_string()),
+            audio_path: Some(audio_path.to_string_lossy().to_string()),
             audio: None,
             transcript: None,
             error: None,
             history_entry_id: None,
+            segments: Vec::new(),
         };
         self.current = Some(session.clone());
         self.persist()?;
         Ok(session)
+    }
+
+    /// Record (or update) the bounds of segment `index`.
+    pub fn set_segment_bounds(
+        &mut self,
+        index: usize,
+        start_sample: usize,
+        end_sample: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(session) = self.current.as_mut() {
+            match session.segments.iter_mut().find(|s| s.index == index) {
+                Some(seg) => {
+                    seg.start_sample = start_sample;
+                    seg.end_sample = end_sample;
+                }
+                None => {
+                    session.segments.push(SegmentRecord {
+                        index,
+                        start_sample,
+                        end_sample,
+                        text: None,
+                        error: None,
+                    });
+                    session.segments.sort_by_key(|s| s.index);
+                }
+            }
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Store the transcript of segment `index` (or its error).
+    pub fn set_segment_result(
+        &mut self,
+        index: usize,
+        result: Result<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(session) = self.current.as_mut() {
+            if let Some(seg) = session.segments.iter_mut().find(|s| s.index == index) {
+                match result {
+                    Ok(text) => {
+                        seg.text = Some(text);
+                        seg.error = None;
+                    }
+                    Err(err) => {
+                        seg.error = Some(err);
+                    }
+                }
+                self.persist()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-open a Failed/interrupted session for another attempt.
+    pub fn reopen_for_retry(&mut self, audio: AudioMetadata) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(session) = self.current.as_mut() {
+            if session.can_retry() {
+                session.state = SessionState::Transcribing;
+                session.audio = Some(audio);
+                session.error = None;
+                for seg in session.segments.iter_mut() {
+                    seg.error = None;
+                }
+                self.persist()?;
+            }
+        }
+        Ok(())
     }
 
     // P-7/E-10: All state transitions now guard on valid source states
@@ -166,12 +272,6 @@ impl SessionStore {
         project_dirs()
             .map(|dirs| dirs.data_dir().join("session.json"))
             .ok_or_else(|| "Could not determine session path".into())
-    }
-
-    fn audio_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-        project_dirs()
-            .map(|dirs| dirs.data_dir().join("audio.f32"))
-            .ok_or_else(|| "Could not determine audio path".into())
     }
 
     fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {

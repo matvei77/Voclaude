@@ -1,0 +1,7 @@
+Loading Qwen/Qwen3-ASR-1.7B (gpu=true, prompt=Official)...
+[2m2026-09-03T22:28:06.399392Z[0m [32m INFO[0m Loading model from "C:\\Users\\matvei\\.cache\\huggingface\\hub\\models--Qwen--Qwen3-ASR-1.7B\\snapshots\\7278e1e70fe206f11671096ffdd38061171dd6e5" on Cuda(CudaDevice(DeviceId(1)))
+[2m2026-09-03T22:28:08.856325Z[0m [32m INFO[0m Model loaded in 2.46s
+Model loaded in 2.46s
+file                         audio_s  wall_ms segs  stop_s  maxlag   toks   tok/s    xRT    WER
+audio-1772019995026.f32         10.0     4057    1    4.06    4.06     36     9.5    2.5      -
+audio-1772020028560.f32         43.1    15205    3    5.82    7.57    143     9.9    2.8      -
