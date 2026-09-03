@@ -118,6 +118,10 @@ impl QwenEngine {
         self.prompt_style
     }
 
+    pub fn is_loaded(&self) -> bool {
+        self.model.is_some()
+    }
+
     pub fn set_prompt_style(&mut self, style: PromptStyle) {
         self.prompt_style = style;
         if let Some(model) = self.model.as_mut() {

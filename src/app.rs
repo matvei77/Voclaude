@@ -5,16 +5,17 @@ use crate::audio::{AudioCapture, SegmentBounds, SegmentReady, SegmenterConfig, T
 use crate::config::Config;
 use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
-use crate::inference::{AsrEngine, InferenceProgress, InferenceStage, QwenEngine};
+use crate::inference::{InferenceProgress, InferenceStage};
 use crate::tray::TrayManager;
 use crate::ui::{LogBuffer, UiManager, UiStatus};
 use crate::session::{RecordingSession, SessionStore};
+use crate::worker::{read_f32_range, InferenceCommand};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use crate::config::project_dirs;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -78,26 +79,6 @@ pub enum AppState {
 const LONG_RECORDING_MS: u64 = 10 * 60 * 1000;
 const LONG_TRANSCRIPT_CHARS: usize = 20000;
 
-#[derive(Debug)]
-enum InferenceCommand {
-    /// Load the model now (sent when recording starts, so the load overlaps speech).
-    Preload,
-    /// Transcribe samples `[start, end)` of the file.
-    TranscribeSegment {
-        session_id: String,
-        index: usize,
-        path: PathBuf,
-        start: usize,
-        end: usize,
-        use_context: bool,
-    },
-    TranscribeFile(PathBuf),
-    Unload,
-    Shutdown,
-}
-
-/// Maximum characters of the previous segment fed back as context.
-const SEGMENT_CONTEXT_CHARS: usize = 200;
 /// Attempts per segment before it is declared failed.
 const SEGMENT_MAX_ATTEMPTS: u8 = 2;
 
@@ -211,40 +192,6 @@ impl LiveSession {
 
 fn partial_transcript_path(session_id: &str) -> Option<PathBuf> {
     transcripts_dir().map(|dir| dir.join(format!("{}.partial.txt", session_id)))
-}
-
-/// Read samples `[start, end)` from a raw little-endian f32 file.
-fn read_f32_range(path: &Path, start: usize, end: usize) -> Result<Vec<f32>, String> {
-    if end <= start {
-        return Ok(Vec::new());
-    }
-    let mut file = fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
-    let len = file.metadata().map_err(|e| e.to_string())?.len() as usize / 4;
-    let end = end.min(len);
-    if end <= start {
-        return Ok(Vec::new());
-    }
-    file.seek(SeekFrom::Start((start * 4) as u64)).map_err(|e| e.to_string())?;
-    let mut bytes = vec![0u8; (end - start) * 4];
-    file.read_exact(&mut bytes).map_err(|e| format!("read segment: {}", e))?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
-
-/// Last `max_chars` characters of `text`, cut at a word boundary.
-fn context_tail(text: &str, max_chars: usize) -> String {
-    let total = text.chars().count();
-    if total <= max_chars {
-        return text.trim().to_string();
-    }
-    let skip = total - max_chars;
-    let tail: String = text.chars().skip(skip).collect();
-    match tail.find(' ') {
-        Some(pos) => tail[pos + 1..].trim().to_string(),
-        None => tail.trim().to_string(),
-    }
 }
 
 fn segmenter_config_from(config: &Config) -> SegmenterConfig {
@@ -1368,102 +1315,7 @@ impl App {
         event_tx: Sender<AppEvent>,
         config: Config,
     ) -> (Sender<InferenceCommand>, thread::JoinHandle<()>) {
-        let (inference_tx, inference_rx) = bounded::<InferenceCommand>(8);
-        let handle = thread::spawn(move || Self::inference_worker(inference_rx, event_tx, config));
-        (inference_tx, handle)
-    }
-
-    fn inference_worker(
-        inference_rx: Receiver<InferenceCommand>,
-        event_tx: Sender<AppEvent>,
-        config: Config,
-    ) {
-        let mut engine = match QwenEngine::new_with_config(&config) {
-            Ok(engine) => engine,
-            Err(err) => {
-                let _ = event_tx.send(AppEvent::TranscriptionComplete(Err(format!(
-                    "Failed to initialize inference: {}",
-                    err
-                ))));
-                return;
-            }
-        };
-
-        // Context carried between consecutive segments of one session.
-        let mut ctx_session: Option<String> = None;
-        let mut ctx_text = String::new();
-
-        for command in inference_rx.iter() {
-            match command {
-                InferenceCommand::Preload => {
-                    let mut callback = |progress: InferenceProgress| {
-                        let _ = event_tx.send(AppEvent::InferenceProgress(progress));
-                    };
-                    match engine.prepare(Some(&mut callback)) {
-                        Ok(()) => {
-                            let _ = event_tx.send(AppEvent::InferenceEngineInfo {
-                                using_gpu: engine.active_gpu(),
-                                model: engine.model_label(),
-                                model_size_mb: engine.model_size_mb(),
-                            });
-                        }
-                        Err(err) => {
-                            // Not fatal here: the segment that needs the model will report it.
-                            warn!("Preload failed: {}", err);
-                        }
-                    }
-                }
-                InferenceCommand::TranscribeSegment { session_id, index, path, start, end, use_context } => {
-                    if ctx_session.as_deref() != Some(session_id.as_str()) {
-                        ctx_session = Some(session_id.clone());
-                        ctx_text.clear();
-                    }
-                    let context = if use_context && !ctx_text.is_empty() {
-                        Some(context_tail(&ctx_text, SEGMENT_CONTEXT_CHARS))
-                    } else {
-                        None
-                    };
-                    let result = read_f32_range(&path, start, end).and_then(|samples| {
-                        engine
-                            .transcribe_segment(&samples, context.as_deref())
-                            .map(|(text, _stats)| text)
-                            .map_err(|e| e.to_string())
-                    });
-                    if let Ok(text) = &result {
-                        if !text.trim().is_empty() {
-                            ctx_text = text.clone();
-                        }
-                    }
-                    let _ = event_tx.send(AppEvent::SegmentTranscribed { session_id, index, result });
-                }
-                InferenceCommand::TranscribeFile(path) => {
-                    let mut callback = |progress: InferenceProgress| {
-                        let _ = event_tx.send(AppEvent::InferenceProgress(progress));
-                    };
-                    if let Err(err) = engine.prepare(Some(&mut callback)) {
-                        let _ = event_tx.send(AppEvent::TranscriptionComplete(Err(
-                            format!("Failed to load model: {}", err),
-                        )));
-                        continue;
-                    }
-                    let _ = event_tx.send(AppEvent::InferenceEngineInfo {
-                        using_gpu: engine.active_gpu(),
-                        model: engine.model_label(),
-                        model_size_mb: engine.model_size_mb(),
-                    });
-                    let result =
-                        engine.transcribe_file_with_progress(&path, Some(&mut callback));
-                    let result = result.map_err(|err| err.to_string());
-                    let _ = event_tx.send(AppEvent::TranscriptionComplete(result));
-                }
-                InferenceCommand::Unload => {
-                    engine.unload();
-                }
-                InferenceCommand::Shutdown => {
-                    break;
-                }
-            }
-        }
+        crate::worker::spawn_proxy(event_tx, config)
     }
 
     /// Pump Windows messages - MUST be called from main thread

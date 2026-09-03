@@ -13,6 +13,7 @@ mod inference;
 mod session;
 mod tray;
 mod ui;
+mod worker;
 
 use app::App;
 use config::Config;
@@ -55,6 +56,22 @@ fn main() {
     // --version: print version and exit
     if args.iter().any(|a| a == "--version") {
         println!("voclaude {} ({})", env!("CARGO_PKG_VERSION"), option_env!("VOCLAUDE_GIT_HASH").unwrap_or("unknown"));
+        return;
+    }
+
+    // Inference child process (spawned by the app itself).
+    if args.len() > 1 && args[1] == "--worker" {
+        tracing_subscriber::fmt()
+            .with_max_level(Level::INFO)
+            .with_target(false)
+            .with_ansi(false)
+            .compact()
+            .with_writer(std::io::stderr)
+            .init();
+        if let Err(e) = worker::run_child() {
+            error!("worker failed: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
