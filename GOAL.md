@@ -109,3 +109,21 @@ which is a separate project. 60 MB is the realistic floor with the current UI st
 quantization second because it makes segments finish with margin and halves VRAM; durability
 before idle tuning because it is a core promise; model bake-off last because it needs the
 bench and the streaming pipeline to be meaningful.
+
+## Results (2026-09-04, end of the 10 h session)
+
+| Metric | Target | Measured |
+|---|---|---|
+| Stop → clipboard, any length | ≤ 3 s | 0.3–2.4 s live; simulation over the 29-min set: mean 1.2 s, max 2.7 s |
+| Short clip, model already loaded | ≤ 1.5 s | 0.3–0.6 s |
+| Short clip, model cold | ≤ 4 s | worker start 0.15 s + Q8 load 4.4 s, overlapped with the recording; a 2 s clip waits ~3 s |
+| Decode speed | ≥ 45 tok/s | 99 tok/s (Q8_0, fused kernels) |
+| VRAM while loaded | ≤ 3.5 GB | ~3.6 GB |
+| VRAM idle | 0 within 60 s | 0 (worker process exits at 60 s) |
+| RAM idle | ≤ 60 MB | 20 MB working set / 8 MB private |
+| Power cut / kill mid-dictation | resume from last segment | verified: hard kill at 48 s, relaunch reused 2 segments, finished 2.4 s after launch |
+| Transcription failure | zero loss, retry | verified: inference child killed mid-recording, restarted on next segment, all text delivered |
+| Multilingual quality | measured, model chosen from data | Qwen3-ASR-1.7B kept; Whisper large-v3-turbo dropped the Russian passage entirely; Q4_K lost text; see docs/bench/README.md |
+
+Not done: single-digit-MB idle RAM (out of scope by design; 8 MB private / 20 MB working set achieved),
+GGUF caching of the quantized weights (would cut the cold load from 4.4 s to ~2 s).

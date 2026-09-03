@@ -8,8 +8,11 @@ Press a hotkey, speak, and your words are instantly transcribed and copied to yo
 
 - **Single binary** — pure Rust, no Python or external runtimes
 - **Local-first** — all transcription happens on-device, nothing leaves your machine
-- **GPU accelerated** — CUDA support for fast inference (~2s for 10s of audio)
-- **Lazy loading** — model downloads on first use, auto-unloads after idle to save VRAM
+- **GPU accelerated** — CUDA inference at ~30x realtime on an RTX 3060 (Q8 weights, fused kernels)
+- **Transcribes while you speak** — the recording is cut into segments at pauses and transcribed in the background; after you stop, only the last few seconds remain, so the text is on the clipboard within about a second
+- **Never loses a word** — audio is streamed to disk and synced every 5 s; every finished segment's text is journaled; a crash or power cut resumes from the last finished segment on relaunch, and the tray has "Recover Last Recording"
+- **Tiny when idle** — inference runs in a child process that exits after 60 s idle: 0 VRAM and ~20 MB of RAM for the tray
+- **Lazy loading** — model downloads on first use; loads while you are still speaking
 - **System tray** — lives in your tray, stays out of your way
 - **HUD overlay** — recording/transcribing status appears as a small overlay
 - **History window** — browse, search, and copy past transcriptions (Ctrl+Shift+H)
@@ -91,7 +94,7 @@ sudo apt install libasound2-dev libgtk-3-dev libayatana-appindicator3-dev \
 1. **Launch** — Voclaude appears in your system tray
 2. **Press F4** to start recording — a HUD overlay appears top-right
 3. **Speak** — your voice is captured locally
-4. **Press F4 again** to stop — the HUD shows "Transcribing...", then "Copied to clipboard"
+4. **Press F4 again** to stop — segments were already transcribed while you spoke; the last one finishes and the HUD shows "Copied to clipboard"
 5. **Paste** (Ctrl+V) — transcribed text is in your clipboard
 
 ### Keyboard Shortcuts
@@ -103,7 +106,7 @@ sudo apt install libasound2-dev libgtk-3-dev libayatana-appindicator3-dev \
 
 ### Tray Menu
 
-Right-click the tray icon for: Show History, Open Transcripts, Settings, Quit.
+Right-click the tray icon for: Show History, Open Last Transcript, Open Transcripts Folder, Recover Last Recording, Settings, Quit.
 
 ## Configuration
 
@@ -116,9 +119,14 @@ hotkey = "F4"
 history_hotkey = "Ctrl+Shift+H"
 add_trailing_space = true
 capitalize_first = true
-idle_unload_seconds = 30
+idle_unload_seconds = 60
 use_gpu = true
 model = "Qwen/Qwen3-ASR-1.7B"
+quantization = "q8_0"        # "none" for F16 weights
+streaming = true             # transcribe segments while recording
+segment_min_seconds = 20
+segment_max_seconds = 45
+segment_pause_seconds = 0.5
 ```
 
 See [`config.example.toml`](config.example.toml) for all options.

@@ -60,6 +60,11 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
     let mut out: Option<PathBuf> = None;
     let stream = args.iter().any(|a| a == "--stream");
     let no_context = args.iter().any(|a| a == "--no-context");
+    let engine_kind = args
+        .iter()
+        .position(|a| a == "--engine")
+        .and_then(|i| args.get(i + 1).cloned())
+        .unwrap_or_else(|| "qwen".to_string());
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -75,7 +80,7 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         }
         if a.starts_with("--") {
             // Engine overrides (--cpu, --model-tier, ...) were consumed by apply_cli_overrides.
-            if matches!(a.as_str(), "--model-tier" | "--model" | "--model-dir" | "--max-new-tokens" | "--chunk-seconds" | "--quant") {
+            if matches!(a.as_str(), "--model-tier" | "--model" | "--model-dir" | "--max-new-tokens" | "--chunk-seconds" | "--quant" | "--engine") {
                 i += 2;
             } else {
                 i += 1;
@@ -101,6 +106,9 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         return Err("No audio files given. Usage: voclaude --bench <file|dir>... [--tag NAME] [--out results.json]".into());
     }
 
+    if engine_kind == "whisper" {
+        return run_whisper(config, &inputs, &tag, out.as_deref());
+    }
     let mut engine = QwenEngine::new_with_config(config)?;
     eprintln!("Loading {} (gpu={}, prompt={:?}, quant={})...", config.model, config.use_gpu, engine.prompt_style(), config.quantization);
     let t_load = Instant::now();
@@ -331,6 +339,130 @@ fn tail(text: &str, max_chars: usize) -> String {
         Some(pos) => t[pos + 1..].trim().to_string(),
         None => t.trim().to_string(),
     }
+}
+
+/// Whisper comparison run (bench only). `--model-dir` must point at a directory
+/// with config.json, tokenizer.json and model.safetensors.
+fn run_whisper(config: &Config, inputs: &[PathBuf], tag: &str, out: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::inference::whisper_engine::WhisperEngine;
+    use candle_core::{DType, Device};
+    let dir = config
+        .model_path
+        .as_deref()
+        .ok_or("--engine whisper needs --model-dir <dir with model.safetensors>")?;
+    let device = if config.use_gpu { Device::new_cuda(0)? } else { Device::Cpu };
+    // candle's whisper keeps an F32 mask internally, so run everything in F32.
+    let dtype = DType::F32;
+    let t_load = Instant::now();
+    let mut engine = WhisperEngine::load(Path::new(dir), &device, dtype)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("Whisper loaded in {:.2}s", load_ms / 1000.0);
+    // Warm-up
+    if let Some(first) = inputs.first() {
+        let samples = crate::inference::load_audio_file(first)?;
+        let warm: Vec<f32> = samples.iter().take(16000 * 3).copied().collect();
+        if !warm.is_empty() {
+            let _ = engine.transcribe_window(&warm);
+        }
+        engine.reset_stats();
+    }
+    println!(
+        "{:<28} {:>7} {:>8} {:>7} {:>8} {:>6} {:>7} {:>6} {:>6}  langs",
+        "file", "audio_s", "wall_ms", "encode", "decode", "toks", "tok/s", "xRT", "WER"
+    );
+    let mut results = Vec::new();
+    for path in inputs {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let samples = crate::inference::load_audio_file(path)?;
+        let audio_secs = samples.len() as f64 / 16000.0;
+        engine.reset_stats();
+        let t = Instant::now();
+        let result = engine.transcribe(&samples);
+        let wall_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let (text, langs, error) = match result {
+            Ok((text, langs)) => (text, langs, None),
+            Err(e) => (String::new(), Vec::new(), Some(e.to_string())),
+        };
+        let hyp_path = path.with_extension(format!("{}.hyp.txt", tag));
+        if error.is_none() {
+            let _ = std::fs::write(&hyp_path, &text);
+        }
+        let ref_path = path.with_extension("ref.txt");
+        let wer = if ref_path.exists() {
+            std::fs::read_to_string(&ref_path).ok().map(|r| word_error_rate(&r, &text))
+        } else {
+            None
+        };
+        let tok_s = if engine.decode_ms > 0.0 { engine.n_generated as f64 * 1000.0 / engine.decode_ms } else { 0.0 };
+        let fr = FileResult {
+            file: name.clone(),
+            audio_secs,
+            wall_ms,
+            mel_ms: 0.0,
+            encode_ms: engine.encode_ms,
+            prefill_ms: 0.0,
+            decode_ms: engine.decode_ms,
+            n_audio_tokens: 0,
+            n_generated: engine.n_generated,
+            decode_tok_per_s: tok_s,
+            realtime_factor: if wall_ms > 0.0 { audio_secs * 1000.0 / wall_ms } else { 0.0 },
+            chars: text.chars().count(),
+            wer,
+            error,
+            segments: Some(langs.len()),
+            stop_latency_s: None,
+            max_lag_s: None,
+        };
+        println!(
+            "{:<28} {:>7.1} {:>8.0} {:>7.0} {:>8.0} {:>6} {:>7.1} {:>6.1} {:>6}  {}",
+            truncate(&fr.file, 28),
+            fr.audio_secs,
+            fr.wall_ms,
+            fr.encode_ms,
+            fr.decode_ms,
+            fr.n_generated,
+            fr.decode_tok_per_s,
+            fr.realtime_factor,
+            fr.wer.map(|w| format!("{:.1}%", w * 100.0)).unwrap_or_else(|| "-".to_string()),
+            langs.join(",")
+        );
+        if let Some(err) = &fr.error {
+            println!("    ERROR: {}", err);
+        }
+        results.push(fr);
+    }
+    let total_audio: f64 = results.iter().map(|r| r.audio_secs).sum();
+    let total_wall: f64 = results.iter().map(|r| r.wall_ms).sum();
+    let toks: Vec<f64> = results.iter().filter(|r| r.n_generated > 20).map(|r| r.decode_tok_per_s).collect();
+    let mean_tok = if toks.is_empty() { 0.0 } else { toks.iter().sum::<f64>() / toks.len() as f64 };
+    println!(
+        "TOTAL audio {:.1}s, wall {:.1}s ({:.1}x realtime), mean decode {:.1} tok/s",
+        total_audio,
+        total_wall / 1000.0,
+        if total_wall > 0.0 { total_audio * 1000.0 / total_wall } else { 0.0 },
+        mean_tok
+    );
+    let report = BenchReport {
+        tag: tag.to_string(),
+        model: format!("whisper:{}", dir),
+        gpu: config.use_gpu,
+        prompt_style: "whisper".to_string(),
+        quantization: format!("{:?}", dtype),
+        load_ms,
+        files: results,
+        total_audio_secs: total_audio,
+        total_wall_ms: total_wall,
+        mean_decode_tok_per_s: mean_tok,
+        mean_wer: None,
+    };
+    if let Some(out) = out {
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(out, serde_json::to_string_pretty(&report)?)?;
+        eprintln!("Wrote {}", out.display());
+    }
+    Ok(())
 }
 
 fn is_audio(p: &Path) -> bool {

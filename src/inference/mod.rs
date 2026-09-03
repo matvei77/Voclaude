@@ -4,6 +4,7 @@ pub mod candle_audio;
 pub mod candle_backend;
 pub mod candle_tokenizer;
 mod qwen;
+pub mod whisper_engine;
 
 pub use qwen::{load_audio_file, QwenEngine};
 

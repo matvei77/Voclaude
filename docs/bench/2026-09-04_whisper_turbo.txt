@@ -1,0 +1,17 @@
+[2m2026-09-03T23:36:28.927294Z[0m [32m INFO[0m Whisper loaded: 100 language tokens, dtype F32
+Whisper loaded in 0.75s
+file                         audio_s  wall_ms  encode   decode   toks   tok/s    xRT    WER  langs
+audio-1772019995026.f32         10.0      694     480      213     33   154.6   14.4      -  en
+audio-1772020028560.f32         43.1     2293    1436      855    123   143.8   18.8      -  en,en,en
+audio-1773150920220.f32        656.5    20605   15909     4670    690   147.7   31.9      -  en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en,en
+audio-1773399098147.f32        122.5     3569    3383      181      7    38.7   34.3      -  en,en,en,en,en,en,en
+audio-1788381557645.f32         68.9     2888    1451     1435    206   143.6   23.8      -  en,en,en
+audio-1788420081247.f32        105.4     4366    2415     1947    289   148.4   24.1      -  en,en,en,en,en
+audio-1788421219149.f32        207.7     8540    4825     3707    551   148.6   24.3      -  en,en,en,en,en,en,en,en,en,en
+audio-1788421621695.f32        143.9     4824    3393     1426    211   148.0   29.8      -  en,en,en,en,en,en,en
+audio-1788422551284.f32         18.3      801     484      316     48   152.1   22.8      -  en
+audio-1788422585905.f32         32.6     1486     965      520     80   153.9   21.9      -  en,en
+audio-1788471237661.f32         76.6     3309    1935     1371    201   146.6   23.2      -  en,en,en,en
+audio-1788471750664.f32        270.9     9940    5809     4122    609   147.8   27.3      -  en,en,en,en,en,en,en,en,en,en,en,en
+TOTAL audio 1756.3s, wall 63.3s (27.7x realtime), mean decode 148.7 tok/s
+Wrote ../../docs/bench/2026-09-04_whisper_turbo.json
