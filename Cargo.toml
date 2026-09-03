@@ -63,3 +63,9 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1              # Faster dev builds but not painfully slow
+
+[patch.crates-io]
+# candle-core with cudarc "dynamic-loading": CUDA DLLs are loaded on first
+# GPU use instead of at process start, so the tray process never maps them.
+candle-core = { path = "vendor/candle-core" }
+float8 = { path = "vendor/float8" }

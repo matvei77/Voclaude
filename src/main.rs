@@ -65,6 +65,7 @@ fn main() {
             .with_max_level(Level::INFO)
             .with_target(false)
             .with_ansi(false)
+            .without_time()
             .compact()
             .with_writer(std::io::stderr)
             .init();

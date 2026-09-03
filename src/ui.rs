@@ -197,17 +197,33 @@ impl SharedUiState {
 pub struct UiManager {
     shared: SharedUiState,
     alive: Arc<AtomicBool>,
+    /// Set once the eframe thread has been spawned (it cannot be restarted:
+    /// winit allows one event loop per process).
+    started: AtomicBool,
     repaint_ctx: Arc<Mutex<Option<egui::Context>>>,
 }
 
 impl UiManager {
+    /// Create the shared state only. The egui/eframe thread (GL context, fonts,
+    /// ~150 MB of working set) is started lazily on the first request to show
+    /// the history window, so an idle tray app stays small.
     pub fn new(log_buffer: LogBuffer, _gpu_enabled: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let shared = SharedUiState::new(log_buffer);
-        let app = RootApp::new(shared.clone());
-        let alive = Arc::new(AtomicBool::new(true));
-        let alive_thread = alive.clone();
-        let alive_keepalive = alive.clone();
+        let alive = Arc::new(AtomicBool::new(false));
         let repaint_ctx: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
+        Ok(Self { shared, alive, started: AtomicBool::new(false), repaint_ctx })
+    }
+
+    /// Spawn the eframe thread if it is not running yet.
+    fn ensure_started(&self) {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let app = RootApp::new(self.shared.clone());
+        self.alive.store(true, Ordering::SeqCst);
+        let alive_thread = self.alive.clone();
+        let alive_keepalive = self.alive.clone();
+        let repaint_ctx = self.repaint_ctx.clone();
         let repaint_ctx_cc = repaint_ctx.clone();
 
         std::thread::spawn(move || {
@@ -264,19 +280,20 @@ impl UiManager {
 
         info!("UI thread started");
 
-        // U-2: Wait up to 500ms for repaint_ctx to be initialized by eframe
+        // U-2: Wait up to 2 s for repaint_ctx to be initialized by the eframe
         // creation closure, so early wake() calls aren't silently dropped.
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(2000);
         while std::time::Instant::now() < deadline {
             if let Ok(guard) = repaint_ctx.lock() {
                 if guard.is_some() {
                     break;
                 }
             }
+            if !self.alive.load(Ordering::SeqCst) {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
-
-        Ok(Self { shared, alive, repaint_ctx })
     }
 
     fn wake(&self) {
@@ -288,6 +305,7 @@ impl UiManager {
     }
 
     pub fn toggle(&self) -> bool {
+        self.ensure_started();
         if !self.alive.load(Ordering::SeqCst) {
             error!("UI is not running");
             return false;
@@ -304,6 +322,7 @@ impl UiManager {
     }
 
     pub fn show(&self) -> bool {
+        self.ensure_started();
         if !self.alive.load(Ordering::SeqCst) {
             error!("UI is not running");
             return false;

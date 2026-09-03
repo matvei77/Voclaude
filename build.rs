@@ -20,4 +20,12 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-changed=.git/packed-refs");
+
+    // candle-kernels links `cudart` for its MoE kernels; with cudarc in
+    // dynamic-loading mode nobody else adds the CUDA library directory to the
+    // linker search path, so do it here (harmless on the CPU build).
+    if let Ok(cuda) = std::env::var("CUDA_PATH") {
+        println!("cargo:rustc-link-search=native={}/lib/x64", cuda);
+    }
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
 }
