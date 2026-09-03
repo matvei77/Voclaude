@@ -47,10 +47,13 @@ pub struct HistoryEntry {
     pub created_at_ms: u64,
     pub text: String,
     pub audio: Option<AudioMetadata>,
+    /// Path to the retained audio recording file, if still on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_path: Option<String>,
 }
 
 impl HistoryEntry {
-    fn new(text: String, audio: Option<AudioMetadata>) -> Self {
+    fn new(text: String, audio: Option<AudioMetadata>, audio_path: Option<String>) -> Self {
         let created_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
@@ -63,6 +66,7 @@ impl HistoryEntry {
             created_at_ms,
             text,
             audio,
+            audio_path,
         }
     }
 }
@@ -72,12 +76,14 @@ pub struct HistoryStore {
     entries: Vec<HistoryEntry>,
     path: PathBuf,
     max_entries: usize,
+    audio_retention_count: usize,
     update_tx: Sender<HistoryEntry>,
 }
 
 impl HistoryStore {
     pub fn load(
         max_entries: usize,
+        audio_retention_count: usize,
         update_tx: Sender<HistoryEntry>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let path = Self::history_path()?;
@@ -87,6 +93,7 @@ impl HistoryStore {
             entries,
             path,
             max_entries: max_entries.max(1),
+            audio_retention_count,
             update_tx,
         };
         let retention_applied = store.apply_retention();
@@ -108,10 +115,12 @@ impl HistoryStore {
         &mut self,
         text: String,
         audio: Option<AudioMetadata>,
+        audio_path: Option<String>,
     ) -> Result<HistoryEntry, Box<dyn std::error::Error>> {
-        let entry = HistoryEntry::new(text, audio);
+        let entry = HistoryEntry::new(text, audio, audio_path);
         self.entries.push(entry.clone());
         self.apply_retention();
+        self.apply_audio_retention();
         self.persist()?;
         if let Err(err) = self.update_tx.try_send(entry.clone()) {
             debug!("Dropping history update: {}", err);
@@ -122,10 +131,50 @@ impl HistoryStore {
     fn apply_retention(&mut self) -> bool {
         if self.entries.len() > self.max_entries {
             let excess = self.entries.len() - self.max_entries;
+            // Delete audio files for entries being removed
+            for entry in &self.entries[..excess] {
+                if let Some(path) = &entry.audio_path {
+                    let p = Path::new(path);
+                    if p.exists() {
+                        if let Err(err) = std::fs::remove_file(p) {
+                            warn!("Failed to delete audio file {:?}: {}", p, err);
+                        } else {
+                            debug!("Cleaned up audio file from evicted entry: {:?}", p);
+                        }
+                    }
+                }
+            }
             self.entries.drain(0..excess);
             return true;
         }
         false
+    }
+
+    /// Delete audio files from the oldest entries beyond the audio retention count.
+    fn apply_audio_retention(&mut self) {
+        // Collect indices of entries that still have audio files, oldest first
+        let with_audio: Vec<usize> = self.entries.iter().enumerate()
+            .filter(|(_, e)| e.audio_path.is_some())
+            .map(|(i, _)| i)
+            .collect();
+
+        if with_audio.len() <= self.audio_retention_count {
+            return;
+        }
+
+        let to_remove = with_audio.len() - self.audio_retention_count;
+        for &idx in &with_audio[..to_remove] {
+            if let Some(path) = self.entries[idx].audio_path.take() {
+                let p = Path::new(&path);
+                if p.exists() {
+                    if let Err(err) = std::fs::remove_file(p) {
+                        warn!("Failed to delete old audio file {:?}: {}", p, err);
+                    } else {
+                        debug!("Audio retention: deleted {:?}", p);
+                    }
+                }
+            }
+        }
     }
 
     fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -281,8 +330,8 @@ mod tests {
 
     #[test]
     fn history_entry_has_unique_id() {
-        let e1 = HistoryEntry::new("hello".to_string(), None);
-        let e2 = HistoryEntry::new("world".to_string(), None);
+        let e1 = HistoryEntry::new("hello".to_string(), None, None);
+        let e2 = HistoryEntry::new("world".to_string(), None, None);
         assert_ne!(e1.id, e2.id);
     }
 

@@ -3,6 +3,7 @@
 //! Loads Qwen3-ASR-1.7B safetensors directly via candle-core and runs
 //! inference entirely in Rust. No Python dependency.
 
+use crate::audio::TARGET_SAMPLE_RATE;
 use crate::config::Config;
 use crate::inference::candle_backend::Qwen3ASRModel;
 use crate::inference::candle_tokenizer::Qwen3ASRTokenizer;
@@ -15,6 +16,18 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_MODEL_SIZE_MB: u64 = 3300;
 
+const SAMPLE_RATE: usize = TARGET_SAMPLE_RATE as usize;
+
+/// Maximum chunk size in samples (5 minutes at 16kHz).
+/// At 13 audio tokens/second, 5 min = 3900 tokens. With ~30 prompt tokens
+/// and 2048 max_new_tokens, total positions = ~5978, well within MRoPE's 16384 limit.
+const MAX_CHUNK_SAMPLES: usize = 5 * 60 * SAMPLE_RATE;
+const MIN_CHUNK_SAMPLES: usize = 10 * SAMPLE_RATE;
+
+/// Number of transcriptions before proactively resetting the CUDA context
+/// to prevent driver-level memory fragmentation from accumulating to OOM.
+const DEFRAG_INTERVAL: u32 = 250;
+
 pub struct QwenEngine {
     active_gpu: bool,
     use_gpu: bool,
@@ -22,11 +35,15 @@ pub struct QwenEngine {
     model_id: String,
     model_path: Option<String>,
     max_new_tokens: u32,
+    adaptive_max_new_tokens: bool,
+    max_chunk_samples: usize,
     require_gpu: bool,
     model: Option<Qwen3ASRModel>,
     tokenizer: Option<Qwen3ASRTokenizer>,
     device: Device,
     dtype: DType,
+    /// Tracks consecutive transcriptions since last model load/reload.
+    transcription_count: u32,
 }
 
 impl QwenEngine {
@@ -52,11 +69,14 @@ impl QwenEngine {
             model_id: "Qwen/Qwen3-ASR-1.7B".to_string(),
             model_path: None,
             max_new_tokens: 2048,
+            adaptive_max_new_tokens: true,
+            max_chunk_samples: MAX_CHUNK_SAMPLES,
             require_gpu: true,
             model: None,
             tokenizer: None,
             device,
             dtype,
+            transcription_count: 0,
         })
     }
 
@@ -66,6 +86,9 @@ impl QwenEngine {
         engine.model_id = config.model.clone();
         engine.model_path = config.model_path.clone();
         engine.max_new_tokens = config.max_new_tokens;
+        engine.adaptive_max_new_tokens = config.adaptive_max_new_tokens;
+        engine.max_chunk_samples = ((config.max_chunk_seconds as usize) * SAMPLE_RATE)
+            .clamp(MIN_CHUNK_SAMPLES, MAX_CHUNK_SAMPLES);
         engine.require_gpu = config.require_gpu;
         Ok(engine)
     }
@@ -80,6 +103,22 @@ impl QwenEngine {
         samples: &[f32],
         mut progress: Option<&mut dyn FnMut(InferenceProgress)>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // Proactive CUDA defrag: periodically unload/reload to prevent
+        // driver-level memory fragmentation from accumulating to OOM.
+        if self.active_gpu && self.transcription_count > 0 && self.transcription_count % DEFRAG_INTERVAL == 0 {
+            info!(
+                "Proactive CUDA defrag after {} transcriptions",
+                self.transcription_count
+            );
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(InferenceProgress {
+                    stage: InferenceStage::LoadingModel,
+                    message: "Optimizing GPU memory...".to_string(),
+                });
+            }
+            self.unload();
+        }
+
         self.prepare(progress.as_deref_mut().map(|p| p as &mut dyn FnMut(InferenceProgress)))?;
 
         if let Some(cb) = progress.as_deref_mut() {
@@ -90,17 +129,124 @@ impl QwenEngine {
         }
 
         let started = Instant::now();
+        let result = self.run_transcription(samples);
+
+        match result {
+            Ok(text) => {
+                self.transcription_count += 1;
+                let elapsed = started.elapsed();
+                info!(
+                    "Transcription #{} complete: infer={:.2}s",
+                    self.transcription_count,
+                    elapsed.as_secs_f64()
+                );
+                Ok(text)
+            }
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                if Self::is_cuda_oom(&err_msg) && self.use_gpu {
+                    warn!(
+                        "CUDA OOM on transcription #{}, recovering...",
+                        self.transcription_count + 1
+                    );
+                    if let Some(cb) = progress.as_deref_mut() {
+                        cb(InferenceProgress {
+                            stage: InferenceStage::LoadingModel,
+                            message: "Recovering from GPU memory pressure...".to_string(),
+                        });
+                    }
+
+                    // Drop CUDA context entirely and reload with fresh memory state
+                    self.unload();
+                    self.prepare(progress.as_deref_mut().map(|p| p as &mut dyn FnMut(InferenceProgress)))?;
+
+                    if let Some(cb) = progress.as_deref_mut() {
+                        cb(InferenceProgress {
+                            stage: InferenceStage::Transcribing,
+                            message: "Retrying transcription...".to_string(),
+                        });
+                    }
+
+                    let retry_result = self.run_transcription(samples);
+                    match retry_result {
+                        Ok(text) => {
+                            self.transcription_count = 1; // reset after successful recovery
+                            let elapsed = started.elapsed();
+                            info!(
+                                "Transcription recovered after OOM: infer={:.2}s",
+                                elapsed.as_secs_f64()
+                            );
+                            Ok(text)
+                        }
+                        Err(retry_err) => {
+                            Err(format!("Transcription failed: {}", retry_err).into())
+                        }
+                    }
+                } else {
+                    Err(format!("Transcription failed: {}", e).into())
+                }
+            }
+        }
+    }
+
+    /// Run the actual model transcription. Extracted to allow OOM retry.
+    /// Automatically chunks long audio (>5 min) to stay within MRoPE position limits.
+    fn run_transcription(&mut self, samples: &[f32]) -> Result<String, Box<dyn std::error::Error>> {
         let model = self.model.as_mut().ok_or("Model not loaded")?;
         let tokenizer = self.tokenizer.as_ref().ok_or("Tokenizer not loaded")?;
 
-        let text = model
-            .transcribe(samples, self.language.as_deref(), tokenizer)
-            .map_err(|e| format!("Transcription failed: {}", e))?;
+        let chunk_limit = self.max_chunk_samples;
+        if samples.len() <= chunk_limit {
+            model.max_new_tokens = adaptive_token_limit(
+                samples.len(),
+                self.max_new_tokens as usize,
+                self.adaptive_max_new_tokens,
+            );
+            let text = model
+                .transcribe(samples, self.language.as_deref(), tokenizer)
+                .map_err(|e| format!("{}", e))?;
+            return Ok(text);
+        }
 
-        let elapsed = started.elapsed();
-        info!("Transcription complete: infer={:.2}s", elapsed.as_secs_f64());
+        // Chunk long audio at silence boundaries
+        let chunks = split_audio_at_silence(samples, chunk_limit);
+        info!(
+            "Audio too long ({:.1}s), split into {} chunks (limit={}s)",
+            samples.len() as f64 / SAMPLE_RATE as f64,
+            chunks.len(),
+            chunk_limit / SAMPLE_RATE
+        );
 
-        Ok(text)
+        let mut texts = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            model.max_new_tokens = adaptive_token_limit(
+                chunk.len(),
+                self.max_new_tokens as usize,
+                self.adaptive_max_new_tokens,
+            );
+            info!(
+                "Transcribing chunk {}/{} ({:.1}s, max_new_tokens={})",
+                i + 1,
+                chunks.len(),
+                chunk.len() as f64 / SAMPLE_RATE as f64,
+                model.max_new_tokens
+            );
+            let text = model
+                .transcribe(chunk, self.language.as_deref(), tokenizer)
+                .map_err(|e| format!("Chunk {}/{} failed: {}", i + 1, chunks.len(), e))?;
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                texts.push(trimmed.to_string());
+            }
+        }
+
+        Ok(texts.join(" "))
+    }
+
+    /// Check if an error message indicates CUDA out-of-memory.
+    fn is_cuda_oom(err_msg: &str) -> bool {
+        let lower = err_msg.to_lowercase();
+        lower.contains("out of memory") || lower.contains("out_of_memory")
     }
 
     fn resolve_model_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -247,13 +393,14 @@ impl AsrEngine for QwenEngine {
 
     fn unload(&mut self) {
         if self.model.is_some() {
-            info!("Unloading model from memory");
+            info!("Unloading model from memory (after {} transcriptions)", self.transcription_count);
             self.model = None;
             self.tokenizer = None;
             // Release CUDA context and its memory pool by dropping the Device handle.
             // The device will be recreated on next prepare() call.
             self.device = Device::Cpu;
             self.active_gpu = false;
+            self.transcription_count = 0;
             info!("CUDA context released");
         }
     }
@@ -476,4 +623,82 @@ fn dirs_for_hf_cache() -> Option<PathBuf> {
             .ok()
             .map(|home| PathBuf::from(home).join(".cache").join("huggingface").join("hub"))
     }
+}
+
+/// Split long audio into chunks at silence boundaries.
+///
+/// Finds low-energy (near-silence) points near each nominal 5-minute boundary
+/// to avoid cutting mid-word. Returns slices into the original sample buffer.
+fn adaptive_token_limit(sample_count: usize, configured_max: usize, adaptive: bool) -> usize {
+    if !adaptive {
+        return configured_max.max(1);
+    }
+
+    // Typical dictation is far below this, but the margin avoids truncating
+    // fast speech and languages that tokenize more densely than English.
+    let seconds = sample_count as f64 / SAMPLE_RATE as f64;
+    let estimated = (seconds * 16.0).ceil() as usize + 128;
+    configured_max.min(estimated.max(96)).max(1)
+}
+
+fn split_audio_at_silence(samples: &[f32], max_chunk_samples: usize) -> Vec<&[f32]> {
+    let max_chunk_samples = max_chunk_samples.clamp(MIN_CHUNK_SAMPLES, MAX_CHUNK_SAMPLES);
+    if samples.len() <= max_chunk_samples {
+        return vec![samples];
+    }
+
+    /// Half-second analysis frame for RMS energy calculation.
+    const ANALYSIS_FRAME: usize = SAMPLE_RATE / 2; // 8000 samples = 0.5s
+    /// Search window: ±5 seconds around the nominal cut point.
+    const SEARCH_HALF_WINDOW: usize = 5 * SAMPLE_RATE; // 80000 samples
+    /// Step size for sliding the analysis frame (0.125 seconds).
+    const STEP: usize = SAMPLE_RATE / 8; // 2000 samples
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < samples.len() {
+        let remaining = samples.len() - start;
+        if remaining <= max_chunk_samples {
+            chunks.push(&samples[start..]);
+            break;
+        }
+
+        let nominal_end = start + max_chunk_samples;
+        let search_start = nominal_end.saturating_sub(SEARCH_HALF_WINDOW);
+        let search_end = (nominal_end + SEARCH_HALF_WINDOW).min(samples.len());
+
+        // Find the half-second window with minimum RMS energy
+        let mut best_pos = nominal_end;
+        let mut best_energy = f32::MAX;
+
+        let mut pos = search_start;
+        while pos + ANALYSIS_FRAME <= search_end {
+            let window = &samples[pos..pos + ANALYSIS_FRAME];
+            let energy: f32 = window.iter().map(|s| s * s).sum::<f32>() / ANALYSIS_FRAME as f32;
+            if energy < best_energy {
+                best_energy = energy;
+                best_pos = pos + ANALYSIS_FRAME / 2; // cut at center of quiet window
+            }
+            pos += STEP;
+        }
+
+        // Clamp: never let a chunk exceed MAX_CHUNK_SAMPLES from start,
+        // even if silence was found in the forward half of the search window.
+        best_pos = best_pos.min(start + max_chunk_samples);
+
+        // If the remaining tail after this cut is too short to produce a
+        // meaningful transcription (< 1 second), absorb it into this chunk.
+        const MIN_TAIL_SAMPLES: usize = SAMPLE_RATE; // 1 second
+        let tail = samples.len() - best_pos;
+        if tail < MIN_TAIL_SAMPLES {
+            chunks.push(&samples[start..]);
+            break;
+        }
+
+        chunks.push(&samples[start..best_pos]);
+        start = best_pos;
+    }
+
+    chunks
 }

@@ -1,7 +1,7 @@
 # package.ps1 — Build Voclaude and package it with CUDA DLLs for distribution.
 #
 # Usage:
-#   .\package.ps1            # GPU build (default)
+#   .\package.ps1            # GPU build (default, bundles CUDA runtime DLLs)
 #   .\package.ps1 -Cpu       # CPU-only build (no CUDA DLLs, smaller)
 #
 # Output:
@@ -50,8 +50,16 @@ Copy-Item $Exe $StageDir
 
 # For GPU builds, bundle the required CUDA DLLs
 if (-not $Cpu) {
-    # DLLs we need (nvcuda.dll ships with NVIDIA drivers, no need to bundle)
-    $CudaDlls = @("cublas64_*.dll", "cublasLt64_*.dll", "curand64_*.dll")
+    # DLLs we need (nvcuda.dll ships with NVIDIA drivers, no need to bundle).
+    # Keep this broader than the current import table because NVIDIA DLLs can
+    # depend on sibling runtime DLLs depending on CUDA version.
+    $CudaDlls = @(
+        "cublas64_*.dll",
+        "cublasLt64_*.dll",
+        "curand64_*.dll",
+        "cudart64_*.dll",
+        "nvrtc64_*.dll"
+    )
 
     # Search paths: CUDA_PATH, then common install locations
     $SearchRoots = @()
@@ -103,6 +111,31 @@ if (-not $Cpu) {
         Copy-Item $entry.Value $StageDir
         Write-Host "  Bundled $dll" -ForegroundColor DarkGray
     }
+
+    # MSVC runtime is frequently missing on clean corporate Windows images.
+    # Bundle it when present so users do not have to install VC++ redistributables.
+    $MsvcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+    $MsvcRoots = @(
+        "$env:WINDIR\System32",
+        "$env:WINDIR\SysWOW64"
+    ) + ($env:PATH -split ';')
+    foreach ($dllName in $MsvcDlls) {
+        $dllPath = $null
+        foreach ($root in $MsvcRoots) {
+            if (-not $root -or -not (Test-Path $root)) { continue }
+            $candidate = Join-Path $root $dllName
+            if (Test-Path $candidate) {
+                $dllPath = $candidate
+                break
+            }
+        }
+        if ($dllPath) {
+            Copy-Item $dllPath $StageDir
+            Write-Host "  Bundled $dllName" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  WARNING: Could not find $dllName" -ForegroundColor Yellow
+        }
+    }
 }
 
 # Copy example config
@@ -110,6 +143,44 @@ $ExampleConfig = Join-Path $ProjectRoot "config.example.toml"
 if (Test-Path $ExampleConfig) {
     Copy-Item $ExampleConfig $StageDir
 }
+
+$ReadmePath = Join-Path $StageDir "README-FIRST.txt"
+$ReadmeText = if ($Cpu) {
+@"
+Voclaude CPU build
+==================
+
+Run voclaude.exe. No Rust, Python, CUDA Toolkit, or NVIDIA GPU is required.
+
+The model downloads on first transcription. For normal corporate laptops, use
+model_tier = "medium" in config.toml so Voclaude uses Qwen3-ASR-0.6B.
+
+Useful checks:
+  voclaude.exe --validate --cpu --model-tier medium
+  voclaude.exe --list-models
+"@
+} else {
+@"
+Voclaude GPU build
+==================
+
+Run voclaude.exe. Do NOT install the CUDA Toolkit on the user's machine.
+This package bundles the CUDA runtime DLLs that Voclaude imports.
+
+Requirements:
+  - Windows 10/11 64-bit
+  - NVIDIA GPU
+  - Recent NVIDIA driver
+
+Useful checks:
+  voclaude.exe --validate --gpu --model-tier medium
+  voclaude.exe --list-models
+
+If validation says CUDA is unavailable, update the NVIDIA driver. The CUDA
+Toolkit is a developer dependency, not an end-user install step.
+"@
+}
+Set-Content -Path $ReadmePath -Value $ReadmeText -Encoding ASCII
 
 # Create zip (include git hash for traceability)
 $ZipName = "voclaude-v$Version-$GitHash-$Variant.zip"

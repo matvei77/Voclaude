@@ -444,8 +444,9 @@ pub struct MRoPEEmbedding {
 
 impl MRoPEEmbedding {
     /// I-3: Maximum positions to precompute (audio prefix + max generated tokens).
-    /// 5-min audio ≈ 3950 tokens + 2048 generated = ~6000; use 8192 for headroom.
-    const MAX_POSITIONS: usize = 8192;
+    /// 5-min chunk ≈ 3900 tokens + 2048 generated = ~5950. Long audio is chunked
+    /// at ~5 min boundaries, but use 16384 for generous headroom. Cost: ~8MB VRAM.
+    const MAX_POSITIONS: usize = 16384;
 
     fn new(head_dim: usize, rope_theta: f64, _mrope_section: Vec<usize>, device: &Device, dtype: DType) -> Result<Self> {
         let half_dim = head_dim / 2;
@@ -1029,7 +1030,10 @@ impl Qwen3ASRModel {
 
         // Extract last-token logits immediately and drop the full prefill tensor.
         // Shape: logits is (1, seq_len, vocab_size) → extract (vocab_size,)
-        let mut last_logits = logits.i((0, logits.dims()[1] - 1))?;
+        // .contiguous() copies the data into a small dedicated buffer so the full
+        // prefill logits tensor (~145-170MB) can be freed immediately instead of
+        // surviving through a view reference until the first decode step.
+        let mut last_logits = logits.i((0, logits.dims()[1] - 1))?.contiguous()?;
         drop(logits);
 
         // 8. Autoregressive generation

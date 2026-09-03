@@ -27,7 +27,16 @@ history_max_entries = 500
 # GPU acceleration (CUDA)
 use_gpu = true
 
-# Model (HuggingFace repo id, downloaded automatically on first use)
+# Model tier:
+#   fast / small / medium  = Qwen3-ASR-0.6B, lower memory, best for CPU or laptop GPUs
+#   best / large / accurate = Qwen3-ASR-1.7B, highest quality, best for stronger NVIDIA GPUs
+model_tier = "medium"
+
+# If true, choose a conservative model for the selected CPU/GPU path unless `model` is set.
+auto_select_model = false
+
+# Model (HuggingFace repo id, downloaded automatically on first use).
+# Comment this out if you want model_tier to pick the model.
 model = "Qwen/Qwen3-ASR-1.7B"
 
 # Optional: path to local model directory (safetensors)
@@ -35,6 +44,13 @@ model = "Qwen/Qwen3-ASR-1.7B"
 
 # Max tokens per transcription
 max_new_tokens = 2048
+
+# For short dictation, allocate fewer decode-cache tokens automatically.
+adaptive_max_new_tokens = true
+
+# Split long audio at silence boundaries. Lower values reduce peak memory and
+# can help CPU/low-VRAM systems, but may slightly hurt context across chunks.
+max_chunk_seconds = 300
 
 # Require GPU (fail if CUDA unavailable)
 require_gpu = false

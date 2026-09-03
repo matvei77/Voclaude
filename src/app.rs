@@ -188,7 +188,7 @@ impl App {
 
         // History storage
         let (history_update_tx, history_update_rx) = bounded::<HistoryEntry>(32);
-        let mut history = HistoryStore::load(self.config.history_max_entries, history_update_tx)?;
+        let mut history = HistoryStore::load(self.config.history_max_entries, self.config.audio_retention_count, history_update_tx)?;
         info!("History loaded: {} entries", history.len());
         for entry in history.entries() {
             self.ui.push_history(entry.text.clone());
@@ -548,16 +548,11 @@ impl App {
                             if matches!(result, Ok(_)) {
                                 watchdog_respawn_count = 0;
                             }
-                            // E-7: Clean up audio file after transcription
-                            if let Some(audio_path) = pending_audio_path.take() {
-                                if audio_path.exists() {
-                                    if let Err(err) = std::fs::remove_file(&audio_path) {
-                                        warn!("Failed to delete audio file {:?}: {}", audio_path, err);
-                                    } else {
-                                        debug!("Cleaned up audio file: {:?}", audio_path);
-                                    }
-                                }
-                            }
+                            // E-7: Audio file retention — keep recordings on disk.
+                            // On success: store path in history entry; old files are
+                            // pruned by HistoryStore::apply_audio_retention.
+                            // On failure: always keep the audio file for recovery.
+                            let completed_audio_path = pending_audio_path.take();
                             match result {
                                 Ok(text) => {
                                     // S-1: Don't log full transcript (may contain sensitive dictation)
@@ -617,7 +612,10 @@ impl App {
                                     let mut history_error = None;
                                     if !history_text.is_empty() {
                                         let metadata = pending_audio_metadata.take();
-                                        match history.append(history_text.clone(), metadata) {
+                                        let audio_file = completed_audio_path
+                                            .as_ref()
+                                            .map(|p| p.to_string_lossy().to_string());
+                                        match history.append(history_text.clone(), metadata, audio_file) {
                                             Ok(entry) => {
                                                 history_entry_id = Some(entry.id);
                                                 ui_status.history_count = history.len();
@@ -848,6 +846,7 @@ impl App {
                             self.config.language = new_config.language.clone();
                             self.config.history_max_entries = new_config.history_max_entries;
                             self.config.require_gpu = new_config.require_gpu;
+                            self.config.audio_retention_count = new_config.audio_retention_count;
                             notifications.enabled = new_config.show_notifications;
                             let msg = if needs_restart.is_empty() {
                                 "Settings applied successfully".to_string()

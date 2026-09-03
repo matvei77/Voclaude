@@ -57,18 +57,18 @@ fn main() {
         return;
     }
 
+    if args.iter().any(|a| a == "--list-models") {
+        attach_console_for_cli();
+        print_model_list();
+        return;
+    }
+
     let test_mode = args.len() > 1 && args[1] == "--test";
     let validate_mode = args.iter().any(|a| a == "--validate");
 
     if test_mode {
         // Attach to parent console so test output is visible on Windows GUI subsystem
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS, AllocConsole};
-            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
-                AllocConsole();
-            }
-        }
+        attach_console_for_cli();
 
         // Test mode: log to a file for reliable output capture
         let log_path = std::env::current_dir().unwrap_or_default().join("test_output.log");
@@ -86,7 +86,7 @@ fn main() {
         }
         let wav_path = &args[2];
 
-        if let Err(e) = run_test(wav_path) {
+        if let Err(e) = run_test(wav_path, &args) {
             error!("Test failed: {}", e);
             show_fatal_error_dialog(&format!("Test failed: {}", e));
             std::process::exit(1);
@@ -160,41 +160,25 @@ fn main() {
 
     // CLI override: --model-dir <path> sets model_path for IT pre-staging
     // O-5: Validate --model-dir has a value and the path exists
-    if let Some(pos) = args.iter().position(|a| a == "--model-dir") {
-        match args.get(pos + 1) {
-            Some(dir) if !dir.starts_with('-') => {
-                let path = std::path::Path::new(dir);
-                if !path.exists() || !path.is_dir() {
-                    error!("--model-dir path does not exist or is not a directory: {}", dir);
-                    show_fatal_error_dialog(&format!("--model-dir path not found: {}", dir));
-                    std::process::exit(1);
-                }
-                info!("Using --model-dir override: {}", dir);
-                config.model_path = Some(dir.clone());
-            }
-            _ => {
-                error!("--model-dir requires a path argument");
-                show_fatal_error_dialog("--model-dir requires a path argument");
-                std::process::exit(1);
-            }
-        }
+    if let Err(err) = apply_cli_overrides(&mut config, &args) {
+        error!("Invalid CLI option: {}", err);
+        show_fatal_error_dialog(&err);
+        std::process::exit(1);
     }
 
     // --validate: check GPU, model, audio device, config — then exit
     if validate_mode {
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS, AllocConsole};
-            if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
-                AllocConsole();
-            }
-        }
+        attach_console_for_cli();
         let validate_result = (|| -> Result<(), Box<dyn std::error::Error>> {
             println!("Voclaude {} — Validation Mode", env!("CARGO_PKG_VERSION"));
             println!("Config: OK");
             println!("  model: {}", config.model);
+            println!("  model_tier: {} ({})", config.model_tier, config.model_tier_summary());
             println!("  use_gpu: {}", config.use_gpu);
             println!("  model_path: {}", config.model_path.as_deref().unwrap_or("(auto)"));
+            println!("  max_new_tokens: {}", config.max_new_tokens);
+            println!("  adaptive_max_new_tokens: {}", config.adaptive_max_new_tokens);
+            println!("  max_chunk_seconds: {}", config.max_chunk_seconds);
 
             let mut engine = QwenEngine::new_with_config(&config)?;
             println!("Engine init: OK (gpu={})", engine.active_gpu());
@@ -233,8 +217,85 @@ fn main() {
     }
 }
 
+fn apply_cli_overrides(config: &mut Config, args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "--cpu") {
+        config.use_gpu = false;
+        config.require_gpu = false;
+    }
+    if args.iter().any(|a| a == "--gpu") {
+        config.use_gpu = true;
+    }
+
+    if let Some(tier) = arg_value(args, "--model-tier") {
+        config.set_model_tier(tier);
+    } else if config.auto_select_model {
+        config.model = config.model_for_current_tier();
+    }
+
+    if let Some(model) = arg_value(args, "--model") {
+        if model.trim().is_empty() {
+            return Err("--model cannot be empty".to_string());
+        }
+        config.model = model.to_string();
+    }
+
+    if let Some(dir) = arg_value(args, "--model-dir") {
+        let path = std::path::Path::new(dir);
+        if !path.exists() || !path.is_dir() {
+            return Err(format!("--model-dir path not found: {}", dir));
+        }
+        config.model_path = Some(dir.to_string());
+    }
+
+    if let Some(value) = arg_value(args, "--max-new-tokens") {
+        config.max_new_tokens = value
+            .parse::<u32>()
+            .map_err(|_| "--max-new-tokens must be an integer".to_string())?;
+    }
+
+    if let Some(value) = arg_value(args, "--chunk-seconds") {
+        config.max_chunk_seconds = value
+            .parse::<u32>()
+            .map_err(|_| "--chunk-seconds must be an integer".to_string())?;
+    }
+
+    if args.iter().any(|a| a == "--no-adaptive-tokens") {
+        config.adaptive_max_new_tokens = false;
+    }
+
+    config.validate().map_err(|err| err.to_string())
+}
+
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|idx| args.get(idx + 1))
+        .filter(|value| !value.starts_with('-'))
+        .map(String::as_str)
+}
+
+fn print_model_list() {
+    let mut fast = Config::default();
+    fast.set_model_tier("fast");
+    let mut best = Config::default();
+    best.set_model_tier("best");
+
+    println!("Available Voclaude model tiers:");
+    println!("  fast / small / medium");
+    println!("    {}", fast.model);
+    println!("    {}", fast.model_tier_summary());
+    println!("  best / large / accurate");
+    println!("    {}", best.model);
+    println!("    {}", best.model_tier_summary());
+    println!();
+    println!("CLI examples:");
+    println!("  voclaude.exe --test audio.f32 --cpu --model-tier fast");
+    println!("  voclaude.exe --test audio.f32 --gpu --model-tier best");
+    println!("  voclaude.exe --validate --model-tier medium");
+}
+
 /// Test mode: load audio file and transcribe it
-fn run_test(audio_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_test(audio_path: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     info!("=== TEST MODE ===");
     info!("Loading audio file: {}", audio_path);
 
@@ -244,6 +305,11 @@ fn run_test(audio_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     info!("Creating inference engine...");
     let mut test_config = Config::load().unwrap_or_default();
     test_config.require_gpu = false; // test mode always allows CPU fallback
+    apply_cli_overrides(&mut test_config, args)
+        .map_err(|err| format!("Invalid CLI option: {}", err))?;
+    info!("Test model: {}", test_config.model);
+    info!("Test use_gpu: {}", test_config.use_gpu);
+    info!("Test max_chunk_seconds: {}", test_config.max_chunk_seconds);
     let mut engine = QwenEngine::new_with_config(&test_config)?;
 
     info!("Transcribing...");
@@ -261,6 +327,21 @@ fn run_test(audio_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+fn attach_console_for_cli() {
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
+        };
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_console_for_cli() {}
 
 #[cfg(target_os = "windows")]
 fn show_fatal_error_dialog(message: &str) {
