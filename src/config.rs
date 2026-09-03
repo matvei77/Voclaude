@@ -98,6 +98,10 @@ pub struct Config {
     #[serde(default)]
     pub legacy_prompt: bool,
 
+    /// Decoder weight format on GPU: "none" (F16), "q8_0", or "q4_k".
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
+
     /// Transcribe while recording (segments are sent to the model as they
     /// close). When false, the whole file is transcribed after stop.
     #[serde(default = "default_true")]
@@ -116,7 +120,9 @@ pub struct Config {
     pub segment_pause_seconds: f32,
 
     /// Feed the tail of the previous segment's text to the model as context.
-    #[serde(default = "default_true")]
+    /// Off by default: on the 2026-09-04 bench it fixed a few proper nouns but
+    /// also injected fabricated sentences at segment boundaries.
+    #[serde(default)]
     pub segment_context: bool,
 }
 
@@ -129,7 +135,7 @@ impl Default for Config {
             language: None,
             add_trailing_space: true,
             capitalize_first: true,
-            idle_unload_seconds: 30,
+            idle_unload_seconds: 60,
             show_notifications: true,
             history_max_entries: default_history_max_entries(),
             use_gpu: true,
@@ -143,11 +149,12 @@ impl Default for Config {
             require_gpu: false,
             audio_retention_count: default_audio_retention_count(),
             legacy_prompt: false,
+            quantization: default_quantization(),
             streaming: true,
             segment_min_seconds: default_segment_min_seconds(),
             segment_max_seconds: default_segment_max_seconds(),
             segment_pause_seconds: default_segment_pause_seconds(),
-            segment_context: true,
+            segment_context: false,
         }
     }
 }
@@ -181,7 +188,7 @@ impl Config {
                     "show_notifications", "history_max_entries", "use_gpu",
                     "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
-                    "require_gpu", "audio_retention_count", "legacy_prompt",
+                    "require_gpu", "audio_retention_count", "legacy_prompt", "quantization",
                     "streaming", "segment_min_seconds", "segment_max_seconds",
                     "segment_pause_seconds", "segment_context",
                     // Legacy aliases
@@ -244,6 +251,12 @@ impl Config {
         }
         if self.model.trim().is_empty() {
             return Err("model cannot be empty".into());
+        }
+        if !matches!(
+            self.quantization.trim().to_ascii_lowercase().as_str(),
+            "none" | "f16" | "off" | "" | "q8_0" | "q8" | "int8" | "q4_k" | "q4k" | "q4"
+        ) {
+            return Err("quantization must be one of: none, q8_0, q4_k".into());
         }
         if !(3.0..=120.0).contains(&self.segment_min_seconds) {
             return Err("segment_min_seconds must be between 3 and 120".into());
@@ -471,7 +484,7 @@ fn default_capitalize_first() -> bool {
 }
 
 fn default_idle_unload_seconds() -> u64 {
-    30
+    60
 }
 
 fn default_show_notifications() -> bool {
@@ -484,6 +497,10 @@ fn default_audio_retention_count() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_quantization() -> String {
+    "q8_0".to_string()
 }
 
 fn default_segment_min_seconds() -> f32 {

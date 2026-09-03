@@ -289,6 +289,10 @@ fn apply_cli_overrides(config: &mut Config, args: &[String]) -> Result<(), Strin
         config.legacy_prompt = true;
     }
 
+    if let Some(q) = arg_value(args, "--quant") {
+        config.quantization = q.to_string();
+    }
+
     config.validate().map_err(|err| err.to_string())
 }
 

@@ -1,0 +1,22 @@
+Loading Qwen/Qwen3-ASR-1.7B (gpu=true, prompt=Official)...
+[2m2026-09-03T22:34:32.367531Z[0m [32m INFO[0m Loading model from "C:\\Users\\matvei\\.cache\\huggingface\\hub\\models--Qwen--Qwen3-ASR-1.7B\\snapshots\\7278e1e70fe206f11671096ffdd38061171dd6e5" on Cuda(CudaDevice(DeviceId(1)))
+[2m2026-09-03T22:34:34.399525Z[0m [32m INFO[0m Model loaded in 2.03s
+Model loaded in 2.03s
+file                         audio_s  wall_ms segs  stop_s  maxlag   toks   tok/s    xRT    WER
+audio-1772019995026.f32         10.0      997    1    1.00    1.00     36    40.3   10.0      -
+audio-1772020028560.f32         43.1     4034    3    0.21    2.01    143    39.3   10.7      -
+audio-1773150920220.f32        656.5    27217   33    0.12    1.68    838    39.0   24.1      -
+audio-1773399098147.f32        122.5     1618    7    0.13    0.25     21    39.6   75.7      -
+audio-1788381557645.f32         68.9     6393    3    2.50    2.50    226    39.0   10.8      -
+audio-1788420081247.f32        105.4     9618    5    2.17    2.18    341    39.2   11.0      -
+audio-1788421219149.f32        207.7    18473   10    1.28    2.13    652    39.1   11.2      -
+audio-1788421621695.f32        143.9     7915    6    2.06    2.06    260    38.8   18.2      -
+audio-1788422551284.f32         18.3     1542    1    1.54    1.54     52    37.6   11.9      -
+audio-1788422585905.f32         32.6     2793    2    1.04    1.75     98    39.2   11.7      -
+audio-1788471237661.f32         76.6     7000    4    0.98    2.62    243    38.4   10.9      -
+audio-1788471750664.f32        270.9    22402   12    1.86    2.87    766    38.1   12.1      -
+STREAM stop-to-result latency: mean 1.24s, max 2.50s
+TOTAL audio 1756.3s, wall 110.0s (16.0x realtime), mean decode 39.0 tok/s
+Wrote ../../docs/bench/2026-09-04_f16_stream_noctx.json
+[2m2026-09-03T22:36:24.900275Z[0m [32m INFO[0m Unloading model from memory (after 88 transcriptions)
+[2m2026-09-03T22:36:24.935949Z[0m [32m INFO[0m CUDA context released

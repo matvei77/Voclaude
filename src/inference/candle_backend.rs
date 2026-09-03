@@ -3,8 +3,109 @@
 //! Loads safetensors weights from a local directory and runs inference entirely
 //! in Rust via `candle-core`.
 
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module, VarBuilder};
+
+/// Weight format for the text decoder's large projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantization {
+    /// Keep the safetensors dtype (F16 on GPU).
+    None,
+    /// 8-bit blocks (ggml Q8_0): half the weight bandwidth, near-lossless.
+    Q8_0,
+    /// 4-bit k-quant (ggml Q4_K): quarter bandwidth, small quality cost.
+    Q4K,
+}
+
+impl Quantization {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "f16" | "off" | "" => Some(Self::None),
+            "q8_0" | "q8" | "int8" => Some(Self::Q8_0),
+            "q4_k" | "q4k" | "q4" => Some(Self::Q4K),
+            _ => None,
+        }
+    }
+
+    fn ggml(self) -> Option<GgmlDType> {
+        match self {
+            Self::None => None,
+            Self::Q8_0 => Some(GgmlDType::Q8_0),
+            Self::Q4K => Some(GgmlDType::Q4K),
+        }
+    }
+}
+
+/// A linear layer that is either dense (F16 matmul) or block-quantized
+/// (candle's CUDA ggml kernels: int8 dot products for decode, q8_1 GEMM for prefill).
+enum ProjLinear {
+    Dense(Linear),
+    Quant(QMatMul),
+}
+
+/// Where decoder projection weights are read from at load time.
+#[derive(Clone)]
+struct ProjSource<'a> {
+    /// Model-dtype weights on the target device (dense path).
+    vb: VarBuilder<'a>,
+    /// F32 weights on the CPU (quantized path: quantize on CPU, upload once).
+    vb_cpu: Option<VarBuilder<'a>>,
+    device: Device,
+    quant: Quantization,
+}
+
+impl<'a> ProjSource<'a> {
+    fn pp(&self, name: &str) -> Self {
+        Self {
+            vb: self.vb.pp(name),
+            vb_cpu: self.vb_cpu.as_ref().map(|v| v.pp(name)),
+            device: self.device.clone(),
+            quant: self.quant,
+        }
+    }
+
+    /// Load `parts` (each `(sub_path, out_dim)`) sharing `in_dim`, concatenated
+    /// along the output dim, as one projection.
+    fn linear(&self, parts: &[(&str, usize)], in_dim: usize) -> Result<ProjLinear> {
+        match (self.quant.ggml(), self.vb_cpu.as_ref()) {
+            (Some(dtype), Some(vb_cpu)) if in_dim % dtype.block_size() == 0 => {
+                let mut ws = Vec::with_capacity(parts.len());
+                for (name, out) in parts {
+                    ws.push(vb_cpu.pp(name).get((*out, in_dim), "weight")?);
+                }
+                let w = if ws.len() == 1 { ws.pop().unwrap() } else { Tensor::cat(&ws, 0)? };
+                drop(ws);
+                let q = QTensor::quantize_onto(&w, dtype, &self.device)?;
+                Ok(ProjLinear::Quant(QMatMul::from_qtensor(q)?))
+            }
+            _ => {
+                let mut ws = Vec::with_capacity(parts.len());
+                for (name, out) in parts {
+                    ws.push(self.vb.pp(name).get((*out, in_dim), "weight")?);
+                }
+                let w = if ws.len() == 1 { ws.pop().unwrap() } else { Tensor::cat(&ws, 0)? };
+                Ok(ProjLinear::Dense(Linear::new(w, None)))
+            }
+        }
+    }
+}
+
+impl ProjLinear {
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(l) => l.forward(x),
+            Self::Quant(q) => {
+                // The CUDA quantized kernels take f32 activations.
+                let in_dtype = x.dtype();
+                let x = if in_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
+                let y = q.forward(&x)?;
+                if in_dtype == DType::F32 { Ok(y) } else { y.to_dtype(in_dtype) }
+            }
+        }
+    }
+}
 use serde::Deserialize;
 use std::path::Path;
 
@@ -462,70 +563,55 @@ impl MRoPEEmbedding {
         // identical position sequences (0, 1, 2, ..., seq_len-1), so the
         // interleaved dimension assignment doesn't change the output. Each
         // frequency index i simply uses cos(pos * inv_freq[i]).
+        // Tables hold only the first half of head_dim: candle's fused `rope`
+        // kernel (rotate-half variant, as used by Qwen) expects (seq, head_dim/2).
         let max_pos = Self::MAX_POSITIONS;
-        let mut cos_data = vec![0.0f32; max_pos * head_dim];
-        let mut sin_data = vec![0.0f32; max_pos * head_dim];
+        let mut cos_data = vec![0.0f32; max_pos * half_dim];
+        let mut sin_data = vec![0.0f32; max_pos * half_dim];
 
         for p in 0..max_pos {
-            let base = p * head_dim;
+            let base = p * half_dim;
             for i in 0..half_dim {
                 let angle = p as f64 * inv_freq[i];
-                let c = angle.cos() as f32;
-                let s = angle.sin() as f32;
-                // Duplicated across both halves of head_dim
-                cos_data[base + i] = c;
-                cos_data[base + half_dim + i] = c;
-                sin_data[base + i] = s;
-                sin_data[base + half_dim + i] = s;
+                cos_data[base + i] = angle.cos() as f32;
+                sin_data[base + i] = angle.sin() as f32;
             }
         }
 
-        let cos_cache = Tensor::from_vec(cos_data, (max_pos, head_dim), device)?.to_dtype(dtype)?;
-        let sin_cache = Tensor::from_vec(sin_data, (max_pos, head_dim), device)?.to_dtype(dtype)?;
+        let cos_cache = Tensor::from_vec(cos_data, (max_pos, half_dim), device)?.to_dtype(dtype)?;
+        let sin_cache = Tensor::from_vec(sin_data, (max_pos, half_dim), device)?.to_dtype(dtype)?;
 
         Ok(Self { head_dim, cos_cache, sin_cache })
     }
 
     /// Compute cos/sin for position_ids of shape `(3, batch, seq_len)`.
-    /// Returns `(cos, sin)` each of shape `(batch, seq_len, head_dim)`.
+    /// Returns `(cos, sin)` each of shape `(seq_len, head_dim / 2)` for batch 1,
+    /// ready for `candle_nn::rotary_emb::rope`.
     ///
     /// Uses GPU-resident precomputed tables — zero CPU round-trips during decode.
     /// Since ASR uses identical positions across all 3 MRoPE dimensions,
     /// we only need to gather from dimension 0.
     fn forward(&self, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_three, batch, seq_len) = position_ids.dims3()?;
+        if batch != 1 {
+            return Err(candle_core::Error::Msg("MRoPE forward expects batch size 1".to_string()));
+        }
+        let _ = self.head_dim;
 
         // All 3 dims have same positions in ASR — just use dim 0
-        let positions = position_ids.i(0)?; // (batch, seq_len)
-        let pos_flat = positions.reshape((batch * seq_len,))?;
+        let pos_flat = position_ids.i(0)?.reshape((seq_len,))?;
 
-        // GPU index_select: gather rows from precomputed table
-        let cos = self.cos_cache.index_select(&pos_flat, 0)?; // (batch*seq_len, head_dim)
+        // GPU index_select: gather rows from precomputed table -> (seq_len, half_dim)
+        let cos = self.cos_cache.index_select(&pos_flat, 0)?;
         let sin = self.sin_cache.index_select(&pos_flat, 0)?;
-
-        let cos = cos.reshape((batch, seq_len, self.head_dim))?;
-        let sin = sin.reshape((batch, seq_len, self.head_dim))?;
-
         Ok((cos, sin))
     }
 }
 
-/// Apply rotary embeddings to q or k tensor.
+/// Apply rotary embeddings (rotate-half variant) with candle's fused kernel.
+/// `x` must be contiguous `(b, heads, seq, head_dim)`; cos/sin are `(seq, head_dim/2)`.
 fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let last_dim = *x.dims().last().unwrap();
-    let half = last_dim / 2;
-    let x1 = x.narrow(D::Minus1, 0, half)?;
-    let x2 = x.narrow(D::Minus1, half, half)?;
-
-    // Rotate: [x1, x2] -> [x1*cos - x2*sin, x2*cos + x1*sin]
-    let cos = cos.unsqueeze(1)?; // (b, 1, seq, dim)
-    let sin = sin.unsqueeze(1)?;
-    let cos_half = cos.narrow(D::Minus1, 0, half)?;
-    let sin_half = sin.narrow(D::Minus1, 0, half)?;
-
-    let r1 = (x1.broadcast_mul(&cos_half)? - x2.broadcast_mul(&sin_half)?)?;
-    let r2 = (x2.broadcast_mul(&cos_half)? + x1.broadcast_mul(&sin_half)?)?;
-    Tensor::cat(&[r1, r2], D::Minus1)
+    candle_nn::rotary_emb::rope(x, cos, sin)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -544,11 +630,9 @@ impl RmsNorm {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        x.to_dtype(dtype)?.broadcast_mul(&self.weight)
+        // Fused kernel: accumulates in f32 internally for f16 inputs.
+        let x = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        candle_nn::ops::rms_norm(&x, &self.weight, self.eps as f32)
     }
 }
 
@@ -557,10 +641,11 @@ impl RmsNorm {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct DecoderAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    /// q, k and v projections concatenated along the output dim: one matmul per step.
+    qkv_proj: ProjLinear,
+    q_dim: usize,
+    kv_dim: usize,
+    o_proj: ProjLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_heads: usize,
@@ -575,20 +660,19 @@ struct DecoderAttention {
 }
 
 impl DecoderAttention {
-    fn load(vb: VarBuilder, cfg: &ThinkerConfig) -> Result<Self> {
+    fn load(src: &ProjSource, cfg: &ThinkerConfig) -> Result<Self> {
         let h = cfg.hidden_size;
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let vb = &src.vb;
 
-        let q_proj = candle_nn::linear_no_bias(h, q_dim, vb.pp("q_proj"))?;
-        let k_proj = candle_nn::linear_no_bias(h, kv_dim, vb.pp("k_proj"))?;
-        let v_proj = candle_nn::linear_no_bias(h, kv_dim, vb.pp("v_proj"))?;
-        let o_proj = candle_nn::linear_no_bias(h, h, vb.pp("o_proj"))?;
+        let qkv_proj = src.linear(&[("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim)], h)?;
+        let o_proj = src.linear(&[("o_proj", h)], h)?;
         let q_norm = RmsNorm::load(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::load(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
 
         Ok(Self {
-            q_proj, k_proj, v_proj, o_proj, q_norm, k_norm,
+            qkv_proj, q_dim, kv_dim, o_proj, q_norm, k_norm,
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -611,12 +695,11 @@ impl DecoderAttention {
 
     fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let qkv = self.qkv_proj.forward(x)?;
+        let q = qkv.narrow(D::Minus1, 0, self.q_dim)?;
+        let k = qkv.narrow(D::Minus1, self.q_dim, self.kv_dim)?;
+        let v = qkv.narrow(D::Minus1, self.q_dim + self.kv_dim, self.kv_dim)?;
 
-        // BUG 12: capture dtype before reshape so we can restore it after F32 softmax.
-        let q_dtype = q.dtype();
         let q = q.reshape((b, seq, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape((b, seq, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape((b, seq, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
@@ -668,14 +751,15 @@ impl DecoderAttention {
             // Decode hot-path: reshape Q into KV head groups.
             // q: (b, num_heads, 1, hd) → (b, num_kv_heads, n_rep, hd)
             let q = q.reshape((b, self.num_kv_heads, n_rep, self.head_dim))?;
-            let k_t = k_full.transpose(D::Minus2, D::Minus1)?.contiguous()?; // (b, kv_h, hd, kv_len)
-            drop(k_full);
+            // Transposed view of the cache: cuBLAS reads it in place (no copy).
+            let k_t = k_full.transpose(D::Minus2, D::Minus1)?; // (b, kv_h, hd, kv_len)
             // (b, kv_h, n_rep, hd) @ (b, kv_h, hd, kv_len) → (b, kv_h, n_rep, kv_len)
             let attn = (q.matmul(&k_t)? / scale)?;
             drop(q);
             drop(k_t);
-            // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
-            let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
+            drop(k_full);
+            // Fused softmax (accumulates in f32 for f16 inputs).
+            let attn = candle_nn::ops::softmax_last_dim(&attn)?;
             // (b, kv_h, n_rep, kv_len) @ (b, kv_h, kv_len, hd) → (b, kv_h, n_rep, hd)
             let out = attn.matmul(&v_full)?;
             drop(attn);
@@ -726,8 +810,8 @@ impl DecoderAttention {
                 attn
             };
 
-            // BUG 12: upcast to F32 for numerically stable softmax, then restore q_dtype.
-            let attn = candle_nn::ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q_dtype)?;
+            // Fused softmax (accumulates in f32 for f16 inputs).
+            let attn = candle_nn::ops::softmax_last_dim(&attn.contiguous()?)?;
             let out = attn.matmul(&v_expanded)?;
             drop(attn);
             drop(v_expanded);
@@ -745,23 +829,22 @@ impl DecoderAttention {
 }
 
 struct DecoderMLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    /// gate and up projections concatenated along the output dim.
+    gate_up_proj: ProjLinear,
+    down_proj: ProjLinear,
 }
 
 impl DecoderMLP {
-    fn load(vb: VarBuilder, hidden: usize, intermediate: usize) -> Result<Self> {
-        let gate_proj = candle_nn::linear_no_bias(hidden, intermediate, vb.pp("gate_proj"))?;
-        let up_proj = candle_nn::linear_no_bias(hidden, intermediate, vb.pp("up_proj"))?;
-        let down_proj = candle_nn::linear_no_bias(intermediate, hidden, vb.pp("down_proj"))?;
-        Ok(Self { gate_proj, up_proj, down_proj })
+    fn load(src: &ProjSource, hidden: usize, intermediate: usize) -> Result<Self> {
+        let gate_up_proj = src.linear(&[("gate_proj", intermediate), ("up_proj", intermediate)], hidden)?;
+        let down_proj = src.linear(&[("down_proj", hidden)], intermediate)?;
+        Ok(Self { gate_up_proj, down_proj })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?.silu()?.to_dtype(x.dtype())?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        // swiglu = silu(gate) * up on the two halves of one matmul output.
+        let h = candle_nn::ops::swiglu(&self.gate_up_proj.forward(x)?)?;
+        self.down_proj.forward(&h)
     }
 }
 
@@ -773,11 +856,12 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn load(vb: VarBuilder, cfg: &ThinkerConfig) -> Result<Self> {
+    fn load(src: &ProjSource, cfg: &ThinkerConfig) -> Result<Self> {
+        let vb = &src.vb;
         let input_layernorm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let self_attn = DecoderAttention::load(vb.pp("self_attn"), cfg)?;
+        let self_attn = DecoderAttention::load(&src.pp("self_attn"), cfg)?;
         let post_attention_layernorm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
-        let mlp = DecoderMLP::load(vb.pp("mlp"), cfg.hidden_size, cfg.intermediate_size)?;
+        let mlp = DecoderMLP::load(&src.pp("mlp"), cfg.hidden_size, cfg.intermediate_size)?;
         Ok(Self { input_layernorm, self_attn, post_attention_layernorm, mlp })
     }
 
@@ -806,7 +890,7 @@ pub struct TextDecoder {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: ProjLinear,
     rotary_emb: MRoPEEmbedding,
     #[allow(dead_code)]
     device: Device,
@@ -814,16 +898,88 @@ pub struct TextDecoder {
 }
 
 impl TextDecoder {
-    fn load(vb_model: VarBuilder, vb_lm_head: VarBuilder, cfg: &ThinkerConfig, device: &Device, dtype: DType) -> Result<Self> {
+    fn load(
+        vb_model: VarBuilder,
+        vb_lm_head: VarBuilder,
+        vb_cpu: Option<(VarBuilder, VarBuilder)>,
+        cfg: &ThinkerConfig,
+        device: &Device,
+        dtype: DType,
+        quant: Quantization,
+    ) -> Result<Self> {
         let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_model.pp("embed_tokens"))?;
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::load(vb_model.pp(format!("layers.{}", i)), cfg)?);
+        let (vb_cpu_model, vb_cpu_lm_head) = match vb_cpu {
+            Some((m, l)) => (Some(m), Some(l)),
+            None => (None, None),
+        };
+        let src = ProjSource {
+            vb: vb_model.clone(),
+            vb_cpu: vb_cpu_model,
+            device: device.clone(),
+            quant,
+        };
+
+        // Quantization runs on the CPU, so spread the layers over threads.
+        let n_layers = cfg.num_hidden_layers;
+        let threads = if quant == Quantization::None {
+            1
+        } else {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8)
+        };
+        let mut layers: Vec<Option<DecoderLayer>> = (0..n_layers).map(|_| None).collect();
+        if threads <= 1 {
+            for (i, slot) in layers.iter_mut().enumerate() {
+                *slot = Some(DecoderLayer::load(&src.pp(&format!("layers.{}", i)), cfg)?);
+            }
+        } else {
+            let results: Vec<Result<(usize, DecoderLayer)>> = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for t in 0..threads {
+                    let src = src.clone();
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::new();
+                        let mut i = t;
+                        while i < n_layers {
+                            out.push(DecoderLayer::load(&src.pp(&format!("layers.{}", i)), cfg).map(|l| (i, l)));
+                            i += threads;
+                        }
+                        out
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_else(|_| vec![Err(candle_core::Error::Msg("layer load thread panicked".into()))]))
+                    .collect()
+            });
+            for r in results {
+                let (i, layer) = r?;
+                layers[i] = Some(layer);
+            }
         }
+        let layers: Vec<DecoderLayer> = layers
+            .into_iter()
+            .map(|l| l.ok_or_else(|| candle_core::Error::Msg("missing decoder layer".into())))
+            .collect::<Result<_>>()?;
 
         let norm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb_model.pp("norm"))?;
-        let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb_lm_head)?;
+        let lm_src = ProjSource {
+            vb: vb_lm_head.clone(),
+            vb_cpu: vb_cpu_lm_head,
+            device: device.clone(),
+            quant,
+        };
+        // lm_head lives at the prefix itself: load it as a single-part projection.
+        let lm_head = match (quant.ggml(), lm_src.vb_cpu.as_ref()) {
+            (Some(qdt), Some(vbc)) if cfg.hidden_size % qdt.block_size() == 0 => {
+                let w = vbc.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+                ProjLinear::Quant(QMatMul::from_qtensor(QTensor::quantize_onto(&w, qdt, device)?)?)
+            }
+            _ => {
+                let w = vb_lm_head.get((cfg.vocab_size, cfg.hidden_size), "weight")?;
+                ProjLinear::Dense(Linear::new(w, None))
+            }
+        };
         let rotary_emb = MRoPEEmbedding::new(cfg.head_dim, cfg.rope_theta, cfg.mrope_section(), device, dtype)?;
 
         Ok(Self {
@@ -895,6 +1051,8 @@ pub struct Qwen3ASRModel {
     pub max_new_tokens: usize,
     /// Which chat template to build (official by default).
     pub prompt_style: PromptStyle,
+    /// Weight format the decoder was loaded with.
+    pub quantization: Quantization,
 }
 
 /// Per-phase timing for one `transcribe_with_stats` call.
@@ -931,7 +1089,7 @@ impl TranscribeStats {
 
 impl Qwen3ASRModel {
     /// Load from a directory containing safetensors + config.json.
-    pub fn load(model_dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn load(model_dir: &Path, device: &Device, dtype: DType, quant: Quantization) -> Result<Self> {
         // Parse config
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
@@ -944,13 +1102,27 @@ impl Qwen3ASRModel {
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&safetensor_files, dtype, device)?
         };
+        // Quantized path: read projections as F32 on the CPU, quantize there,
+        // upload once (avoids a GPU round-trip per tensor).
+        let vb_cpu = if quant != Quantization::None {
+            let vbc = unsafe {
+                VarBuilder::from_mmaped_safetensors(&safetensor_files, DType::F32, &Device::Cpu)?
+            };
+            Some((vbc.pp("thinker.model"), vbc.pp("thinker.lm_head")))
+        } else {
+            None
+        };
 
         let vb_audio = vb.pp("thinker.audio_tower");
         let vb_model = vb.pp("thinker.model");
         let vb_lm_head = vb.pp("thinker.lm_head");
 
         let audio_encoder = AudioEncoder::load(vb_audio, &config.thinker_config.audio_config)?;
-        let text_decoder = TextDecoder::load(vb_model, vb_lm_head, &config.thinker_config.text_config, device, dtype)?;
+        let text_decoder = TextDecoder::load(vb_model, vb_lm_head, vb_cpu, &config.thinker_config.text_config, device, dtype, quant)?;
+        if quant != Quantization::None {
+            // Make sure every quantization round-trip has landed before we start.
+            device.synchronize()?;
+        }
 
         Ok(Self {
             audio_encoder,
@@ -960,6 +1132,7 @@ impl Qwen3ASRModel {
             dtype,
             max_new_tokens: 2048, // default, overridden by QwenEngine
             prompt_style: PromptStyle::Official,
+            quantization: quant,
         })
     }
 

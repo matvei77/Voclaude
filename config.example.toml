@@ -16,7 +16,7 @@ capitalize_first = true
 
 # Unload model after N seconds idle (saves VRAM).
 # Model also unloads immediately after each transcription.
-idle_unload_seconds = 30
+idle_unload_seconds = 60
 
 # Show OS notifications
 show_notifications = true
@@ -52,6 +52,11 @@ adaptive_max_new_tokens = true
 # can help CPU/low-VRAM systems, but may slightly hurt context across chunks.
 max_chunk_seconds = 300
 
+# Decoder weight format on the GPU: "q8_0" (default: 8-bit, same quality as
+# F16 on the 2026-09-04 bench, ~1.4x faster decode, less VRAM) or "none" (F16).
+# "q4_k" exists but lost words on long recordings; not recommended.
+quantization = "q8_0"
+
 # Require GPU (fail if CUDA unavailable)
 require_gpu = false
 
@@ -74,6 +79,7 @@ segment_max_seconds = 45
 # A pause of this length closes a segment once it is long enough (seconds).
 segment_pause_seconds = 0.5
 
-# Feed the tail of the previous segment's text to the model as context so
-# language and vocabulary carry across segment boundaries.
-segment_context = true
+# Feed the tail of the previous segment's text to the model as context.
+# Off by default: it can fix proper nouns but sometimes makes the model
+# fabricate a sentence at a segment boundary.
+segment_context = false

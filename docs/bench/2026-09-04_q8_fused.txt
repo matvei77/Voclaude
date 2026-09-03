@@ -1,0 +1,37 @@
+Loading Qwen/Qwen3-ASR-1.7B (gpu=true, prompt=Official, quant=q8_0)...
+[2m2026-09-03T22:41:22.568170Z[0m [32m INFO[0m Loading model from "C:\\Users\\matvei\\.cache\\huggingface\\hub\\models--Qwen--Qwen3-ASR-1.7B\\snapshots\\7278e1e70fe206f11671096ffdd38061171dd6e5" on Cuda(CudaDevice(DeviceId(1)))
+[2m2026-09-03T22:41:32.345977Z[0m [32m INFO[0m Model loaded in 9.78s (Q8_0 weights)
+Model loaded in 9.78s
+file                         audio_s  wall_ms    mel  encode prefill   decode   toks   tok/s    xRT    WER
+[2m2026-09-03T22:41:37.218665Z[0m [32m INFO[0m Transcription #2 complete: infer=0.45s
+audio-1772019995026.f32         10.0      452      2      33      79      338     36   106.7   22.1      -
+[2m2026-09-03T22:41:38.851430Z[0m [32m INFO[0m Transcription #3 complete: infer=1.63s
+audio-1772020028560.f32         43.1     1632      7     117     222     1285    134   104.3   26.4      -
+[2m2026-09-03T22:41:38.874496Z[0m [32m INFO[0m Audio too long (656.5s), split into 3 chunks (limit=300s)
+[2m2026-09-03T22:41:38.874540Z[0m [32m INFO[0m Transcribing chunk 1/3 (297.9s, max_new_tokens=2048)
+[2m2026-09-03T22:41:46.542878Z[0m [32m INFO[0m Transcribing chunk 2/3 (299.8s, max_new_tokens=2048)
+[2m2026-09-03T22:41:54.179016Z[0m [32m INFO[0m Transcribing chunk 3/3 (58.8s, max_new_tokens=1070)
+[2m2026-09-03T22:41:55.348544Z[0m [32m INFO[0m Transcription #4 complete: infer=16.47s
+audio-1773150920220.f32        656.5    16498    102    1786    5905     8680    756    87.1   39.8      -
+[2m2026-09-03T22:41:56.481823Z[0m [32m INFO[0m Transcription #5 complete: infer=1.13s
+audio-1773399098147.f32        122.5     1132     19     346     731       31      3    95.6  108.3      -
+[2m2026-09-03T22:41:59.221273Z[0m [32m INFO[0m Transcription #6 complete: infer=2.74s
+audio-1788381557645.f32         68.9     2739     14     192     378     2153    220   102.2   25.1      -
+[2m2026-09-03T22:42:02.905653Z[0m [32m INFO[0m Transcription #7 complete: infer=3.68s
+audio-1788420081247.f32        105.4     3684     14     292     618     2756    281   101.9   28.6      -
+[2m2026-09-03T22:42:11.736475Z[0m [32m INFO[0m Transcription #8 complete: infer=8.82s
+audio-1788421219149.f32        207.7     8831     30     573    1591     6630    606    91.4   23.5      -
+[2m2026-09-03T22:42:15.426829Z[0m [32m INFO[0m Transcription #9 complete: infer=3.68s
+audio-1788421621695.f32        143.9     3690     23     398     914     2350    231    98.3   39.0      -
+[2m2026-09-03T22:42:16.097590Z[0m [32m INFO[0m Transcription #10 complete: infer=0.67s
+audio-1788422551284.f32         18.3      670      4      59      96      511     52   101.8   27.3      -
+[2m2026-09-03T22:42:17.261751Z[0m [32m INFO[0m Transcription #11 complete: infer=1.16s
+audio-1788422585905.f32         32.6     1164      7      93     176      887     90   101.5   28.0      -
+[2m2026-09-03T22:42:20.203707Z[0m [32m INFO[0m Transcription #12 complete: infer=2.94s
+audio-1788471237661.f32         76.6     2942     12     215     408     2303    230    99.8   26.0      -
+[2m2026-09-03T22:42:31.854229Z[0m [32m INFO[0m Transcription #13 complete: infer=11.64s
+audio-1788471750664.f32        270.9    11650     39     726    2429     8447    730    86.4   23.3      -
+TOTAL audio 1756.3s, wall 55.1s (31.9x realtime), mean decode 98.3 tok/s
+Wrote ../../docs/bench/2026-09-04_q8_fused.json
+[2m2026-09-03T22:42:31.855427Z[0m [32m INFO[0m Unloading model from memory (after 13 transcriptions)
+[2m2026-09-03T22:42:31.886084Z[0m [32m INFO[0m CUDA context released

@@ -5,7 +5,7 @@
 
 use crate::audio::TARGET_SAMPLE_RATE;
 use crate::config::Config;
-use crate::inference::candle_backend::{Qwen3ASRModel, TranscribeStats};
+use crate::inference::candle_backend::{Quantization, Qwen3ASRModel, TranscribeStats};
 use crate::inference::candle_tokenizer::{PromptStyle, Qwen3ASRTokenizer};
 use crate::inference::{AsrEngine, InferenceProgress, InferenceStage};
 use candle_core::{DType, Device};
@@ -48,6 +48,8 @@ pub struct QwenEngine {
     prompt_style: PromptStyle,
     /// Per-phase timing accumulated since the last `take_stats()`.
     stats: TranscribeStats,
+    /// Decoder weight format.
+    quantization: Quantization,
 }
 
 impl QwenEngine {
@@ -83,6 +85,7 @@ impl QwenEngine {
             transcription_count: 0,
             prompt_style: PromptStyle::Official,
             stats: TranscribeStats::default(),
+            quantization: Quantization::None,
         })
     }
 
@@ -101,6 +104,8 @@ impl QwenEngine {
         } else {
             PromptStyle::Official
         };
+        engine.quantization = Quantization::parse(&config.quantization)
+            .ok_or_else(|| format!("Unknown quantization: {}", config.quantization))?;
         Ok(engine)
     }
 
@@ -446,16 +451,19 @@ impl AsrEngine for QwenEngine {
             });
         }
 
-        let tokenizer = Qwen3ASRTokenizer::load(&model_dir)
+        let tokenizer_dir = resolve_tokenizer_dir(&model_dir, &self.model_id)?;
+        let tokenizer = Qwen3ASRTokenizer::load(&tokenizer_dir)
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype)
+        // Quantized kernels only exist for the GPU path; CPU keeps dense weights.
+        let quant = if self.device.is_cuda() { self.quantization } else { Quantization::None };
+        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant)
             .map_err(|e| format!("Failed to load model: {}", e))?;
         // I-6: Wire max_new_tokens config through to the model
         model.max_new_tokens = self.max_new_tokens as usize;
         model.prompt_style = self.prompt_style;
 
         let elapsed = started.elapsed();
-        info!("Model loaded in {:.2}s", elapsed.as_secs_f64());
+        info!("Model loaded in {:.2}s ({:?} weights)", elapsed.as_secs_f64(), model.quantization);
 
         self.tokenizer = Some(tokenizer);
         self.model = Some(model);
@@ -490,7 +498,10 @@ impl AsrEngine for QwenEngine {
     }
 
     fn model_label(&self) -> String {
-        format!("candle ({})", self.model_id)
+        match self.quantization {
+            Quantization::None => format!("candle ({})", self.model_id),
+            q => format!("candle ({}, {:?})", self.model_id, q),
+        }
     }
 
     fn model_size_mb(&self) -> u64 {
@@ -653,6 +664,61 @@ fn load_wav_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     }
 
     Err("No data chunk found in WAV file".into())
+}
+
+/// Directory holding `tokenizer.json` for the model. Some snapshots (e.g.
+/// Qwen3-ASR-0.6B) ship only vocab.json/merges.txt; all Qwen3-ASR sizes share
+/// one tokenizer, so fall back to a download or to a sibling snapshot's file.
+fn resolve_tokenizer_dir(model_dir: &Path, model_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if model_dir.join("tokenizer.json").exists() {
+        return Ok(model_dir.to_path_buf());
+    }
+    // 1. Try to fetch tokenizer.json for this repo.
+    if let Ok(api) = hf_hub::api::sync::Api::new() {
+        if let Ok(path) = api.model(model_id.to_string()).get("tokenizer.json") {
+            if let Some(dir) = path.parent() {
+                info!("Downloaded tokenizer.json for {}", model_id);
+                return Ok(dir.to_path_buf());
+            }
+        }
+    }
+    // 2. Any other cached Qwen3-ASR snapshot with a tokenizer.json.
+    if let Some(cache) = dirs_for_hf_cache() {
+        if let Ok(entries) = fs::read_dir(&cache) {
+            let mut candidates: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("models--Qwen--Qwen3-ASR"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            candidates.sort();
+            for repo_dir in candidates {
+                let snapshots = repo_dir.join("snapshots");
+                if let Ok(snaps) = fs::read_dir(&snapshots) {
+                    for snap in snaps.flatten() {
+                        let dir = snap.path();
+                        if dir.join("tokenizer.json").exists() {
+                            warn!(
+                                "{} has no tokenizer.json; using the one from {}",
+                                model_id,
+                                dir.display()
+                            );
+                            return Ok(dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(format!(
+        "tokenizer.json not found for {} (looked in {} and the HuggingFace cache)",
+        model_id,
+        model_dir.display()
+    )
+    .into())
 }
 
 /// Try to find the model in the HuggingFace cache directory.

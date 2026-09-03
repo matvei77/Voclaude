@@ -45,6 +45,7 @@ struct BenchReport {
     model: String,
     gpu: bool,
     prompt_style: String,
+    quantization: String,
     load_ms: f64,
     files: Vec<FileResult>,
     total_audio_secs: f64,
@@ -74,7 +75,7 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         }
         if a.starts_with("--") {
             // Engine overrides (--cpu, --model-tier, ...) were consumed by apply_cli_overrides.
-            if matches!(a.as_str(), "--model-tier" | "--model" | "--model-dir" | "--max-new-tokens" | "--chunk-seconds") {
+            if matches!(a.as_str(), "--model-tier" | "--model" | "--model-dir" | "--max-new-tokens" | "--chunk-seconds" | "--quant") {
                 i += 2;
             } else {
                 i += 1;
@@ -101,7 +102,7 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
     }
 
     let mut engine = QwenEngine::new_with_config(config)?;
-    eprintln!("Loading {} (gpu={}, prompt={:?})...", config.model, config.use_gpu, engine.prompt_style());
+    eprintln!("Loading {} (gpu={}, prompt={:?}, quant={})...", config.model, config.use_gpu, engine.prompt_style(), config.quantization);
     let t_load = Instant::now();
     engine.prepare(None)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
@@ -254,6 +255,7 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         model: config.model.clone(),
         gpu: engine.active_gpu(),
         prompt_style: format!("{:?}", engine.prompt_style()),
+        quantization: config.quantization.clone(),
         load_ms,
         files: results,
         total_audio_secs: total_audio,
