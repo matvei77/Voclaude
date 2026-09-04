@@ -372,8 +372,15 @@ impl QwenEngine {
             .map_err(|e| format!("Failed to create HF API: {}", e))?;
         let repo = api.model(self.model_id.clone());
 
-        // Download essential files
-        for filename in &["config.json", "tokenizer.json"] {
+        // Qwen3-ASR publishes the tokenizer as separate files rather than a
+        // combined tokenizer.json. candle_tokenizer reconstructs the fast
+        // tokenizer from these components at load time.
+        for filename in &[
+            "config.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer_config.json",
+        ] {
             repo.get(filename)
                 .map_err(|e| format!("Failed to download {}: {}", filename, e))?;
         }
@@ -759,55 +766,45 @@ fn quant_cache_path(model_id: &str, quant: Quantization) -> Option<PathBuf> {
     )
 }
 
-/// Directory holding `tokenizer.json` for the model. Some snapshots (e.g.
-/// Qwen3-ASR-0.6B) ship only vocab.json/merges.txt; all Qwen3-ASR sizes share
-/// one tokenizer, so fall back to a download or to a sibling snapshot's file.
+const TOKENIZER_COMPONENTS: &[&str] = &["vocab.json", "merges.txt", "tokenizer_config.json"];
+
+fn has_tokenizer_files(model_dir: &Path) -> bool {
+    model_dir.join("tokenizer.json").is_file()
+        || TOKENIZER_COMPONENTS
+            .iter()
+            .all(|filename| model_dir.join(filename).is_file())
+}
+
+/// Return a directory containing either a combined tokenizer.json or the
+/// components published by Qwen3-ASR. Fill a partial Hugging Face cache when
+/// possible instead of borrowing a tokenizer from an unrelated snapshot.
 fn resolve_tokenizer_dir(model_dir: &Path, model_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if model_dir.join("tokenizer.json").exists() {
+    if has_tokenizer_files(model_dir) {
         return Ok(model_dir.to_path_buf());
     }
-    // 1. Try to fetch tokenizer.json for this repo.
-    if let Ok(api) = hf_hub::api::sync::Api::new() {
-        if let Ok(path) = api.model(model_id.to_string()).get("tokenizer.json") {
-            if let Some(dir) = path.parent() {
-                info!("Downloaded tokenizer.json for {}", model_id);
-                return Ok(dir.to_path_buf());
-            }
+
+    let api = hf_hub::api::sync::Api::new()
+        .map_err(|e| format!("Failed to create HF API for tokenizer files: {}", e))?;
+    let repo = api.model(model_id.to_string());
+    let mut downloaded_dir = None;
+    for filename in TOKENIZER_COMPONENTS {
+        if !model_dir.join(filename).is_file() {
+            let path = repo
+                .get(filename)
+                .map_err(|e| format!("Failed to download {} for {}: {}", filename, model_id, e))?;
+            downloaded_dir = path.parent().map(Path::to_path_buf);
         }
     }
-    // 2. Any other cached Qwen3-ASR snapshot with a tokenizer.json.
-    if let Some(cache) = dirs_for_hf_cache() {
-        if let Ok(entries) = fs::read_dir(&cache) {
-            let mut candidates: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .map(|n| n.to_string_lossy().starts_with("models--Qwen--Qwen3-ASR"))
-                        .unwrap_or(false)
-                })
-                .collect();
-            candidates.sort();
-            for repo_dir in candidates {
-                let snapshots = repo_dir.join("snapshots");
-                if let Ok(snaps) = fs::read_dir(&snapshots) {
-                    for snap in snaps.flatten() {
-                        let dir = snap.path();
-                        if dir.join("tokenizer.json").exists() {
-                            warn!(
-                                "{} has no tokenizer.json; using the one from {}",
-                                model_id,
-                                dir.display()
-                            );
-                            return Ok(dir);
-                        }
-                    }
-                }
-            }
-        }
+
+    if has_tokenizer_files(model_dir) {
+        return Ok(model_dir.to_path_buf());
     }
+    if let Some(dir) = downloaded_dir.filter(|dir| has_tokenizer_files(dir)) {
+        return Ok(dir);
+    }
+
     Err(format!(
-        "tokenizer.json not found for {} (looked in {} and the HuggingFace cache)",
+        "Tokenizer files not found for {} (looked in {})",
         model_id,
         model_dir.display()
     )
