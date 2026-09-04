@@ -1,8 +1,8 @@
 # Builds release artifacts when a tag like v0.4.0 is pushed.
 #
 # Windows: CUDA build, zipped with the CUDA runtime DLLs (same as package.ps1).
-# macOS:   Metal build (unverified as of 2026-09-04 — the code base has only
-#          been built and run on Windows; treat the macOS job as a starting point).
+# macOS:   Metal build. Compiles on macos-latest (verified 2026-09-04) but has
+#          not been run on a Mac yet; the artifact is unsigned.
 name: release
 
 on:
@@ -24,6 +24,10 @@ jobs:
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
       - name: Package
         shell: pwsh
+        env:
+          # Runners have no GPU, so candle-kernels cannot ask nvidia-smi.
+          # 7.5 = GTX 16xx / RTX 20xx; newer GPUs JIT the PTX.
+          CUDA_COMPUTE_CAP: "75"
         run: .\package.ps1
       - uses: actions/upload-artifact@v4
         with:
