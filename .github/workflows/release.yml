@@ -16,6 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1 # nvcc needs cl.exe on PATH
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
