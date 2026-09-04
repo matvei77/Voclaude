@@ -55,10 +55,10 @@ pub struct QwenEngine {
 impl QwenEngine {
     pub fn new(use_gpu: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let (device, dtype) = if use_gpu {
-            match try_cuda_device() {
+            match try_gpu_device() {
                 Ok(dev) => (dev, DType::F16),
                 Err(e) => {
-                    warn!("CUDA not available: {}; falling back to CPU", e);
+                    warn!("GPU not available: {}; falling back to CPU", e);
                     (Device::Cpu, DType::F32)
                 }
             }
@@ -66,7 +66,7 @@ impl QwenEngine {
             (Device::Cpu, DType::F32)
         };
 
-        let active_gpu = matches!(&device, Device::Cuda(_));
+        let active_gpu = !device.is_cpu();
 
         Ok(Self {
             active_gpu,
@@ -419,15 +419,15 @@ impl AsrEngine for QwenEngine {
         }
 
         // Re-initialize CUDA device if it was released by unload() and GPU is requested.
-        if self.use_gpu && !self.device.is_cuda() {
-            match try_cuda_device() {
+        if self.use_gpu && self.device.is_cpu() {
+            match try_gpu_device() {
                 Ok(device) => {
                     self.device = device;
                     self.dtype = DType::F16;
                     self.active_gpu = true;
                 }
                 Err(e) => {
-                    warn!("CUDA not available: {}; using CPU", e);
+                    warn!("GPU not available: {}; using CPU", e);
                     self.device = Device::Cpu;
                     self.dtype = DType::F32;
                     self.active_gpu = false;
@@ -436,7 +436,7 @@ impl AsrEngine for QwenEngine {
         }
 
         if self.use_gpu && self.require_gpu && !self.active_gpu {
-            return Err("CUDA is required but not available".into());
+            return Err("A GPU is required but none is available".into());
         }
 
         // CPU only: the 1.7B model decodes slower than realtime (3.5 tok/s on a
@@ -447,7 +447,7 @@ impl AsrEngine for QwenEngine {
             if let Some(cb) = progress.as_deref_mut() {
                 cb(InferenceProgress {
                     stage: InferenceStage::LoadingModel,
-                    message: "No NVIDIA GPU found: using the smaller 0.6B model on the CPU".to_string(),
+                    message: "No GPU found: using the smaller 0.6B model on the CPU".to_string(),
                 });
             }
             self.model_id = crate::config::MODEL_QWEN3_ASR_0_6B.to_string();
@@ -487,12 +487,13 @@ impl AsrEngine for QwenEngine {
         let tokenizer_dir = resolve_tokenizer_dir(&model_dir, &self.model_id)?;
         let tokenizer = Qwen3ASRTokenizer::load(&tokenizer_dir)
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-        // Quantized kernels only exist for the GPU path; CPU keeps dense weights.
-        let quant = if self.device.is_cuda() { self.quantization } else { Quantization::None };
+        // Q8_0 QMatMul runs on every Candle backend (CUDA, Metal, and CPU via
+        // AVX2/NEON dot products), so the requested quantization applies everywhere.
+        let quant = self.quantization;
         let cache_path = quant_cache_path(&self.model_id, quant);
         let mut model = match Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant, cache_path.as_deref()) {
             Ok(m) => m,
-            Err(e) if self.device.is_cuda() && Self::is_cuda_oom(&e.to_string()) && self.model_id.contains("1.7B") => {
+            Err(e) if !self.device.is_cpu() && Self::is_cuda_oom(&e.to_string()) && self.model_id.contains("1.7B") => {
                 // Small GPU: the 1.7B model does not fit. Drop to the 0.6B model.
                 warn!("GPU out of memory loading {}; switching to Qwen/Qwen3-ASR-0.6B", self.model_id);
                 if let Some(cb) = progress.as_deref_mut() {
@@ -539,7 +540,7 @@ impl AsrEngine for QwenEngine {
             self.device = Device::Cpu;
             self.active_gpu = false;
             self.transcription_count = 0;
-            info!("CUDA context released");
+            info!("GPU context released");
         }
     }
 
@@ -716,11 +717,12 @@ fn load_wav_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     Err("No data chunk found in WAV file".into())
 }
 
-/// Create the CUDA device, but only if the driver and cuBLAS libraries can be
-/// loaded: with runtime loading, cudarc panics (instead of erroring) when a
-/// library is missing, which would kill the worker process on machines
-/// without an NVIDIA driver.
-fn try_cuda_device() -> Result<Device, String> {
+/// Create the GPU device: CUDA when built with the `cuda` feature, Metal with
+/// the `metal` feature. CUDA is only attempted if the driver and cuBLAS
+/// libraries can be loaded: with runtime loading, cudarc panics (instead of
+/// erroring) when a library is missing, which would kill the worker process on
+/// machines without an NVIDIA driver.
+fn try_gpu_device() -> Result<Device, String> {
     #[cfg(feature = "cuda")]
     {
         use candle_core::cuda_backend::cudarc;
@@ -734,8 +736,14 @@ fn try_cuda_device() -> Result<Device, String> {
         if !cublas || !cublaslt {
             return Err("cuBLAS runtime DLLs not found next to voclaude.exe".to_string());
         }
+        Device::new_cuda(0).map_err(|e| e.to_string())
     }
-    Device::new_cuda(0).map_err(|e| e.to_string())
+    #[cfg(not(feature = "cuda"))]
+    {
+        // Metal when compiled with the `metal` feature; otherwise candle
+        // reports that no GPU backend was built in.
+        Device::new_metal(0).map_err(|e| format!("no GPU backend in this build: {}", e))
+    }
 }
 
 /// Where the quantized projections of `model_id` are cached

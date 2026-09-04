@@ -178,7 +178,7 @@ impl ProjLinear {
         match self {
             Self::Dense(l) => l.forward(x),
             Self::Quant { q, .. } => {
-                // The CUDA quantized kernels take f32 activations.
+                // The quantized kernels (CUDA, Metal, CPU) take f32 activations.
                 let in_dtype = x.dtype();
                 let x = if in_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
                 let y = q.forward(&x)?;
