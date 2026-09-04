@@ -33,9 +33,10 @@ To start it with Windows: press Win+R, type `shell:startup`, and put a shortcut 
 ### Requirements (download)
 
 - Windows 10/11, 64-bit.
-- **Best experience:** an NVIDIA GPU with 6 GB or more VRAM and a driver from 2025 or newer
-  (CUDA 13 runtime; nothing else to install — the zip bundles the CUDA DLLs). On a GPU with
-  less memory the app automatically switches to the smaller 0.6B model.
+- **Best experience:** an NVIDIA GPU from the GTX 16xx / RTX 20xx generation or newer with
+  6 GB or more VRAM, and a driver from 2025 or newer (CUDA 13 runtime; nothing else to install —
+  the zip bundles the CUDA DLLs). On a GPU with less memory the app automatically switches to
+  the smaller 0.6B model.
 - **No NVIDIA GPU:** it still works on the CPU, but transcription is far slower than
   realtime (see `docs/bench/README.md`), so long dictations will finish long after you stop.
   Set `model_tier = "fast"` in the config to use the 0.6B model on CPU.

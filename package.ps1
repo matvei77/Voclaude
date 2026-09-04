@@ -20,6 +20,11 @@ $Version     = (Select-String -Path (Join-Path $ProjectRoot "Cargo.toml") -Patte
 $GitHash     = (git -C $ProjectRoot rev-parse --short=8 HEAD 2>$null)
 if (-not $GitHash) { $GitHash = "unknown" }
 
+# Build CUDA kernels for compute capability 7.5 (GTX 16xx / RTX 20xx) unless
+# told otherwise; newer GPUs JIT the PTX. Without this, candle-kernels asks
+# nvidia-smi and targets only the build machine's GPU generation.
+if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = "75" }
+
 if ($Cpu) {
     $Variant = "cpu"
     Write-Host "Building Voclaude v$Version (CPU-only)..." -ForegroundColor Cyan
