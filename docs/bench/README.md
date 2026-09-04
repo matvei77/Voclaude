@@ -28,6 +28,13 @@ the Russian passage comes out as "если я сейчас пириду на р�
 (The 0.6B model also needed two loader fixes today: tokenizer.json fallback and an o_proj shape that
 is not hidden×hidden.)
 
+### CPU only (no NVIDIA GPU), F32, this desktop's CPU
+
+| Model | Speed | Decode |
+|---|---|---|
+| Qwen3-ASR-1.7B | 0.9x realtime | 3.5 tok/s — slower than speech, not usable for dictation |
+| Qwen3-ASR-0.6B | 2.3x realtime | 10 tok/s — keeps up with speech; the app switches to it automatically when no GPU is found |
+
 ### Model bake-off: Whisper large-v3-turbo (`--engine whisper`, F32, 30 s windows, per-window language detection)
 
 | | Qwen3-ASR-1.7B Q8_0 | Whisper large-v3-turbo |

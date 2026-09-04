@@ -55,10 +55,10 @@ pub struct QwenEngine {
 impl QwenEngine {
     pub fn new(use_gpu: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let (device, dtype) = if use_gpu {
-            match Device::new_cuda(0) {
+            match try_cuda_device() {
                 Ok(dev) => (dev, DType::F16),
                 Err(e) => {
-                    warn!("CUDA not available: {}, falling back to CPU", e);
+                    warn!("CUDA not available: {}; falling back to CPU", e);
                     (Device::Cpu, DType::F32)
                 }
             }
@@ -420,21 +420,37 @@ impl AsrEngine for QwenEngine {
 
         // Re-initialize CUDA device if it was released by unload() and GPU is requested.
         if self.use_gpu && !self.device.is_cuda() {
-            match Device::new_cuda(0) {
+            match try_cuda_device() {
                 Ok(device) => {
                     self.device = device;
                     self.dtype = DType::F16;
                     self.active_gpu = true;
                 }
                 Err(e) => {
-                    warn!("Failed to reinitialize CUDA: {}", e);
-                    // Fall through to CPU
+                    warn!("CUDA not available: {}; using CPU", e);
+                    self.device = Device::Cpu;
+                    self.dtype = DType::F32;
+                    self.active_gpu = false;
                 }
             }
         }
 
         if self.use_gpu && self.require_gpu && !self.active_gpu {
             return Err("CUDA is required but not available".into());
+        }
+
+        // CPU only: the 1.7B model decodes slower than realtime (3.5 tok/s on a
+        // desktop CPU); the 0.6B model keeps up with speech (10 tok/s). Switch
+        // unless the user pointed at an explicit local model directory.
+        if !self.active_gpu && self.model_id.contains("1.7B") && self.model_path.is_none() {
+            warn!("No GPU: using Qwen/Qwen3-ASR-0.6B instead of {} for speed", self.model_id);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(InferenceProgress {
+                    stage: InferenceStage::LoadingModel,
+                    message: "No NVIDIA GPU found: using the smaller 0.6B model on the CPU".to_string(),
+                });
+            }
+            self.model_id = crate::config::MODEL_QWEN3_ASR_0_6B.to_string();
         }
 
         if let Some(cb) = progress.as_deref_mut() {
@@ -444,6 +460,18 @@ impl AsrEngine for QwenEngine {
             });
         }
 
+        if self.model_path.is_none() && resolve_hf_cache(&self.model_id).is_none() {
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(InferenceProgress {
+                    stage: InferenceStage::LoadingModel,
+                    message: format!(
+                        "Downloading {} ({} MB, first run only)...",
+                        self.model_id.rsplit('/').next().unwrap_or(&self.model_id),
+                        self.model_size_mb()
+                    ),
+                });
+            }
+        }
         let model_dir = self.resolve_model_dir()?;
         let started = Instant::now();
 
@@ -462,8 +490,24 @@ impl AsrEngine for QwenEngine {
         // Quantized kernels only exist for the GPU path; CPU keeps dense weights.
         let quant = if self.device.is_cuda() { self.quantization } else { Quantization::None };
         let cache_path = quant_cache_path(&self.model_id, quant);
-        let mut model = Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant, cache_path.as_deref())
-            .map_err(|e| format!("Failed to load model: {}", e))?;
+        let mut model = match Qwen3ASRModel::load(&model_dir, &self.device, self.dtype, quant, cache_path.as_deref()) {
+            Ok(m) => m,
+            Err(e) if self.device.is_cuda() && Self::is_cuda_oom(&e.to_string()) && self.model_id.contains("1.7B") => {
+                // Small GPU: the 1.7B model does not fit. Drop to the 0.6B model.
+                warn!("GPU out of memory loading {}; switching to Qwen/Qwen3-ASR-0.6B", self.model_id);
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(InferenceProgress {
+                        stage: InferenceStage::LoadingModel,
+                        message: "GPU memory too small for the 1.7B model; using the 0.6B model".to_string(),
+                    });
+                }
+                self.unload();
+                self.model_id = crate::config::MODEL_QWEN3_ASR_0_6B.to_string();
+                self.model_path = None;
+                return self.prepare(progress);
+            }
+            Err(e) => return Err(format!("Failed to load model: {}", e).into()),
+        };
         // I-6: Wire max_new_tokens config through to the model
         model.max_new_tokens = self.max_new_tokens as usize;
         model.prompt_style = self.prompt_style;
@@ -670,6 +714,28 @@ fn load_wav_file(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     }
 
     Err("No data chunk found in WAV file".into())
+}
+
+/// Create the CUDA device, but only if the driver and cuBLAS libraries can be
+/// loaded: with runtime loading, cudarc panics (instead of erroring) when a
+/// library is missing, which would kill the worker process on machines
+/// without an NVIDIA driver.
+fn try_cuda_device() -> Result<Device, String> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::cuda_backend::cudarc;
+        // SAFETY: these only attempt to load shared libraries.
+        let driver = unsafe { cudarc::driver::sys::is_culib_present() };
+        if !driver {
+            return Err("NVIDIA driver (nvcuda.dll) not found".to_string());
+        }
+        let cublas = unsafe { cudarc::cublas::sys::is_culib_present() };
+        let cublaslt = unsafe { cudarc::cublaslt::sys::is_culib_present() };
+        if !cublas || !cublaslt {
+            return Err("cuBLAS runtime DLLs not found next to voclaude.exe".to_string());
+        }
+    }
+    Device::new_cuda(0).map_err(|e| e.to_string())
 }
 
 /// Where the quantized projections of `model_id` are cached

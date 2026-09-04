@@ -1,0 +1,60 @@
+# Builds release artifacts when a tag like v0.4.0 is pushed.
+#
+# Windows: CUDA build, zipped with the CUDA runtime DLLs (same as package.ps1).
+# macOS:   Metal build (unverified as of 2026-09-04 — the code base has only
+#          been built and run on Windows; treat the macOS job as a starting point).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.8.0"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+      - name: Package
+        shell: pwsh
+        run: .\package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voclaude-windows
+          path: dist/*.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+
+  macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (Metal)
+        run: cargo build --release --no-default-features --features metal
+      - name: Package
+        run: |
+          mkdir -p dist/voclaude-macos
+          cp target/release/voclaude dist/voclaude-macos/
+          cp config.example.toml README.md dist/voclaude-macos/
+          (cd dist && zip -r voclaude-macos.zip voclaude-macos)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voclaude-macos
+          path: dist/voclaude-macos.zip
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/voclaude-macos.zip

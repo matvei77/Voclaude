@@ -21,22 +21,25 @@ Press a hotkey, speak, and your words are instantly transcribed and copied to yo
 
 ## Quick Start (download)
 
-If someone gave you a `voclaude-vX.Y.Z-gpu.zip`:
+1. Download `voclaude-vX.Y.Z-<hash>-gpu.zip` from the [Releases](https://github.com/matvei77/Voclaude/releases) page.
+2. Unzip it anywhere (for example `C:\Voclaude`) and run `voclaude.exe`. A tray icon appears.
+3. Press **F4**, speak, press **F4** again. The text is on your clipboard; paste it with Ctrl+V.
 
-1. **Unzip** the archive anywhere (e.g. `C:\Voclaude\`)
-2. **Run** `voclaude.exe` — it appears in your system tray
-3. **Press F4** to record, **F4 again** to stop — transcription is copied to your clipboard
-4. **Paste** (Ctrl+V) anywhere
+On the first run the app downloads the model (about 3.4 GB) from Hugging Face; the tray/HUD shows
+"Downloading ... first run only" while it does. Later starts load in about 1.5 s.
 
-The ASR model (~4.5 GB) downloads automatically from Hugging Face on first use. After that, everything works offline.
+To start it with Windows: press Win+R, type `shell:startup`, and put a shortcut to `voclaude.exe` there.
 
 ### Requirements (download)
 
-- **Windows 10/11** (64-bit)
-- **NVIDIA GPU** with recent drivers (the zip includes CUDA runtime DLLs, no toolkit install needed)
-- ~4.5 GB free disk space for the model
-
-For CPU-only builds (no NVIDIA GPU needed), ask for the `-cpu` zip or build from source (see below).
+- Windows 10/11, 64-bit.
+- **Best experience:** an NVIDIA GPU with 6 GB or more VRAM and a driver from 2025 or newer
+  (CUDA 13 runtime; nothing else to install — the zip bundles the CUDA DLLs). On a GPU with
+  less memory the app automatically switches to the smaller 0.6B model.
+- **No NVIDIA GPU:** it still works on the CPU, but transcription is far slower than
+  realtime (see `docs/bench/README.md`), so long dictations will finish long after you stop.
+  Set `model_tier = "fast"` in the config to use the 0.6B model on CPU.
+- Microphone. Windows: Settings → Privacy → Microphone → allow desktop apps.
 
 ## Quick Start (build from source)
 
