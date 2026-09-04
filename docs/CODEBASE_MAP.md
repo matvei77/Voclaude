@@ -122,6 +122,7 @@ Voclaude/
 | File | Purpose | Tokens |
 |------|---------|--------|
 | `src/app.rs` | Event loop, state machine, inference worker | 7,698 |
+| `src/api.rs` | Local HTTP API on 127.0.0.1 (OpenAI-compatible `/v1/audio/transcriptions`), media decoding, `voclaude transcribe` CLI | - |
 | `src/main.rs` | CLI args, logging init, app dispatch | 2,193 |
 
 **Key types**: `App`, `AppState` (Idle/Recording/Transcribing), `AppEvent`, `InferenceCommand`, `NotificationManager`

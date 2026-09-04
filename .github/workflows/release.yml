@@ -1,10 +1,11 @@
 # Builds release artifacts when a tag like v0.4.0 is pushed.
 #
 # Windows: CUDA build, zipped with the CUDA runtime DLLs (same as package.ps1).
-#          STATUS 2026-09-04: not working yet on hosted runners. CUDA 12.6 cannot
-#          compile candle-kernels' bf16 MoE kernel at compute 7.5, and the
-#          Jimver action's CUDA 13.0 install fails. Release zips are built
-#          locally with package.ps1 (CUDA 13.1) until this is sorted out.
+#          STATUS 2026-09-04 (evening): candle-kernels is now vendored without
+#          the bf16 MoE kernels (vendor/candle-kernels), so compute 7.5 builds
+#          with any CUDA 12.x/13.x toolkit. The Jimver CUDA 13.0 install still
+#          failed last time; release zips and installers are built locally with
+#          `package.ps1 -Installer` (CUDA 13.1) until the hosted job is verified.
 # macOS:   Metal build. Compiles on macos-latest (verified 2026-09-04) but has
 #          not been run on a Mac yet; the artifact is unsigned.
 name: release

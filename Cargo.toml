@@ -52,6 +52,9 @@ num-traits = "0.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
 
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"      # embeds assets/icon.ico into voclaude.exe
+
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 notify-rust = "4.11"
 
@@ -74,4 +77,8 @@ opt-level = 1              # Faster dev builds but not painfully slow
 # candle-core with cudarc "dynamic-loading": CUDA DLLs are loaded on first
 # GPU use instead of at process start, so the tray process never maps them.
 candle-core = { path = "vendor/candle-core" }
+# candle-kernels without the MoE kernels: those need bf16 tensor-core fragments
+# (compute 8.0+) and Voclaude does not use them, so they are stubbed to let the
+# PTX build target compute 7.5 (GTX 16xx / RTX 20xx).
+candle-kernels = { path = "vendor/candle-kernels" }
 float8 = { path = "vendor/float8" }

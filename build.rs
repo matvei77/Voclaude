@@ -28,4 +28,17 @@ fn main() {
         println!("cargo:rustc-link-search=native={}/lib/x64", cuda);
     }
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+
+    // Application icon for Explorer, the taskbar and the installer (Windows only).
+    #[cfg(target_os = "windows")]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        res.set("ProductName", "Voclaude");
+        res.set("FileDescription", "Voclaude voice input");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=icon not embedded: {}", e);
+        }
+        println!("cargo:rerun-if-changed=assets/icon.ico");
+    }
 }

@@ -21,9 +21,10 @@ Press a hotkey, speak, and your words are instantly transcribed and copied to yo
 
 ## Quick Start (download)
 
-1. Download `voclaude-vX.Y.Z-<hash>-gpu.zip` from the [Releases](https://github.com/matvei77/Voclaude/releases) page.
-2. Unzip it anywhere (for example `C:\Voclaude`) and run `voclaude.exe`. A tray icon appears.
-3. Press **F4**, speak, press **F4** again. The text is on your clipboard; paste it with Ctrl+V.
+1. Download `voclaude-vX.Y.Z-gpu-setup.exe` from the [Releases](https://github.com/matvei77/Voclaude/releases) page and run it.
+   It installs for the current user (no admin prompt), can start with Windows, and launches the app. A tray icon appears.
+   Prefer no installer? `voclaude-vX.Y.Z-<hash>-gpu.zip` unzips anywhere; run `voclaude.exe` from the folder.
+2. Press **F4**, speak, press **F4** again. The text is on your clipboard; paste it with Ctrl+V.
 
 On the first run the app downloads the model (about 3.4 GB) from Hugging Face; the tray/HUD shows
 "Downloading ... first run only" while it does. Later starts load in about 1.5 s.

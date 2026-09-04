@@ -8,7 +8,8 @@
 #   dist\voclaude-gpu.zip    or    dist\voclaude-cpu.zip
 
 param(
-    [switch]$Cpu
+    [switch]$Cpu,
+    [switch]$Installer   # also build dist\voclaude-vX.Y.Z-<variant>-setup.exe with Inno Setup
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,19 @@ if (-not $GitHash) { $GitHash = "unknown" }
 # told otherwise; newer GPUs JIT the PTX. Without this, candle-kernels asks
 # nvidia-smi and targets only the build machine's GPU generation.
 if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = "75" }
+
+# nvcc needs MSVC's cl.exe on PATH; find it through vswhere when the shell
+# is not a Visual Studio developer prompt.
+if (-not $Cpu -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+    $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $VsWhere) {
+        $Cl = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" | Select-Object -First 1
+        if ($Cl) {
+            $env:PATH = (Split-Path $Cl) + ";" + $env:PATH
+            Write-Host "Using MSVC compiler: $Cl" -ForegroundColor DarkGray
+        }
+    }
+}
 
 if ($Cpu) {
     $Variant = "cpu"
@@ -201,6 +215,30 @@ $FileCount = (Get-ChildItem $StageDir).Count
 
 Write-Host "`nPackaged $FileCount files -> $ZipName ($([math]::Round($ZipSize, 1)) MB)" -ForegroundColor Green
 Write-Host "Location: $ZipPath" -ForegroundColor Green
+
+# One-click installer (Inno Setup 6). Per-user install, no admin prompt,
+# optional "start with Windows", launches the app when done.
+if ($Installer) {
+    $IsccCandidates = @(
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+    )
+    $Iscc = $IsccCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $Iscc) {
+        Write-Host "Inno Setup 6 not found (winget install JRSoftware.InnoSetup); skipping installer." -ForegroundColor Yellow
+    } else {
+        Write-Host "`nBuilding installer..." -ForegroundColor Cyan
+        & $Iscc /Q "/DAppVersion=$Version" "/DStageDir=$StageDir" "/DOutputDir=$DistDir" "/DVariant=$Variant" (Join-Path $ProjectRoot "installer\voclaude.iss")
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Installer build failed." -ForegroundColor Red
+            exit 1
+        }
+        $SetupPath = Join-Path $DistDir "voclaude-v$Version-$Variant-setup.exe"
+        $SetupSize = (Get-Item $SetupPath).Length / 1MB
+        Write-Host "Installer: $SetupPath ($([math]::Round($SetupSize, 1)) MB)" -ForegroundColor Green
+    }
+}
 
 # Cleanup staging dir
 Remove-Item -Recurse -Force $StageDir
