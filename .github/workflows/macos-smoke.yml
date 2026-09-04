@@ -11,6 +11,10 @@ on:
   push:
     branches: ["metal-smoke"]
 
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   metal:
     runs-on: macos-latest # arm64 (Apple Silicon) since macos-14
@@ -58,11 +62,11 @@ jobs:
 
       - name: Transcripts
         if: always()
-        run: for f in jfk.*.hyp.txt; do echo "== $f"; cat "$f"; echo; done
+        run: shopt -s nullglob; for f in jfk.*.hyp.txt; do echo "== $f"; cat "$f"; echo; done
 
       - name: Results
         if: always()
-        run: for f in *.json; do echo "== $f"; cat "$f"; echo; done
+        run: shopt -s nullglob; for f in *.json; do echo "== $f"; cat "$f"; echo; done
 
       - uses: actions/upload-artifact@v4
         if: always()
