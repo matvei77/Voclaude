@@ -37,9 +37,9 @@ To start it with Windows: press Win+R, type `shell:startup`, and put a shortcut 
   6 GB or more VRAM, and a driver from 2025 or newer (CUDA 13 runtime; nothing else to install —
   the zip bundles the CUDA DLLs). On a GPU with less memory the app automatically switches to
   the smaller 0.6B model.
-- **No NVIDIA GPU:** it still works on the CPU, but transcription is far slower than
-  realtime (see `docs/bench/README.md`), so long dictations will finish long after you stop.
-  Set `model_tier = "fast"` in the config to use the 0.6B model on CPU.
+- **No NVIDIA GPU:** it still works on the CPU with Q8 weights: about 2x realtime for the
+  1.7B model and 3.4x for 0.6B on a desktop CPU (see `docs/bench/README.md`), which keeps up
+  with speech because segments are transcribed while you talk. Needs a CPU with AVX2 (2013+).
 - Microphone. Windows: Settings → Privacy → Microphone → allow desktop apps.
 
 ## Quick Start (build from source)
@@ -111,6 +111,20 @@ sudo apt install libasound2-dev libgtk-3-dev libayatana-appindicator3-dev \
 ### Tray Menu
 
 Right-click the tray icon for: Show History, Open Last Transcript, Open Transcripts Folder, Recover Last Recording, Settings, Quit.
+
+## Local API (for scripts and agents)
+
+While the app runs it serves `http://127.0.0.1:7770/v1/audio/transcriptions`, an
+OpenAI-compatible transcription endpoint that decodes audio and video files
+(wav, mp3, flac, ogg, m4a/mp4/mov, mkv; anything else via `ffmpeg` if installed)
+and uses the same loaded model as dictation:
+
+```
+voclaude transcribe meeting.mp4            # prints the text
+curl -F file=@clip.wav http://127.0.0.1:7770/v1/audio/transcriptions
+```
+
+See [docs/API.md](docs/API.md). Disable with `api_enabled = false`.
 
 ## Configuration
 

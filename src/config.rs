@@ -124,6 +124,17 @@ pub struct Config {
     /// also injected fabricated sentences at segment boundaries.
     #[serde(default)]
     pub segment_context: bool,
+
+    /// Serve the local HTTP API (127.0.0.1 only) so other programs can transcribe files.
+    #[serde(default = "default_api_enabled")]
+    pub api_enabled: bool,
+
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+
+    /// Optional bearer token required by the API; empty or absent means no auth.
+    #[serde(default)]
+    pub api_token: Option<String>,
 }
 
 impl Default for Config {
@@ -155,6 +166,9 @@ impl Default for Config {
             segment_max_seconds: default_segment_max_seconds(),
             segment_pause_seconds: default_segment_pause_seconds(),
             segment_context: false,
+            api_enabled: default_api_enabled(),
+            api_port: default_api_port(),
+            api_token: None,
         }
     }
 }
@@ -233,6 +247,9 @@ impl Config {
         }
         if self.idle_unload_seconds == 0 {
             return Err("idle_unload_seconds must be > 0".into());
+        }
+        if self.api_enabled && self.api_port == 0 {
+            return Err("api_port must be between 1 and 65535".into());
         }
         if self.history_max_entries == 0 {
             return Err("history_max_entries must be > 0".into());
@@ -509,6 +526,14 @@ fn default_segment_min_seconds() -> f32 {
 
 fn default_segment_max_seconds() -> f32 {
     45.0
+}
+
+fn default_api_enabled() -> bool {
+    true
+}
+
+fn default_api_port() -> u16 {
+    7770
 }
 
 fn default_segment_pause_seconds() -> f32 {

@@ -41,6 +41,9 @@ impl Quantization {
 
 /// A linear layer that is either dense (F16 matmul) or block-quantized
 /// (candle's CUDA ggml kernels: int8 dot products for decode, q8_1 GEMM for prefill).
+/// On the CPU, inputs with more rows than this use a dequantized F32 GEMM.
+const CPU_DEQUANT_MIN_ROWS: usize = 8;
+
 enum ProjLinear {
     Dense(Linear),
     Quant { name: String, q: QMatMul },
@@ -181,7 +184,17 @@ impl ProjLinear {
                 // The quantized kernels (CUDA, Metal, CPU) take f32 activations.
                 let in_dtype = x.dtype();
                 let x = if in_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
-                let y = q.forward(&x)?;
+                let rows: usize = x.dims()[..x.rank() - 1].iter().product();
+                let y = match q {
+                    // candle's CPU quantized matmul is a per-row dot-product loop: fast for
+                    // single-token decode, but several times slower than the blocked F32 GEMM
+                    // for prefill. Dequantize for multi-row inputs; the extra memory traffic
+                    // is small next to the GEMM itself.
+                    QMatMul::QTensor(t) if x.device().is_cpu() && rows > CPU_DEQUANT_MIN_ROWS => {
+                        QMatMul::Tensor(t.dequantize(x.device())?).forward(&x)?
+                    }
+                    q => q.forward(&x)?,
+                };
                 if in_dtype == DType::F32 { Ok(y) } else { y.to_dtype(in_dtype) }
             }
         }

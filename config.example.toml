@@ -83,3 +83,10 @@ segment_pause_seconds = 0.5
 # Off by default: it can fix proper nouns but sometimes makes the model
 # fabricate a sentence at a segment boundary.
 segment_context = false
+
+# Local HTTP API (127.0.0.1 only). Other programs and agents can POST files to
+# http://127.0.0.1:7770/v1/audio/transcriptions (OpenAI-compatible), or run
+# `voclaude transcribe <file>`. Leave api_token empty for no authentication.
+api_enabled = true
+api_port = 7770
+# api_token = "change-me"

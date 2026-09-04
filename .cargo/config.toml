@@ -15,3 +15,11 @@ CMAKE_GENERATOR = "Ninja"
 # Linux typically auto-detects CUDA at /usr/local/cuda
 # Uncomment if you have CUDA in a non-standard location:
 # CUDA_PATH = "/usr/local/cuda"
+
+# Quantized (Q8_0) CPU inference uses candle's AVX2 dot products, which are
+# selected at compile time. Every x86-64 CPU since 2013 has AVX2+FMA.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+fma"]

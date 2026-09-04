@@ -3,6 +3,7 @@
 //!
 //! Local-first, GPU-accelerated speech-to-text that runs in your system tray.
 
+mod api;
 mod app;
 mod audio;
 mod bench;
@@ -74,6 +75,12 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+
+    // `voclaude transcribe <file>...`: client for the local API of a running app
+    if args.len() > 1 && args[1] == "transcribe" {
+        attach_console_for_cli();
+        std::process::exit(api::cli_transcribe(&args[2..]));
     }
 
     if args.iter().any(|a| a == "--list-models") {

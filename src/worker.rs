@@ -46,6 +46,14 @@ pub enum InferenceCommand {
         use_context: bool,
     },
     TranscribeFile(PathBuf),
+    /// API: transcribe samples `[start, end)` of a 16 kHz f32 file; the answer
+    /// goes back on `reply` instead of the app event channel.
+    TranscribeRange {
+        path: PathBuf,
+        start: usize,
+        end: usize,
+        reply: Sender<Result<String, String>>,
+    },
     /// Settings changed: use this config for the next worker start. A running
     /// idle worker is stopped so the change takes effect on the next recording.
     UpdateConfig(Config),
@@ -551,6 +559,43 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                         fail("inference worker timed out".to_string());
                     }
                 }
+            }
+            InferenceCommand::TranscribeRange { path, start, end, reply } => {
+                if let Err(e) = ensure_child(&mut child, &config) {
+                    let _ = reply.send(Err(format!("worker start failed: {}", e)));
+                    continue;
+                }
+                let c = child.as_mut().unwrap();
+                let cmd = WireCommand::Segment {
+                    session_id: "api".to_string(),
+                    index: 0,
+                    path,
+                    start,
+                    end,
+                    use_context: false,
+                };
+                if let Err(e) = c.send(&cmd) {
+                    c.kill();
+                    child = None;
+                    let _ = reply.send(Err(format!("worker send failed: {}", e)));
+                    continue;
+                }
+                let result = match wait_for(c, &event_tx, &shutdown, SEGMENT_TIMEOUT, |ev| matches!(ev, WireEvent::Segment { .. })) {
+                    Wait::Done(WireEvent::Segment { ok, text, error, .. }) => {
+                        if ok { Ok(text.unwrap_or_default()) } else { Err(error.unwrap_or_else(|| "unknown worker error".into())) }
+                    }
+                    Wait::Done(_) => Err("unexpected worker reply".to_string()),
+                    Wait::Died => {
+                        child = None;
+                        Err("inference worker exited unexpectedly".to_string())
+                    }
+                    Wait::Timeout => {
+                        c.kill();
+                        child = None;
+                        Err("inference worker timed out".to_string())
+                    }
+                };
+                let _ = reply.send(result);
             }
             InferenceCommand::TranscribeFile(path) => {
                 let fail = |msg: String| {

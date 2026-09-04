@@ -68,6 +68,19 @@ pub enum AppEvent {
     },
     /// Tray: re-run whatever the last recording is still missing
     RecoverLastRecording,
+    /// API: transcribe samples `[start, end)` of a 16 kHz f32 file; reply on the channel
+    ApiTranscribeRange {
+        path: PathBuf,
+        start: usize,
+        end: usize,
+        reply: Sender<Result<String, String>>,
+    },
+    /// API: a file finished; record it in history
+    ApiTranscribed {
+        source: String,
+        text: String,
+        sample_count: usize,
+    },
 }
 
 /// Application state
@@ -343,6 +356,19 @@ impl App {
         let (mut inference_tx, mut inference_handle) =
             Self::spawn_inference_worker(self.event_tx.clone(), self.config.clone(), inference_shutdown.clone());
         info!("Inference worker ready (model will load on first use)");
+
+        // Local HTTP API for other programs (127.0.0.1 only).
+        let mut api_server = if self.config.api_enabled {
+            match crate::api::ApiServer::start(&self.config, self.event_tx.clone()) {
+                Ok(server) => Some(server),
+                Err(e) => {
+                    warn!("API server not started: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Clipboard
         let mut clipboard = arboard::Clipboard::new()?;
@@ -1242,6 +1268,30 @@ impl App {
                                 warn!("Failed to open transcripts folder: {}", err);
                             }
                         }
+                        AppEvent::ApiTranscribeRange { path, start, end, reply } => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
+                            let cmd = InferenceCommand::TranscribeRange { path, start, end, reply };
+                            if let Err(err) = inference_tx.try_send(cmd) {
+                                use crossbeam_channel::TrySendError;
+                                let (msg, cmd) = match err {
+                                    TrySendError::Full(c) => ("inference queue is full, retry shortly".to_string(), c),
+                                    TrySendError::Disconnected(c) => ("inference worker is unavailable".to_string(), c),
+                                };
+                                if let InferenceCommand::TranscribeRange { reply, .. } = cmd {
+                                    let _ = reply.send(Err(msg));
+                                }
+                            }
+                        }
+                        AppEvent::ApiTranscribed { source, text, sample_count } => {
+                            info!("API transcribed {} ({} chars)", source, text.len());
+                            if !text.trim().is_empty() {
+                                let meta = AudioMetadata::from_samples(sample_count, TARGET_SAMPLE_RATE);
+                                if let Err(e) = history.append(text, Some(meta), None) {
+                                    warn!("Failed to record API transcription in history: {}", e);
+                                }
+                            }
+                        }
                         AppEvent::Quit => {
                             last_activity = Instant::now();
                             idle_unload_requested = false;
@@ -1315,6 +1365,9 @@ impl App {
             }
         }
 
+        if let Some(mut server) = api_server.take() {
+            server.stop();
+        }
         drop(inference_tx); // Close channel so worker exits iter() loop
         info!("Waiting for inference worker to shut down...");
         if let Err(e) = inference_handle.join() {

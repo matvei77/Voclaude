@@ -79,3 +79,40 @@ Details:
 - Kill test: process killed 48 s into a recording; on relaunch the two finished
   segments were reused, the tail was segmented and transcribed, clipboard
   ready 2.4 s after launch including model load.
+
+## 2026-09-04 (evening): Q8_0 on CPU and Metal
+
+`cargo build --release --no-default-features --features cpu` with
+`RUSTFLAGS="-C target-feature=+avx2,+fma"`, 3 files from the set (158 s of
+audio), i5-13600K, 20 threads. Quantization now applies on every backend;
+multi-row (prefill) inputs use a dequantized F32 GEMM on the CPU because
+candle's quantized CPU matmul is a per-row loop that is only fast for decode.
+
+| Model | Weights | Decode tok/s | Whole pipeline | Text vs F32 |
+|---|---|---|---|---|
+| 1.7B | F32 dense (before) | 3.2 | 0.9x realtime | - |
+| 1.7B | Q8_0 | **13.9** | **2.3x realtime** | punctuation-level diffs on 1 of 3 files |
+| 0.6B | F32 dense (before) | 8.2 | 1.9x | - |
+| 0.6B | Q8_0 | **23.9** | **3.4x** | punctuation-level diffs on 1 of 3 files |
+
+Q8_0 without the prefill fix: 13.0 tok/s decode but prefill 3.5x slower, 1.3x
+realtime overall. Limiting rayon to the 6 P-cores made everything slower
+(1.0x), so the E-cores help. With streaming, anything above ~1.5x keeps up
+with speech, so the 1.7B model is now usable without a GPU on a desktop CPU.
+
+### Apple Silicon (GitHub `macos-latest` runner: Apple M1 virtual, 3 cores, 7.5 GB)
+
+`.github/workflows/macos-smoke.yml`, whisper.cpp's 11 s `jfk.wav`, Metal
+device wired in `try_gpu_device()`. Transcripts correct on every run.
+
+| Model | Device | Weights | Decode tok/s | Whole pipeline |
+|---|---|---|---|---|
+| 1.7B | Metal | Q8_0 | 21.0 | 4.6x realtime |
+| 0.6B | Metal | Q8_0 | 40.3 | 7.2x |
+| 0.6B | Metal | F16 dense | 26.9 | 5.0x |
+| 0.6B | CPU (NEON) | Q8_0 | 21.4 | 1.1x (prefill fix not in that build) |
+| 0.6B | CPU | F32 dense | 8.6 | 1.4x |
+
+Model load on the runner: 44-86 s when quantizing on 3 cores, 5-20 s from
+the GGUF cache. A base M4 has ~1.8x the memory bandwidth of an M1, so expect
+roughly 35-40 tok/s for 1.7B Q8_0 on Metal there.

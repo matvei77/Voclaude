@@ -25,6 +25,10 @@ serde_json = "1.0"
 toml = "0.8"
 crossbeam-channel = "0.5"  # Fast MPSC channels
 
+# Local HTTP API + file decoding
+tiny_http = "0.12"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "mkv", "flac", "wav", "pcm", "ogg", "vorbis", "alac", "adpcm"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -40,6 +44,7 @@ candle-transformers = "0.9"
 safetensors = "0.7"
 tokenizers = "0.22"
 hf-hub = "0.4"
+ureq = "2"               # API CLI client (already pulled in by hf-hub)
 half = "2.4"
 num-traits = "0.2"
 
