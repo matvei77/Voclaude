@@ -503,3 +503,33 @@ sequenceDiagram
 - Release (GPU): `cargo build --release`
 - Release (CPU): `cargo build --release --no-default-features --features cpu`
 - Package: `powershell -File package.ps1` (bundles CUDA DLLs + zip)
+
+## Update 2026-09-04 (streaming, worker process, quantization)
+
+The map above predates these changes; the module guide is still accurate for
+what it covers, with these additions:
+
+- `src/audio/segmenter.rs` — incremental pause-based segmenter. The writer
+  thread in `capture.rs` feeds it, flushes the audio file when a segment
+  closes, announces `SegmentReady`, and syncs the file to disk every 5 s.
+- `src/worker.rs` — inference runs in a child process (`voclaude.exe --worker`)
+  over stdin/stdout JSON lines. `spawn_proxy` replaces the old in-process
+  inference thread; `InferenceCommand` lives here. Idle unload = child exit.
+- `src/app.rs` — `LiveSession` tracks segments of the current recording,
+  dispatches them to the worker while recording continues, journals every
+  result in `session.json` (see `SegmentRecord` in `session.rs`), writes a
+  partial transcript, and finishes with only the tail after stop. Startup and
+  the tray's "Recover Last Recording" rebuild a `LiveSession` from the journal
+  and segment any audio the journal does not cover.
+- `src/inference/candle_backend.rs` — fused rms-norm/rope/softmax kernels,
+  merged QKV and gate/up projections, optional Q8_0/Q4_K weights
+  (`ProjLinear`), GGUF cache of the quantized projections under
+  `%LOCALAPPDATA%oclaude\Voclaude\cache\weights`, per-phase
+  `TranscribeStats`. The prompt template follows the model's
+  `chat_template.json` (`candle_tokenizer.rs`, `PromptStyle`).
+- `src/bench.rs` — `voclaude --bench` harness (`--stream` simulates the live
+  pipeline; `--engine whisper` compares against Whisper). Results in
+  `docs/bench/`.
+- `src/ui.rs` — the egui thread starts lazily on the first history-window request.
+- `vendor/` — candle-core and float8 with cudarc `dynamic-loading`, so CUDA
+  DLLs load on first GPU use (in the worker) instead of at process start.

@@ -19,6 +19,15 @@ audio as `<file>.<tag>.hyp.txt` (audio is not in the repo).
 | `q8b` / `dyn` | Q8_0 quantized on the CPU from the mmapped weights, uploaded once; CUDA libraries loaded at runtime | 98.4–99.0 | 31.9x | 4.4 s | identical to `q8` |
 | `gguf` | quantized projections cached as GGUF under `%LOCALAPPDATA%oclaude\Voclaude\cache\weights` | 105 | – | **1.4 s** (5.8 s on the run that writes the cache) | identical |
 
+### Model bake-off: Qwen3-ASR-0.6B (`--model Qwen/Qwen3-ASR-0.6B`, Q8_0)
+
+42.9x realtime, 134 tok/s (1.35x faster than 1.7B) but visibly worse on the same recordings:
+the Russian passage comes out as "если я сейчас пириду на русский, она должна продолжить" (1.7B: "если я
+сейчас пишу на русский, я должен продолжить"), "Quan" → "Quandl", "compiler" → "validator", "whole" →
+"poll", "artisan" → "Arsen". Not the default; available as `model_tier = "fast"` for weaker GPUs.
+(The 0.6B model also needed two loader fixes today: tokenizer.json fallback and an o_proj shape that
+is not hidden×hidden.)
+
 ### Model bake-off: Whisper large-v3-turbo (`--engine whisper`, F32, 30 s windows, per-window language detection)
 
 | | Qwen3-ASR-1.7B Q8_0 | Whisper large-v3-turbo |

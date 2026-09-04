@@ -122,6 +122,7 @@ impl QwenEngine {
         self.model.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn set_prompt_style(&mut self, style: PromptStyle) {
         self.prompt_style = style;
         if let Some(model) = self.model.as_mut() {

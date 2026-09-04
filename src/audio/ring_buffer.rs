@@ -50,6 +50,7 @@ impl RingBuffer {
 
     /// A-5: Clear must only be called when no concurrent push/pop is in progress.
     /// Uses SeqCst to ensure full fence visibility.
+    #[allow(dead_code)]
     pub fn clear(&self) {
         let head = self.head.load(Ordering::SeqCst);
         self.tail.store(head, Ordering::SeqCst);

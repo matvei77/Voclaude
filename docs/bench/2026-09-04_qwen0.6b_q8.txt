@@ -1,0 +1,40 @@
+Loading Qwen/Qwen3-ASR-0.6B (gpu=true, prompt=Official, quant=q8_0)...
+[2m2026-09-04T00:06:18.863549Z[0m [32m INFO[0m Loading model from "C:\\Users\\matvei\\.cache\\huggingface\\hub\\models--Qwen--Qwen3-ASR-0.6B\\snapshots\\5eb144179a02acc5e5ba31e748d22b0cf3e303b0" on Cuda(CudaDevice(DeviceId(1)))
+[2m2026-09-04T00:06:18.864045Z[0m [32m INFO[0m Using token file found "C:\\Users\\matvei\\.cache\\huggingface\\token"
+[2m2026-09-04T00:06:19.002629Z[0m [33m WARN[0m Qwen/Qwen3-ASR-0.6B has no tokenizer.json; using the one from C:\Users\matvei\.cache\huggingface\hub\models--Qwen--Qwen3-ASR-1.7B\snapshots\7278e1e70fe206f11671096ffdd38061171dd6e5
+[2m2026-09-04T00:06:21.744800Z[0m [32m INFO[0m Wrote quantized weight cache C:\Users\matvei\AppData\Local\voclaude\Voclaude\cache\weights\Qwen3-ASR-0.6B-q8_0.gguf (113 tensors) in 0.5s
+[2m2026-09-04T00:06:21.811926Z[0m [32m INFO[0m Model loaded in 2.95s (Q8_0 weights)
+Model loaded in 2.95s
+file                         audio_s  wall_ms    mel  encode prefill   decode   toks   tok/s    xRT    WER
+[2m2026-09-04T00:06:22.400536Z[0m [32m INFO[0m Transcription #2 complete: infer=0.32s
+audio-1772019995026.f32         10.0      322      2      28      43      248     36   145.1   30.9      -
+[2m2026-09-04T00:06:23.612272Z[0m [32m INFO[0m Transcription #3 complete: infer=1.21s
+audio-1772020028560.f32         43.1     1211      7     101     128      973    135   138.8   35.6      -
+[2m2026-09-04T00:06:23.636042Z[0m [32m INFO[0m Audio too long (656.5s), split into 3 chunks (limit=300s)
+[2m2026-09-04T00:06:23.636078Z[0m [32m INFO[0m Transcribing chunk 1/3 (297.9s, max_new_tokens=2048)
+[2m2026-09-04T00:06:29.510267Z[0m [32m INFO[0m Transcribing chunk 2/3 (299.8s, max_new_tokens=2048)
+[2m2026-09-04T00:06:35.373966Z[0m [32m INFO[0m Transcribing chunk 3/3 (58.8s, max_new_tokens=1070)
+[2m2026-09-04T00:06:36.195613Z[0m [32m INFO[0m Transcription #4 complete: infer=12.56s
+audio-1773150920220.f32        656.5    12584    105    1424    4585     6444    740   114.8   52.2      -
+[2m2026-09-04T00:06:37.000785Z[0m [32m INFO[0m Transcription #5 complete: infer=0.80s
+audio-1773399098147.f32        122.5      804     20     264     493       23      3   132.0  152.4      -
+[2m2026-09-04T00:06:38.945931Z[0m [32m INFO[0m Transcription #6 complete: infer=1.94s
+audio-1788381557645.f32         68.9     1945     14     169     228     1532    220   143.6   35.4      -
+[2m2026-09-04T00:06:41.871263Z[0m [32m INFO[0m Transcription #7 complete: infer=2.92s
+audio-1788420081247.f32        105.4     2925     17     235     413     2256    310   137.4   36.0      -
+[2m2026-09-04T00:06:48.306274Z[0m [32m INFO[0m Transcription #8 complete: infer=6.43s
+audio-1788421219149.f32        207.7     6435     33     453    1159     4782    585   122.3   32.3      -
+[2m2026-09-04T00:06:50.984471Z[0m [32m INFO[0m Transcription #9 complete: infer=2.67s
+audio-1788421621695.f32        143.9     2678     22     309     638     1704    223   130.9   53.7      -
+[2m2026-09-04T00:06:51.453359Z[0m [32m INFO[0m Transcription #10 complete: infer=0.47s
+audio-1788422551284.f32         18.3      468      5      44      53      365     52   142.5   39.0      -
+[2m2026-09-04T00:06:52.375279Z[0m [32m INFO[0m Transcription #11 complete: infer=0.92s
+audio-1788422585905.f32         32.6      922      5      84      98      732    103   140.6   35.3      -
+[2m2026-09-04T00:06:54.396368Z[0m [32m INFO[0m Transcription #12 complete: infer=2.02s
+audio-1788471237661.f32         76.6     2021     11     170     256     1581    230   145.4   37.9      -
+[2m2026-09-04T00:07:03.013678Z[0m [32m INFO[0m Transcription #13 complete: infer=8.61s
+audio-1788471750664.f32        270.9     8617     42     579    1879     6108    703   115.1   31.4      -
+TOTAL audio 1756.3s, wall 40.9s (42.9x realtime), mean decode 134.2 tok/s
+Wrote ../../docs/bench/2026-09-04_qwen0.6b_q8.json
+[2m2026-09-04T00:07:03.014934Z[0m [32m INFO[0m Unloading model from memory (after 13 transcriptions)
+[2m2026-09-04T00:07:03.037890Z[0m [32m INFO[0m CUDA context released

@@ -748,7 +748,8 @@ impl DecoderAttention {
         let vb = &src.vb;
 
         let qkv_proj = src.linear(&[("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim)], h)?;
-        let o_proj = src.linear(&[("o_proj", h)], h)?;
+        // o_proj maps heads*head_dim back to hidden; they differ on Qwen3-ASR-0.6B.
+        let o_proj = src.linear(&[("o_proj", h)], q_dim)?;
         let q_norm = RmsNorm::load(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = RmsNorm::load(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
 
@@ -1292,6 +1293,7 @@ impl Qwen3ASRModel {
     }
 
     /// Transcribe audio samples to text (no context, default prompt style).
+    #[allow(dead_code)]
     pub fn transcribe(
         &mut self,
         samples: &[f32],

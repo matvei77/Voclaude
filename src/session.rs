@@ -67,6 +67,7 @@ impl RecordingSession {
     }
 
     /// Text of every transcribed segment, in order, joined with spaces.
+    #[allow(dead_code)]
     pub fn joined_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         for seg in &self.segments {

@@ -123,7 +123,7 @@ bench and the streaming pipeline to be meaningful.
 | RAM idle | ≤ 60 MB | 20 MB working set / 8 MB private |
 | Power cut / kill mid-dictation | resume from last segment | verified: hard kill at 48 s, relaunch reused 2 segments, finished 2.4 s after launch |
 | Transcription failure | zero loss, retry | verified: inference child killed mid-recording, restarted on next segment, all text delivered |
-| Multilingual quality | measured, model chosen from data | Qwen3-ASR-1.7B kept; Whisper large-v3-turbo dropped the Russian passage entirely; Q4_K lost text; see docs/bench/README.md |
+| Multilingual quality | measured, model chosen from data | Qwen3-ASR-1.7B Q8_0 kept; Whisper large-v3-turbo dropped the Russian passage entirely; Qwen3-ASR-0.6B garbles the Russian and proper nouns; Q4_K lost text; see docs/bench/README.md |
 
 Not done: single-digit-MB idle RAM (out of scope by design; 8 MB private / 20 MB working set achieved).
 A code review of the day's diff found two issues, both fixed: settings edits now reach the inference

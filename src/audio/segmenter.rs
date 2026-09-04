@@ -48,6 +48,7 @@ pub struct SegmentBounds {
 }
 
 impl SegmentBounds {
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
@@ -126,6 +127,7 @@ impl Segmenter {
     }
 
     /// Total samples fed so far.
+    #[allow(dead_code)]
     pub fn position(&self) -> usize {
         self.consumed + self.partial.len()
     }

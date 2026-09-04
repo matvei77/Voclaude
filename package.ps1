@@ -1,4 +1,4 @@
-# package.ps1 — Build Voclaude and package it with CUDA DLLs for distribution.
+﻿# package.ps1 - Build Voclaude and package it with CUDA DLLs for distribution.
 #
 # Usage:
 #   .\package.ps1            # GPU build (default, bundles CUDA runtime DLLs)
@@ -105,7 +105,7 @@ if (-not $Cpu) {
         if ($ExpectedCudaMajor -and $dll -match '_(\d+)\.dll$') {
             $dllMajor = $Matches[1]
             if ($dllMajor -ne $ExpectedCudaMajor) {
-                Write-Host "  WARNING: $dll is CUDA $dllMajor but build environment is CUDA $ExpectedCudaMajor — ABI mismatch!" -ForegroundColor Red
+                Write-Host "  WARNING: $dll is CUDA $dllMajor but build environment is CUDA $ExpectedCudaMajor - ABI mismatch!" -ForegroundColor Red
             }
         }
         Copy-Item $entry.Value $StageDir
