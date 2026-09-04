@@ -1,0 +1,78 @@
+# Apple Silicon smoke test: build with the Metal feature on GitHub's arm64
+# macOS runner, then transcribe a public 11 s clip (whisper.cpp's jfk.wav)
+# on Metal and on the CPU, dense and Q8_0, and report the numbers.
+#
+# This exercises the inference path only (--bench), not the tray/hotkey UI,
+# which still needs a main-thread run loop on macOS.
+name: macos-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["metal-smoke"]
+
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
+jobs:
+  metal:
+    runs-on: macos-latest # arm64 (Apple Silicon) since macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: metal
+
+      - name: Machine
+        run: |
+          sysctl -n machdep.cpu.brand_string
+          system_profiler SPDisplaysDataType | grep -E "Chipset|Metal|Cores" || true
+          sysctl -n hw.memsize | awk '{print $1/1e9 " GB RAM"}'
+          df -h . | tail -1
+
+      - name: Build (Metal)
+        run: cargo build --release --no-default-features --features metal
+
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-qwen3-asr-0.6b-and-1.7b-v1
+
+      - name: Sample audio
+        run: curl -sL -o jfk.wav https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav && ls -l jfk.wav
+
+      - name: 0.6B Metal Q8_0
+        run: ./target/release/voclaude --bench jfk.wav --gpu --model-tier fast --quant q8_0 --tag m_06_q8 --out m_06_q8.json 2>&1 | tail -20
+
+      - name: 0.6B Metal F16 dense
+        run: ./target/release/voclaude --bench jfk.wav --gpu --model-tier fast --quant none --tag m_06_f16 --out m_06_f16.json 2>&1 | tail -20
+
+      - name: 0.6B CPU Q8_0 (NEON)
+        run: ./target/release/voclaude --bench jfk.wav --cpu --model-tier fast --quant q8_0 --tag c_06_q8 --out c_06_q8.json 2>&1 | tail -20
+
+      - name: 0.6B CPU F32 dense
+        run: ./target/release/voclaude --bench jfk.wav --cpu --model-tier fast --quant none --tag c_06_f32 --out c_06_f32.json 2>&1 | tail -20
+
+      - name: 1.7B Metal Q8_0
+        run: ./target/release/voclaude --bench jfk.wav --gpu --model-tier best --quant q8_0 --tag m_17_q8 --out m_17_q8.json 2>&1 | tail -20
+
+      - name: Transcripts
+        if: always()
+        run: shopt -s nullglob; for f in jfk.*.hyp.txt; do echo "== $f"; cat "$f"; echo; done
+
+      - name: Results
+        if: always()
+        run: shopt -s nullglob; for f in *.json; do echo "== $f"; cat "$f"; echo; done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-smoke
+          path: |
+            target/release/voclaude
+            *.json
+            jfk.*.hyp.txt

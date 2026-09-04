@@ -141,7 +141,7 @@ fn build_from_qwen_files(model_dir: &Path) -> Result<tokenizers::Tokenizer, Stri
     let mut merges = Vec::new();
     for (index, raw_line) in merges_text.lines().enumerate() {
         let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() || line.starts_with("#version") {
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
