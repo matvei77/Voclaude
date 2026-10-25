@@ -24,10 +24,26 @@ show_notifications = true
 # Maximum history entries
 history_max_entries = 500
 
-# GPU acceleration (CUDA)
+# GPU acceleration (Vulkan for Parakeet, CUDA for Qwen)
 use_gpu = true
 
-# Model tier:
+# Speech engine:
+#   "parakeet" = Parakeet Ultra through transcribe.cpp (default). 0.6B, 25 European
+#                languages incl. Russian; ~145x realtime on an RTX 3060 (Vulkan),
+#                ~26x on an i5-13600K CPU. Each segment picks its own language.
+#   "qwen"     = Qwen3-ASR through candle (the settings from model_tier to
+#                quantization below). Better English, 2B, ~3x realtime on CPU.
+engine = "parakeet"
+
+# Parakeet model: a local .gguf file or <owner>/<repo>/<file> on Hugging Face
+# (downloaded once, ~0.6 GB). The same repo has Q8_0 (0.74 GB, same accuracy,
+# 40% slower on the CPU) and Q4_K_M (0.49 GB, same accuracy and speed as Q6_K).
+parakeet_model = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf"
+
+# CPU threads for Parakeet when it runs on the CPU (0 = automatic).
+cpu_threads = 0
+
+# Model tier (Qwen engine):
 #   fast / small / medium  = Qwen3-ASR-0.6B, lower memory, best for CPU or laptop GPUs
 #   best / large / accurate = Qwen3-ASR-1.7B, highest quality, best for stronger NVIDIA GPUs
 model_tier = "medium"
@@ -71,7 +87,9 @@ require_gpu = false
 streaming = true
 
 # A segment is at least this long before a pause may close it (seconds).
-segment_min_seconds = 20
+# Default: 6 for Parakeet (short segments let Russian and English parts each
+# be recognised in their own language), 20 for Qwen.
+# segment_min_seconds = 6
 
 # A segment is force-cut at its quietest recent point past this length (seconds).
 segment_max_seconds = 45

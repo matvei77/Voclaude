@@ -29,6 +29,15 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
+    // transcribe.dll (and the ggml DLLs it pulls in) load on the first
+    // transcribe.cpp call, which only happens in a `--worker` child running a
+    // GGUF model. The tray process never maps them, and a missing DLL is an
+    // engine error instead of a launch failure.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:transcribe.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+    }
+
     // Application icon for Explorer, the taskbar and the installer (Windows only).
     #[cfg(target_os = "windows")]
     {

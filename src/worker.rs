@@ -8,7 +8,7 @@
 
 use crate::app::AppEvent;
 use crate::config::Config;
-use crate::inference::{AsrEngine, InferenceProgress, InferenceStage, QwenEngine};
+use crate::inference::{AsrEngine, Engine, InferenceProgress, InferenceStage};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -155,7 +155,7 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
         WireCommand::Init { config } => config,
         other => return Err(format!("worker: expected init, got {:?}", other).into()),
     };
-    let mut engine = QwenEngine::new_with_config(&config)?;
+    let mut engine = Engine::from_config(&config)?;
     emit(&WireEvent::Ready);
 
     let mut ctx_session: Option<String> = None;
@@ -211,7 +211,6 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
                 let result = read_f32_range(&path, start, end).and_then(|samples| {
                     engine
                         .transcribe_segment(&samples, context.as_deref())
-                        .map(|(text, _stats)| text)
                         .map_err(|e| e.to_string())
                 });
                 if !was_loaded && engine_is_loaded(&engine) {
@@ -259,7 +258,7 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn engine_is_loaded(engine: &QwenEngine) -> bool {
+fn engine_is_loaded(engine: &Engine) -> bool {
     engine.is_loaded()
 }
 
@@ -470,7 +469,13 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
         }
         match command {
             InferenceCommand::UpdateConfig(new_config) => {
-                let changed = new_config.model != config.model
+                let changed = new_config.engine != config.engine
+                    || new_config.parakeet_model != config.parakeet_model
+                    || new_config.cpu_threads != config.cpu_threads
+                    || new_config.segment_min_seconds != config.segment_min_seconds
+                    || new_config.segment_max_seconds != config.segment_max_seconds
+                    || new_config.segment_pause_seconds != config.segment_pause_seconds
+                    || new_config.model != config.model
                     || new_config.model_path != config.model_path
                     || new_config.use_gpu != config.use_gpu
                     || new_config.quantization != config.quantization

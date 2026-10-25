@@ -128,6 +128,11 @@ impl HistoryStore {
         Ok(entry)
     }
 
+    /// Takes effect at the next append (settings reload).
+    pub fn set_audio_retention_count(&mut self, count: usize) {
+        self.audio_retention_count = count;
+    }
+
     fn apply_retention(&mut self) -> bool {
         if self.entries.len() > self.max_entries {
             let excess = self.entries.len() - self.max_entries;

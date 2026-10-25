@@ -2,13 +2,14 @@
 
 Voice input anywhere — local-first, GPU-accelerated speech-to-text that runs in your system tray.
 
-Press a hotkey, speak, and your words are instantly transcribed and copied to your clipboard. All processing happens locally using [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) via pure Rust inference (no Python needed).
+Press a hotkey, speak, and your words are instantly transcribed and copied to your clipboard. All processing happens locally: by default with [Parakeet Ultra](https://huggingface.co/handy-computer/parakeet-ultra-gguf) (0.6B, 25 European languages including Russian) through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), or with [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) through pure Rust inference (candle). No Python needed.
 
 ## Features
 
-- **Single binary** — pure Rust, no Python or external runtimes
+- **No Python** — a Rust app plus the transcribe.cpp/ggml DLLs next to it
 - **Local-first** — all transcription happens on-device, nothing leaves your machine
-- **GPU accelerated** — CUDA inference at ~30x realtime on an RTX 3060 (Q8 weights, fused kernels)
+- **Fast on GPU and CPU** — Parakeet runs at ~145x realtime on an RTX 3060 (Vulkan) and ~26x on an i5-13600K CPU; the Qwen engine runs on CUDA at ~30x
+- **Russian and English in one recording** — segments are cut at pauses and Parakeet picks the language of each one
 - **Transcribes while you speak** — the recording is cut into segments at pauses and transcribed in the background; after you stop, only the last few seconds remain, so the text is on the clipboard within about a second
 - **Never loses a word** — audio is streamed to disk and synced every 5 s; every finished segment's text is journaled; a crash or power cut resumes from the last finished segment on relaunch, and the tray has "Recover Last Recording"
 - **Tiny when idle** — inference runs in a child process that exits after 60 s idle: 0 VRAM and ~20 MB of RAM for the tray
@@ -26,21 +27,22 @@ Press a hotkey, speak, and your words are instantly transcribed and copied to yo
    Prefer no installer? `voclaude-vX.Y.Z-<hash>-gpu.zip` unzips anywhere; run `voclaude.exe` from the folder.
 2. Press **F4**, speak, press **F4** again. The text is on your clipboard; paste it with Ctrl+V.
 
-On the first run the app downloads the model (about 3.4 GB) from Hugging Face; the tray/HUD shows
-"Downloading ... first run only" while it does. Later starts load in about 1.5 s.
+On the first run the app downloads the model from Hugging Face (Parakeet: about 0.6 GB; Qwen:
+about 3.4 GB). Later starts load in about 1.5 s. The very first Parakeet run on a GPU also compiles
+the Vulkan shaders once (~10 s); the driver caches them.
 
 To start it with Windows: press Win+R, type `shell:startup`, and put a shortcut to `voclaude.exe` there.
 
 ### Requirements (download)
 
 - Windows 10/11, 64-bit.
-- **Best experience:** an NVIDIA GPU from the GTX 16xx / RTX 20xx generation or newer with
-  6 GB or more VRAM, and a driver from 2025 or newer (CUDA 13 runtime; nothing else to install —
-  the zip bundles the CUDA DLLs). On a GPU with less memory the app automatically switches to
-  the smaller 0.6B model.
-- **No NVIDIA GPU:** it still works on the CPU with Q8 weights: about 2x realtime for the
-  1.7B model and 3.4x for 0.6B on a desktop CPU (see `docs/bench/README.md`), which keeps up
-  with speech because segments are transcribed while you talk. Needs a CPU with AVX2 (2013+).
+- **Parakeet (default):** any GPU with a Vulkan driver and ~1 GB free VRAM, or just the CPU
+  (~26x realtime on a desktop CPU; the right ggml CPU module is picked at runtime). See
+  `docs/bench/2026-10-23-model-survey.md`.
+- **Qwen (`engine = "qwen"`):** an NVIDIA GPU from the GTX 16xx / RTX 20xx generation or newer
+  with 6 GB or more VRAM and a driver from 2025 or newer (the zip bundles the CUDA DLLs). On the
+  CPU it runs at about 2x realtime for the 1.7B model and 3.4x for 0.6B (see `docs/bench/README.md`).
+  Needs a CPU with AVX2 (2013+).
 - Microphone. Windows: Settings → Privacy → Microphone → allow desktop apps.
 
 ## Quick Start (build from source)
@@ -49,13 +51,15 @@ To start it with Windows: press Win+R, type `shell:startup`, and put a shortcut 
 
 - **Rust** 1.70+ ([rustup.rs](https://rustup.rs))
 - **NVIDIA GPU** with [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) 12.x+ (for GPU mode)
-- ~4.5 GB disk space for the model (downloaded automatically on first run)
+- MSVC build tools (for `fetch-transcribe.ps1`, which turns the official transcribe.cpp DLLs into a link prefix)
+- ~1 GB disk space for the Parakeet model, ~4.5 GB for Qwen (downloaded automatically on first run)
 
 ### Build and Run
 
 ```bash
 git clone https://github.com/matvei77/Voclaude.git
 cd Voclaude
+.\fetch-transcribe.ps1   # once: transcribe.cpp 0.4.1 runtime (CPU + Vulkan) into vendor/
 cargo build --release
 ```
 
@@ -93,6 +97,13 @@ The GPU zip includes `voclaude.exe`, the required CUDA DLLs, and `config.example
 sudo apt install libasound2-dev libgtk-3-dev libayatana-appindicator3-dev \
     libxkbcommon-dev libxdo-dev pkg-config cmake clang
 ```
+
+On Windows, run `fetch-transcribe.ps1` in the same PowerShell session as Cargo.
+The script exports `TRANSCRIBE_DIR` for that shell. The prebuilt prefix contains
+Windows DLLs and must not be used on Linux or macOS. On those platforms Cargo
+builds transcribe.cpp from source and links it statically. The `metal` feature
+also enables transcribe.cpp's Metal backend. These non-Windows builds have not
+been revalidated with the Parakeet integration.
 
 ## Usage
 
@@ -140,10 +151,12 @@ add_trailing_space = true
 capitalize_first = true
 idle_unload_seconds = 60
 use_gpu = true
-model = "Qwen/Qwen3-ASR-1.7B"
-quantization = "q8_0"        # "none" for F16 weights
+engine = "parakeet"          # or "qwen"
+parakeet_model = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf"
+model = "Qwen/Qwen3-ASR-1.7B" # Qwen engine only
+quantization = "q8_0"        # Qwen engine only; "none" for F16 weights
 streaming = true             # transcribe segments while recording
-segment_min_seconds = 20
+# segment_min_seconds = 6    # default 6 for Parakeet, 20 for Qwen
 segment_max_seconds = 45
 segment_pause_seconds = 0.5
 ```
@@ -167,10 +180,10 @@ System Tray ─── Global Hotkey (F4)
     │    └───────────┬───────────┘
     │                │
     │    ┌───────────▼───────────┐
-    │    │   Qwen3-ASR Candle    │
-    │    │   Pure Rust inference  │
-    │    │   CPU or CUDA          │
-    │    │   ~4.5 GB model        │
+    │    │  Parakeet (default)   │
+    │    │  transcribe.cpp/ggml  │
+    │    │  Vulkan or CPU, 0.7GB │
+    │    │  or Qwen3-ASR (candle)│
     │    └───────────┬───────────┘
     │                │
     │    ┌───────────▼───────────┐

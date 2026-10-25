@@ -39,6 +39,10 @@ if (-not $Cpu -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     }
 }
 
+# Prebuilt transcribe.cpp (CPU + Vulkan) that the build links against.
+& (Join-Path $ProjectRoot "fetch-transcribe.ps1")
+if ($LASTEXITCODE -ne 0) { exit 1 }
+
 if ($Cpu) {
     $Variant = "cpu"
     Write-Host "Building Voclaude v$Version (CPU-only)..." -ForegroundColor Cyan
@@ -66,6 +70,14 @@ if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
 
 Copy-Item $Exe $StageDir
+
+# transcribe.cpp runtime for the Parakeet engine: transcribe.dll, ggml, the
+# per-ISA CPU modules and the Vulkan module (delay-loaded by the worker).
+$TranscribeBin = Join-Path $ProjectRoot "vendor\transcribe-prebuilt\bin"
+Copy-Item "$TranscribeBin\*.dll" $StageDir
+New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "licenses") | Out-Null
+Copy-Item -Recurse (Join-Path $ProjectRoot "vendor\transcribe-prebuilt\licenses") (Join-Path $StageDir "licenses\transcribe.cpp")
+Write-Host "  Bundled transcribe.cpp runtime ($((Get-ChildItem "$TranscribeBin\*.dll").Count) DLLs)" -ForegroundColor DarkGray
 
 # For GPU builds, bundle the required CUDA DLLs
 if (-not $Cpu) {

@@ -31,3 +31,4 @@ nul
 
 # Local benchmark audio (not for the repo)
 bench_data/
+/vendor/transcribe-prebuilt/

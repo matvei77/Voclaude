@@ -70,7 +70,7 @@ impl ApiServer {
         let ctx = Arc::new(Ctx {
             event_tx,
             token: config.api_token.clone().filter(|t| !t.trim().is_empty()),
-            model: config.model.clone(),
+            model: config.active_model().to_string(),
             use_gpu: config.use_gpu,
             temp_dir,
             counter: AtomicU64::new(0),

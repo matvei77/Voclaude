@@ -7,6 +7,8 @@ use tracing::{info, warn};
 
 pub const MODEL_QWEN3_ASR_0_6B: &str = "Qwen/Qwen3-ASR-0.6B";
 pub const MODEL_QWEN3_ASR_1_7B: &str = "Qwen/Qwen3-ASR-1.7B";
+/// Default Parakeet model, as `<owner>/<repo>/<file>` on Hugging Face.
+pub const DEFAULT_PARAKEET_MODEL: &str = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf";
 
 /// Return the canonical ProjectDirs for the application.
 pub fn project_dirs() -> Option<ProjectDirs> {
@@ -54,6 +56,20 @@ pub struct Config {
     /// Enable GPU acceleration when available
     #[serde(default = "default_use_gpu")]
     pub use_gpu: bool,
+
+    /// Speech engine: "parakeet" (transcribe.cpp: GPU through Vulkan, or CPU)
+    /// or "qwen" (candle: Qwen3-ASR on CUDA or CPU). `model_tier`, `model`,
+    /// `model_path`, `max_new_tokens` and `quantization` apply to Qwen only.
+    #[serde(default = "default_engine")]
+    pub engine: String,
+
+    /// Parakeet model: a local `.gguf` file or `<owner>/<repo>/<file>` on Hugging Face.
+    #[serde(default = "default_parakeet_model")]
+    pub parakeet_model: String,
+
+    /// CPU threads for the Parakeet engine (0 = transcribe.cpp default).
+    #[serde(default)]
+    pub cpu_threads: u32,
 
     /// User-facing model tier. Used when `model` is not explicitly set.
     #[serde(default = "default_model_tier")]
@@ -108,8 +124,10 @@ pub struct Config {
     pub streaming: bool,
 
     /// Segments are at least this long before a pause may close them.
-    #[serde(default = "default_segment_min_seconds")]
-    pub segment_min_seconds: f32,
+    /// Unset: 6 s for Parakeet (each short segment picks its own language, so
+    /// Russian/English switches survive), 20 s for Qwen.
+    #[serde(default)]
+    pub segment_min_seconds: Option<f32>,
 
     /// Segments are force-cut at the quietest recent point past this length.
     #[serde(default = "default_segment_max_seconds")]
@@ -150,6 +168,9 @@ impl Default for Config {
             show_notifications: true,
             history_max_entries: default_history_max_entries(),
             use_gpu: true,
+            engine: default_engine(),
+            parakeet_model: default_parakeet_model(),
+            cpu_threads: 0,
             model_tier: default_model_tier(),
             auto_select_model: default_auto_select_model(),
             model: default_model(),
@@ -162,7 +183,7 @@ impl Default for Config {
             legacy_prompt: false,
             quantization: default_quantization(),
             streaming: true,
-            segment_min_seconds: default_segment_min_seconds(),
+            segment_min_seconds: None,
             segment_max_seconds: default_segment_max_seconds(),
             segment_pause_seconds: default_segment_pause_seconds(),
             segment_context: false,
@@ -200,11 +221,12 @@ impl Config {
                     "config_version", "hotkey", "history_hotkey", "language",
                     "add_trailing_space", "capitalize_first", "idle_unload_seconds",
                     "show_notifications", "history_max_entries", "use_gpu",
-                    "model_tier", "auto_select_model", "model", "model_path",
+                    "engine", "parakeet_model", "cpu_threads", "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
                     "require_gpu", "audio_retention_count", "legacy_prompt", "quantization",
                     "streaming", "segment_min_seconds", "segment_max_seconds",
                     "segment_pause_seconds", "segment_context",
+                    "api_enabled", "api_port", "api_token",
                     // Legacy aliases
                     "qwen_model", "qwen_model_path", "qwen_max_new_tokens", "qwen_require_gpu",
                 ];
@@ -269,16 +291,22 @@ impl Config {
         if self.model.trim().is_empty() {
             return Err("model cannot be empty".into());
         }
+        if !matches!(self.engine.trim().to_ascii_lowercase().as_str(), "parakeet" | "qwen") {
+            return Err("engine must be \"parakeet\" or \"qwen\"".into());
+        }
+        if self.uses_parakeet() && self.parakeet_model.trim().is_empty() {
+            return Err("parakeet_model cannot be empty".into());
+        }
         if !matches!(
             self.quantization.trim().to_ascii_lowercase().as_str(),
             "none" | "f16" | "off" | "" | "q8_0" | "q8" | "int8" | "q4_k" | "q4k" | "q4"
         ) {
             return Err("quantization must be one of: none, q8_0, q4_k".into());
         }
-        if !(3.0..=120.0).contains(&self.segment_min_seconds) {
+        if !(3.0..=120.0).contains(&self.segment_min_secs()) {
             return Err("segment_min_seconds must be between 3 and 120".into());
         }
-        if self.segment_max_seconds <= self.segment_min_seconds || self.segment_max_seconds > 300.0 {
+        if self.segment_max_seconds <= self.segment_min_secs() || self.segment_max_seconds > 300.0 {
             return Err("segment_max_seconds must be greater than segment_min_seconds and at most 300".into());
         }
         if !(0.2..=5.0).contains(&self.segment_pause_seconds) {
@@ -323,14 +351,40 @@ impl Config {
         Err(last_err.unwrap().into())
     }
 
+    pub fn uses_parakeet(&self) -> bool {
+        self.engine.trim().eq_ignore_ascii_case("parakeet")
+    }
+
+    /// The model the selected engine runs (Parakeet spec or Qwen repo id).
+    pub fn active_model(&self) -> &str {
+        if self.uses_parakeet() {
+            &self.parakeet_model
+        } else {
+            &self.model
+        }
+    }
+
+    /// `segment_min_seconds`, or the engine's default when it is unset.
+    pub fn segment_min_secs(&self) -> f32 {
+        self.segment_min_seconds
+            .unwrap_or(if self.uses_parakeet() { 6.0 } else { 20.0 })
+    }
+
+    pub fn segmenter_config(&self) -> crate::audio::SegmenterConfig {
+        crate::audio::SegmenterConfig {
+            min_secs: self.segment_min_secs(),
+            max_secs: self.segment_max_seconds,
+            pause_secs: self.segment_pause_seconds,
+        }
+    }
+
     /// Extract a short display name from the model id.
     pub fn model_display_name(&self) -> String {
-        // "Qwen/Qwen3-ASR-1.7B" → "qwen3-asr-1.7b"
-        self.model
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.model)
-            .to_lowercase()
+        // "Qwen/Qwen3-ASR-1.7B" → "qwen3-asr-1.7b",
+        // ".../parakeet-ultra-Q6_K.gguf" → "parakeet-ultra-q6_k"
+        let model = self.active_model();
+        let base = model.rsplit(['/', '\\']).next().unwrap_or(model);
+        base.trim_end_matches(".gguf").to_lowercase()
     }
 
     pub fn model_for_current_tier(&self) -> String {
@@ -520,8 +574,12 @@ fn default_quantization() -> String {
     "q8_0".to_string()
 }
 
-fn default_segment_min_seconds() -> f32 {
-    20.0
+fn default_engine() -> String {
+    "parakeet".to_string()
+}
+
+fn default_parakeet_model() -> String {
+    DEFAULT_PARAKEET_MODEL.to_string()
 }
 
 fn default_segment_max_seconds() -> f32 {
@@ -647,8 +705,20 @@ mod tests {
 
     #[test]
     fn model_display_name_extracts_basename() {
-        let config = Config::default();
+        let mut config = Config::default();
+        assert_eq!(config.model_display_name(), "parakeet-ultra-q6_k");
+        config.engine = "qwen".to_string();
         assert_eq!(config.model_display_name(), "qwen3-asr-1.7b");
+    }
+
+    #[test]
+    fn segment_min_defaults_per_engine() {
+        let mut config = Config::default();
+        assert_eq!(config.segment_min_secs(), 6.0);
+        config.engine = "qwen".to_string();
+        assert_eq!(config.segment_min_secs(), 20.0);
+        config.segment_min_seconds = Some(12.0);
+        assert_eq!(config.segment_min_secs(), 12.0);
     }
 
     #[test]
