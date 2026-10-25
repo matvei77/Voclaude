@@ -83,6 +83,34 @@ pub enum AppEvent {
     },
 }
 
+impl AppEvent {
+    /// The variant name, for logs. S-1: payloads hold dictated text (and the
+    /// config holds the API token), so the log never gets `{:?}` of an event.
+    fn kind(&self) -> &'static str {
+        match self {
+            AppEvent::HotkeyPressed => "HotkeyPressed",
+            AppEvent::ToggleHistoryWindow => "ToggleHistoryWindow",
+            AppEvent::ShowHistoryWindow => "ShowHistoryWindow",
+            AppEvent::OpenTranscriptsFolder => "OpenTranscriptsFolder",
+            AppEvent::OpenLastTranscript => "OpenLastTranscript",
+            AppEvent::OpenSettings => "OpenSettings",
+            AppEvent::Quit => "Quit",
+            AppEvent::InferenceProgress(_) => "InferenceProgress",
+            AppEvent::TranscriptionComplete(Ok(_)) => "TranscriptionComplete(ok)",
+            AppEvent::TranscriptionComplete(Err(_)) => "TranscriptionComplete(error)",
+            AppEvent::InferenceEngineInfo { .. } => "InferenceEngineInfo",
+            AppEvent::HistoryUpdated(_) => "HistoryUpdated",
+            AppEvent::ConfigReloaded(_) => "ConfigReloaded",
+            AppEvent::SegmentReady(_) => "SegmentReady",
+            AppEvent::SegmentTranscribed { result: Ok(_), .. } => "SegmentTranscribed(ok)",
+            AppEvent::SegmentTranscribed { result: Err(_), .. } => "SegmentTranscribed(error)",
+            AppEvent::RecoverLastRecording => "RecoverLastRecording",
+            AppEvent::ApiTranscribeRange { .. } => "ApiTranscribeRange",
+            AppEvent::ApiTranscribed { .. } => "ApiTranscribed",
+        }
+    }
+}
+
 /// Application state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
@@ -207,14 +235,6 @@ impl LiveSession {
 
 fn partial_transcript_path(session_id: &str) -> Option<PathBuf> {
     transcripts_dir().map(|dir| dir.join(format!("{}.partial.txt", session_id)))
-}
-
-fn segmenter_config_from(config: &Config) -> SegmenterConfig {
-    SegmenterConfig {
-        min_secs: config.segment_min_seconds,
-        max_secs: config.segment_max_seconds,
-        pause_secs: config.segment_pause_seconds,
-    }
 }
 
 /// Build a `LiveSession` for a journaled session whose audio is on disk,
@@ -345,7 +365,7 @@ impl App {
         // Initialize audio capture (segments are announced through event_tx)
         let (level_tx, level_rx) = bounded::<f32>(64);
         let (segment_tx, segment_rx) = unbounded::<SegmentReady>();
-        let audio = AudioCapture::new(Some(level_tx), Some(segment_tx), segmenter_config_from(&self.config))?;
+        let audio = AudioCapture::new(Some(level_tx), Some(segment_tx), self.config.segmenter_config())?;
         info!("Audio capture ready");
 
         // No preflight — model loads lazily on first transcription.
@@ -646,7 +666,7 @@ impl App {
             match self.event_rx.try_recv() {
                 Ok(event) => {
                     info!("=== APP EVENT RECEIVED ===");
-                    info!("Event: {:?}", event);
+                    info!("Event: {}", event.kind());
                     info!("Time since last activity: {:?}", last_activity.elapsed());
 
                     match event {
@@ -1110,7 +1130,7 @@ impl App {
                                 let _ = session_store.mark_failed("Recovery audio file missing".to_string());
                                 continue;
                             };
-                            match recover_live_session(&session, &path, segmenter_config_from(&self.config)) {
+                            match recover_live_session(&session, &path, self.config.segmenter_config()) {
                                 Ok((recovered, new_bounds, total_samples)) => {
                                     info!(
                                         "Recovering session {}: {} segments ({} done, {} new)",
@@ -1324,23 +1344,28 @@ impl App {
                             self.config.history_max_entries = new_config.history_max_entries;
                             self.config.require_gpu = new_config.require_gpu;
                             self.config.audio_retention_count = new_config.audio_retention_count;
+                            history.set_audio_retention_count(new_config.audio_retention_count);
                             self.config.model = new_config.model.clone();
                             self.config.model_path = new_config.model_path.clone();
                             self.config.model_tier = new_config.model_tier.clone();
                             self.config.use_gpu = new_config.use_gpu;
+                            self.config.engine = new_config.engine.clone();
+                            self.config.parakeet_model = new_config.parakeet_model.clone();
+                            self.config.cpu_threads = new_config.cpu_threads;
                             self.config.quantization = new_config.quantization.clone();
                             self.config.adaptive_max_new_tokens = new_config.adaptive_max_new_tokens;
                             self.config.max_chunk_seconds = new_config.max_chunk_seconds;
                             self.config.legacy_prompt = new_config.legacy_prompt;
-                            if let Err(err) = inference_tx.try_send(InferenceCommand::UpdateConfig(self.config.clone())) {
-                                warn!("Could not forward settings to the inference worker: {}", err);
-                            }
                             self.config.streaming = new_config.streaming;
                             self.config.segment_context = new_config.segment_context;
                             self.config.segment_min_seconds = new_config.segment_min_seconds;
                             self.config.segment_max_seconds = new_config.segment_max_seconds;
                             self.config.segment_pause_seconds = new_config.segment_pause_seconds;
-                            audio.set_segmenter_config(segmenter_config_from(&self.config));
+                            // After the segment fields: Parakeet cuts whole files with them.
+                            if let Err(err) = inference_tx.try_send(InferenceCommand::UpdateConfig(self.config.clone())) {
+                                warn!("Could not forward settings to the inference worker: {}", err);
+                            }
+                            audio.set_segmenter_config(self.config.segmenter_config());
                             notifications.enabled = new_config.show_notifications;
                             let msg = if needs_restart.is_empty() {
                                 "Settings applied successfully".to_string()

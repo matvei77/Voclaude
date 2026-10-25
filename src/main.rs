@@ -18,7 +18,7 @@ mod worker;
 
 use app::App;
 use config::Config;
-use inference::{AsrEngine, QwenEngine};
+use inference::{AsrEngine, Engine};
 use tracing::{info, error, Level};
 
 /// Writer that sends output to both the UI log buffer and a file appender.
@@ -98,6 +98,8 @@ fn main() {
             .with_writer(std::io::stderr)
             .init();
         let mut bench_config = Config::load().unwrap_or_default();
+        // The benchmark reports Qwen-specific token and prefill statistics.
+        bench_config.engine = "qwen".to_string();
         bench_config.require_gpu = false;
         if let Err(err) = apply_cli_overrides(&mut bench_config, &args) {
             eprintln!("Invalid CLI option: {}", err);
@@ -219,7 +221,8 @@ fn main() {
         let validate_result = (|| -> Result<(), Box<dyn std::error::Error>> {
             println!("Voclaude {} — Validation Mode", env!("CARGO_PKG_VERSION"));
             println!("Config: OK");
-            println!("  model: {}", config.model);
+            println!("  engine: {}", config.engine);
+            println!("  model: {}", config.active_model());
             println!("  model_tier: {} ({})", config.model_tier, config.model_tier_summary());
             println!("  use_gpu: {}", config.use_gpu);
             println!("  model_path: {}", config.model_path.as_deref().unwrap_or("(auto)"));
@@ -227,7 +230,7 @@ fn main() {
             println!("  adaptive_max_new_tokens: {}", config.adaptive_max_new_tokens);
             println!("  max_chunk_seconds: {}", config.max_chunk_seconds);
 
-            let mut engine = QwenEngine::new_with_config(&config)?;
+            let mut engine = Engine::from_config(&config)?;
             println!("Engine init: OK (gpu={})", engine.active_gpu());
             engine.prepare(None)?;
             println!("Model load: OK");
@@ -286,6 +289,23 @@ fn apply_cli_overrides(config: &mut Config, args: &[String]) -> Result<(), Strin
         config.model = model.to_string();
     }
 
+    if let Some(engine) = arg_value(args, "--engine") {
+        // Whisper is an existing benchmark-only backend, not a tray engine.
+        if !(engine == "whisper" && args.get(1).map(String::as_str) == Some("--bench")) {
+            config.engine = engine.to_string();
+        }
+    }
+
+    if let Some(model) = arg_value(args, "--parakeet-model") {
+        config.parakeet_model = model.to_string();
+    }
+
+    if let Some(value) = arg_value(args, "--threads") {
+        config.cpu_threads = value
+            .parse::<u32>()
+            .map_err(|_| "--threads must be an integer".to_string())?;
+    }
+
     if let Some(dir) = arg_value(args, "--model-dir") {
         let path = std::path::Path::new(dir);
         if !path.exists() || !path.is_dir() {
@@ -335,7 +355,10 @@ fn print_model_list() {
     let mut best = Config::default();
     best.set_model_tier("best");
 
-    println!("Available Voclaude model tiers:");
+    println!("Default engine: Parakeet (Vulkan GPU or CPU)");
+    println!("  {}", config::DEFAULT_PARAKEET_MODEL);
+    println!();
+    println!("Qwen model tiers (--engine qwen):");
     println!("  fast / small / medium");
     println!("    {}", fast.model);
     println!("    {}", fast.model_tier_summary());
@@ -344,9 +367,9 @@ fn print_model_list() {
     println!("    {}", best.model_tier_summary());
     println!();
     println!("CLI examples:");
-    println!("  voclaude.exe --test audio.f32 --cpu --model-tier fast");
-    println!("  voclaude.exe --test audio.f32 --gpu --model-tier best");
-    println!("  voclaude.exe --validate --model-tier medium");
+    println!("  voclaude.exe --test audio.f32 --engine parakeet --cpu");
+    println!("  voclaude.exe --test audio.f32 --engine qwen --gpu --model-tier best");
+    println!("  voclaude.exe --validate --engine qwen --model-tier medium");
 }
 
 /// Test mode: load audio file and transcribe it
@@ -362,10 +385,11 @@ fn run_test(audio_path: &str, args: &[String]) -> Result<(), Box<dyn std::error:
     test_config.require_gpu = false; // test mode always allows CPU fallback
     apply_cli_overrides(&mut test_config, args)
         .map_err(|err| format!("Invalid CLI option: {}", err))?;
-    info!("Test model: {}", test_config.model);
+    info!("Test engine: {}", test_config.engine);
+    info!("Test model: {}", test_config.active_model());
     info!("Test use_gpu: {}", test_config.use_gpu);
     info!("Test max_chunk_seconds: {}", test_config.max_chunk_seconds);
-    let mut engine = QwenEngine::new_with_config(&test_config)?;
+    let mut engine = Engine::from_config(&test_config)?;
 
     info!("Transcribing...");
     let start = std::time::Instant::now();
@@ -392,6 +416,32 @@ fn attach_console_for_cli() {
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             AllocConsole();
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_engine_tests {
+    use super::*;
+
+    #[test]
+    fn parakeet_benchmark_cannot_silently_measure_qwen() {
+        let args = vec!["--engine".to_string(), "parakeet".to_string()];
+        let error = bench::run(&Config::default(), &args).unwrap_err();
+        assert!(error.to_string().contains("--bench supports qwen or whisper"));
+    }
+
+    #[test]
+    fn whisper_remains_a_benchmark_only_engine() {
+        let mut config = Config::default();
+        config.engine = "qwen".to_string();
+        let args: Vec<String> = ["voclaude", "--bench", "audio.wav", "--engine", "whisper"]
+            .iter().map(|s| s.to_string()).collect();
+        apply_cli_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.engine, "qwen");
+
+        let normal: Vec<String> = ["voclaude", "--engine", "whisper"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(apply_cli_overrides(&mut config, &normal).is_err());
     }
 }
 

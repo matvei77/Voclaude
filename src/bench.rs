@@ -65,6 +65,9 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         .position(|a| a == "--engine")
         .and_then(|i| args.get(i + 1).cloned())
         .unwrap_or_else(|| "qwen".to_string());
+    if !matches!(engine_kind.as_str(), "qwen" | "whisper") {
+        return Err("--bench supports qwen or whisper; use --test with --engine parakeet for Parakeet".into());
+    }
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -138,7 +141,7 @@ pub fn run(config: &Config, args: &[String]) -> Result<(), Box<dyn std::error::E
         );
     }
     let seg_cfg = SegmenterConfig {
-        min_secs: config.segment_min_seconds,
+        min_secs: config.segment_min_secs(),
         max_secs: config.segment_max_seconds,
         pause_secs: config.segment_pause_seconds,
     };

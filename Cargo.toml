@@ -48,20 +48,30 @@ ureq = "2"               # API CLI client (already pulled in by hf-hub)
 half = "2.4"
 num-traits = "0.2"
 
-# Windows message loop
+# Parakeet (and other GGUF speech models) through transcribe.cpp/ggml. Links the
+# official prebuilt DLLs laid out by fetch-transcribe.ps1, which exports
+# TRANSCRIBE_DIR for the shell. transcribe.dll is delay-loaded (build.rs).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+transcribe-cpp = { version = "0.4.1", default-features = false, features = ["dynamic-backends"] }
+transcribe-cpp-sys = { version = "0.4.1", default-features = false }   # native log callback
+
+# Windows message loop
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"      # embeds assets/icon.ico into voclaude.exe
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 notify-rust = "4.11"
+# Build the native runtime statically on other platforms; the Windows DLL
+# prefix and dynamic backend modules must not leak into macOS/Linux builds.
+transcribe-cpp = { version = "0.4.1", default-features = false }
+transcribe-cpp-sys = { version = "0.4.1", default-features = false }
 
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "transcribe-cpp/metal"]
 cpu = []
 
 [profile.release]
