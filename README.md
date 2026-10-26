@@ -153,6 +153,7 @@ idle_unload_seconds = 60
 use_gpu = true
 engine = "parakeet"          # or "qwen"
 parakeet_model = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf"
+parakeet_recheck = true      # short Russian phrases inside English come out in Cyrillic
 model = "Qwen/Qwen3-ASR-1.7B" # Qwen engine only
 quantization = "q8_0"        # Qwen engine only; "none" for F16 weights
 streaming = true             # transcribe segments while recording

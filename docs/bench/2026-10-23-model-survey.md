@@ -185,6 +185,43 @@ reference for RU/EN switching inside one segment (Voxtral and Scribe drop a lang
 mixed clips; GPT Transcribe drops 2 but has no zero-data-retention endpoint). Raw outputs:
 `D:\voclaude-model-eval\out\app`, `cloud`, `judge`, `side-by-side` (local only).
 
+## Follow-up, 2026-10-26: a Russian phrase inside English
+
+A live dictation, "…it's called кассовый разрыв to cover everyone's salaries…", came out as
+"Casa Veras Riv". The phrase was ~1.3 s of Russian in a 7 s segment of English, and Parakeet writes
+a segment in the alphabet of its main language. Same audio, different windows:
+
+| Window | Parakeet Ultra Q6_K | Qwen3-ASR-1.7B Q8_0 |
+|---|---|---|
+| The app's segment (7 s) | Casa Veras Riv | Casabreras Riv |
+| 5 English words before the phrase | Kassovir Reserve | Casaberaz River |
+| 2 English words before | **кассовый разрыв** | cash flow gap (translated) |
+| 1 English word before | **кассовый разрыв** | Скользка с кассовый разрыв |
+
+`RunOptions::language = "ru"` changes nothing for Parakeet. In the other direction (English terms
+inside Russian, the 58-minute meeting) the two models are even: in Russian segments Parakeet kept 128
+words in Latin letters and Qwen 114, each different ones (Parakeet: MCP, GPT, Kimi; Qwen: install,
+playground, sales pipeline).
+
+**Fix: `parakeet_recheck` (default on).** English words below 0.85 confidence (growing through
+neighbours below 0.90) are decoded again with up to two words of context on each side. The result
+replaces them if it comes back in Cyrillic with confidence ≥ 0.90 and at least 0.10 above the
+originals. Over the 3.4 h of personal recordings (12,280 words, cut with the app's 6 s segmenter) plus
+the 20 switch clips: 139 re-decodes and 2 replacements. One is the phrase above, now correct. The other
+turned the end of a meeting segment Parakeet had decoded as Latvian into Russian ("2000 euro mesi." →
+"2000 тысяч евро в месяц."), but that segment is still garbled. No English was changed. Two runs gave
+identical output, and the app's worker produced the same text as the probe on all 1,902 segments, at
+the same wall time (re-decodes were 5 % of probe GPU time). CPU cost is not measured. Re-decoding unsure words of Russian segments in Latin letters is
+not done: it produced Slovak ("To všetko" for "утром,").
+
+Two corrections to the code-switching numbers above. switch-08 and switch-14 have references that do
+not match their audio, and switch-11's audio holds only half of its English sentence. The "3 clips
+losing a language for every model" is therefore mostly reference errors. At 6 s segments Parakeet
+decoded 2 of 539 meeting segments in the wrong language (Latvian, Polish), against 1 of 170 at 20 s.
+
+The evidence for the re-check is one real mixed dictation; the hand-corrected code-switching set below
+is still the way to measure it properly.
+
 ## Not measured / next steps
 
 - **Segment length:** the meeting runs above used the app's old 20–45 s segments. The app now cuts

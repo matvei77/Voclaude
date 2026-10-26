@@ -71,6 +71,12 @@ pub struct Config {
     #[serde(default)]
     pub cpu_threads: u32,
 
+    /// Decode English words Parakeet was unsure of again on their own, and keep
+    /// the result if it comes back as confident Russian. Fixes short Russian
+    /// phrases inside English that would otherwise be spelled in Latin letters.
+    #[serde(default = "default_true")]
+    pub parakeet_recheck: bool,
+
     /// User-facing model tier. Used when `model` is not explicitly set.
     #[serde(default = "default_model_tier")]
     pub model_tier: String,
@@ -171,6 +177,7 @@ impl Default for Config {
             engine: default_engine(),
             parakeet_model: default_parakeet_model(),
             cpu_threads: 0,
+            parakeet_recheck: true,
             model_tier: default_model_tier(),
             auto_select_model: default_auto_select_model(),
             model: default_model(),
@@ -221,7 +228,7 @@ impl Config {
                     "config_version", "hotkey", "history_hotkey", "language",
                     "add_trailing_space", "capitalize_first", "idle_unload_seconds",
                     "show_notifications", "history_max_entries", "use_gpu",
-                    "engine", "parakeet_model", "cpu_threads", "model_tier", "auto_select_model", "model", "model_path",
+                    "engine", "parakeet_model", "cpu_threads", "parakeet_recheck", "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
                     "require_gpu", "audio_retention_count", "legacy_prompt", "quantization",
                     "streaming", "segment_min_seconds", "segment_max_seconds",
