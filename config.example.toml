@@ -43,6 +43,13 @@ parakeet_model = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf"
 # CPU threads for Parakeet when it runs on the CPU (0 = automatic).
 cpu_threads = 0
 
+# Parakeet writes a segment in the alphabet of its main language, so a short
+# Russian phrase inside English comes out spelled in Latin letters ("Casa Veras
+# Riv" for "кассовый разрыв"). With this on, English words the model was unsure
+# of are decoded again with a word or two of context, and the result is kept if
+# it comes back as confident Russian. Costs ~5% extra GPU time.
+parakeet_recheck = true
+
 # Model tier (Qwen engine):
 #   fast / small / medium  = Qwen3-ASR-0.6B, lower memory, best for CPU or laptop GPUs
 #   best / large / accurate = Qwen3-ASR-1.7B, highest quality, best for stronger NVIDIA GPUs
