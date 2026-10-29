@@ -42,6 +42,8 @@ pub enum AppEvent {
     OpenLastTranscript,
     /// Open config file
     OpenSettings,
+    /// Open the folder with the log files
+    OpenLogsFolder,
     /// Quit requested
     Quit,
     /// Inference progress update
@@ -94,6 +96,7 @@ impl AppEvent {
             AppEvent::OpenTranscriptsFolder => "OpenTranscriptsFolder",
             AppEvent::OpenLastTranscript => "OpenLastTranscript",
             AppEvent::OpenSettings => "OpenSettings",
+            AppEvent::OpenLogsFolder => "OpenLogsFolder",
             AppEvent::Quit => "Quit",
             AppEvent::InferenceProgress(_) => "InferenceProgress",
             AppEvent::TranscriptionComplete(Ok(_)) => "TranscriptionComplete(ok)",
@@ -348,7 +351,16 @@ impl App {
         info!("Initializing components...");
 
         // Initialize tray icon - MUST keep alive!
-        let _tray = TrayManager::new(self.event_tx.clone())?;
+        let _tray = TrayManager::new(
+            self.event_tx.clone(),
+            &self.config.hotkey,
+            &self.config.history_hotkey,
+        )?;
+        _tray.set_engine_status(&format!(
+            "{} · {} (loads on first use)",
+            self.config.model_display_name(),
+            if self.config.use_gpu { "GPU" } else { "CPU" }
+        ));
         info!("Tray icon ready");
 
         // Initialize hotkey listener - single unified thread for all hotkeys
@@ -368,8 +380,8 @@ impl App {
         let audio = AudioCapture::new(Some(level_tx), Some(segment_tx), self.config.segmenter_config())?;
         info!("Audio capture ready");
 
-        // No preflight — model loads lazily on first transcription.
-        // If it fails, the user gets immediate feedback via the HUD.
+        // No preflight: the model loads when the first recording starts. A
+        // failure shows in the tray tooltip and the History window status bar.
 
         // Initialize inference worker (lazy - loads model on demand)
         let inference_shutdown = Arc::new(AtomicBool::new(false));
@@ -422,7 +434,10 @@ impl App {
         let mut pending_audio_metadata: Option<AudioMetadata> = None;
         let mut last_progress_stage: Option<InferenceStage> = None;
         let mut transcribe_started_at: Option<Instant> = None;
-        let mut last_transcript_path: Option<PathBuf> = None;
+        // last_transcript.txt is rewritten after every transcription, so the
+        // tray's "Open Last Transcript" works after a restart too.
+        let mut last_transcript_path: Option<PathBuf> =
+            last_transcript_output_path().filter(|path| path.exists());
 
         // Live (streaming) session bookkeeping
         let mut live: Option<LiveSession> = None;
@@ -445,6 +460,7 @@ impl App {
                 }
             }
         }
+        _tray.set_recoverable(recoverable_now(&session_store));
         if recover_request_at_start {
             let _ = self.event_tx.send(AppEvent::RecoverLastRecording);
         }
@@ -682,6 +698,7 @@ impl App {
                                         Err(e) => {
                                             error!("Failed to start recording: {}", e);
                                             _tray.set_state(AppState::Idle);
+                                            _tray.set_tooltip_message(&shorten_error_message(&e.to_string(), 100));
                                             notifications.notify("Failed to start recording");
                                             ui_status.state = "Idle".to_string();
                                             ui_status.last_message = Some(format!("Recording failed: {}", e));
@@ -844,6 +861,7 @@ impl App {
                             ui_status.use_gpu = using_gpu;
                             ui_status.model = model;
                             ui_status.model_size_mb = Some(model_size_mb);
+                            _tray.set_engine_status(&engine_status_line(&ui_status.model, using_gpu));
                             if self.config.use_gpu && !using_gpu {
                                 ui_status.last_message =
                                     Some("GPU init failed; using CPU".to_string());
@@ -914,16 +932,19 @@ impl App {
                                         }
                                     }
 
-                                    if let Some(path) = saved_transcript_path.as_ref() {
-                                        last_transcript_path = Some(path.clone());
-                                    } else if !history_text.is_empty() {
+                                    // last_transcript.txt always holds the newest text, so the
+                                    // tray's "Open Last Transcript" works across restarts.
+                                    if !history_text.is_empty() {
                                         if let Some(path) = last_transcript_output_path() {
                                             if let Err(err) = write_transcript_file(&path, &history_text) {
                                                 warn!("Failed to save last transcript: {}", err);
-                                            } else {
+                                            } else if saved_transcript_path.is_none() {
                                                 last_transcript_path = Some(path);
                                             }
                                         }
+                                    }
+                                    if let Some(path) = saved_transcript_path.as_ref() {
+                                        last_transcript_path = Some(path.clone());
                                     }
                                     let mut history_entry_id = None;
                                     let mut history_error = None;
@@ -1014,6 +1035,7 @@ impl App {
                             pending_audio_metadata = None;
                             last_progress_stage = None;
                             _tray.set_state(AppState::Idle);
+                            _tray.set_recoverable(recoverable_now(&session_store));
                             ui_status.input_level = Some(0.0);
                             self.ui.set_status(ui_status.clone());
 
@@ -1128,6 +1150,7 @@ impl App {
                             let Some(path) = session.audio_path().filter(|p| p.exists()) else {
                                 notifications.notify("Audio for the last recording is gone");
                                 let _ = session_store.mark_failed("Recovery audio file missing".to_string());
+                                _tray.set_recoverable(false);
                                 continue;
                             };
                             match recover_live_session(&session, &path, self.config.segmenter_config()) {
@@ -1211,12 +1234,14 @@ impl App {
                             idle_unload_requested = false;
                             match last_transcript_path.as_ref() {
                                 Some(path) if path.exists() => {
-                                    if let Err(err) = open_path(path) {
+                                    if let Err(err) = open_text_file(path) {
                                         warn!("Failed to open transcript: {}", err);
                                     }
                                 }
                                 _ => {
+                                    // Nothing saved yet: the History window is the visible fallback.
                                     notifications.notify("No saved transcript yet");
+                                    let _ = self.event_tx.send(AppEvent::ShowHistoryWindow);
                                 }
                             }
                         }
@@ -1225,7 +1250,7 @@ impl App {
                             idle_unload_requested = false;
                             match ensure_config_file() {
                                 Ok(path) => {
-                                    if let Err(err) = open_path(&path) {
+                                    if let Err(err) = open_text_file(&path) {
                                         warn!("Failed to open config file: {}", err);
                                     } else {
                                         // Validate config after user potentially edits it.
@@ -1286,6 +1311,13 @@ impl App {
                             idle_unload_requested = false;
                             if let Err(err) = open_transcripts_folder() {
                                 warn!("Failed to open transcripts folder: {}", err);
+                            }
+                        }
+                        AppEvent::OpenLogsFolder => {
+                            last_activity = Instant::now();
+                            idle_unload_requested = false;
+                            if let Err(err) = open_logs_folder() {
+                                warn!("Failed to open logs folder: {}", err);
                             }
                         }
                         AppEvent::ApiTranscribeRange { path, start, end, reply } => {
@@ -1495,6 +1527,51 @@ fn write_transcript_file(path: &Path, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn logs_dir() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.data_dir().join("logs"))
+}
+
+fn open_logs_folder() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(dir) = logs_dir() else {
+        return Err("Could not determine logs directory".into());
+    };
+    fs::create_dir_all(&dir)?;
+    open_path(&dir)
+}
+
+/// Whether the tray's "Recover Last Recording" has a recording to re-run.
+fn recoverable_now(store: &SessionStore) -> bool {
+    store
+        .current()
+        .map(|session| session.can_retry() && session.audio_path().is_some_and(|p| p.exists()))
+        .unwrap_or(false)
+}
+
+/// The first line of the tray menu: the worker's model label without the
+/// backend wrapper, plus the device class.
+fn engine_status_line(label: &str, using_gpu: bool) -> String {
+    let short = label
+        .strip_prefix("transcribe.cpp (")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(label);
+    format!("{} · {}", short, if using_gpu { "GPU" } else { "CPU" })
+}
+
+/// Open a text file in an editor. Windows starts notepad.exe explicitly:
+/// `.toml` has no default association on a stock install, so a ShellExecute
+/// "open" shows an "open with" prompt or nothing at all.
+fn open_text_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("notepad.exe").arg(path).spawn()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open_path(path)
+    }
+}
+
 fn open_transcripts_folder() -> Result<(), Box<dyn std::error::Error>> {
     let Some(dir) = transcripts_dir() else {
         return Err("Could not determine transcripts directory".into());
@@ -1532,7 +1609,8 @@ fn open_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn ensure_config_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path = Config::config_path().ok_or("Could not determine config path")?;
     if !path.exists() {
-        Config::default().save()?;
+        // `load` writes the commented example when the file is missing.
+        Config::load()?;
     }
     Ok(path)
 }

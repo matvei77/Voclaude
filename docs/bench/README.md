@@ -1,5 +1,17 @@
 # Bench results
 
+**Current state (2026-10-29):** the default engine is Parakeet Ultra Q6_K
+through transcribe.cpp. The measurements behind that decision, including
+FLEURS error rates for five languages, speed on the RTX 3060 (Vulkan) and the
+i5-13600K (CPU), code-switching tests and the cleanup-LLM survey, are in
+[2026-10-23-model-survey.md](2026-10-23-model-survey.md). The README's speed
+and accuracy tables are taken from that file and from the live app's logs.
+
+The sections below are the 2026-09-04 Qwen3-ASR measurements. They are still
+the reference for the optional `engine = "qwen"` path (`--bench` supports only
+qwen and whisper).
+
+
 All runs: RTX 3060 12 GB, Windows 11, Qwen3-ASR-1.7B via Candle 0.9, greedy
 decoding, 12 personal dictation recordings (29 min total: English, Russian and
 mixed), `voclaude --bench bench_data ...`. There is no hand-labelled

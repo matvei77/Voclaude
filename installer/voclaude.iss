@@ -1,11 +1,14 @@
 ; Inno Setup script for Voclaude.
 ;
 ; Built by package.ps1 -Installer, which passes the staging directory that
-; already holds voclaude.exe, the CUDA/MSVC runtime DLLs, config.example.toml
-; and README-FIRST.txt:
+; already holds voclaude.exe, the transcribe.cpp and MSVC runtime DLLs (plus
+; the CUDA DLLs for the -Cuda variant), config.example.toml and README-FIRST.txt:
 ;
-;   ISCC.exe /DAppVersion=0.4.0 /DStageDir=..\dist\voclaude-gpu ^
-;            /DOutputDir=..\dist /DVariant=gpu installer\voclaude.iss
+;   ISCC.exe /DAppVersion=0.6.0 /DStageDir=..\dist\voclaude-standard ^
+;            /DOutputDir=..\dist /DVariant=standard installer\voclaude.iss
+;
+; Variant "standard" produces voclaude-v0.6.0-setup.exe; "cuda" produces
+; voclaude-v0.6.0-cuda-setup.exe. Both install to the same place (same AppId).
 ;
 ; Design: a per-user install (no admin prompt) into %LOCALAPPDATA%\Programs,
 ; one wizard page ("start with Windows" checkbox), then the app launches.
@@ -14,13 +17,18 @@
   #define AppVersion "0.0.0"
 #endif
 #ifndef StageDir
-  #define StageDir "..\dist\voclaude-gpu"
+  #define StageDir "..\dist\voclaude-standard"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\dist"
 #endif
 #ifndef Variant
-  #define Variant "gpu"
+  #define Variant "standard"
+#endif
+#if Variant == "cuda"
+  #define Suffix "-cuda"
+#else
+  #define Suffix ""
 #endif
 
 [Setup]
@@ -39,7 +47,7 @@ DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 OutputDir={#OutputDir}
-OutputBaseFilename=voclaude-v{#AppVersion}-{#Variant}-setup
+OutputBaseFilename=voclaude-v{#AppVersion}{#Suffix}-setup
 Compression=lzma2/max
 SolidCompression=yes
 LZMAUseSeparateProcess=yes

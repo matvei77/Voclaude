@@ -89,26 +89,36 @@ Voclaude/
 │   ├── tray.rs              # System tray icon, context menu, state icons
 │   ├── session.rs           # Crash-recovery session journal (JSON)
 │   ├── history.rs           # Persistent transcription history (JSON)
+│   ├── worker.rs            # Inference child process (`--worker`), JSON-lines protocol
+│   ├── api.rs               # Local HTTP API (127.0.0.1:7770), `voclaude transcribe` CLI
+│   ├── bench.rs             # `voclaude --bench` harness (qwen / whisper)
 │   ├── audio/
 │   │   ├── mod.rs           # Re-exports: AudioCapture, processing, RingBuffer
 │   │   ├── capture.rs       # CPAL audio capture, writer thread, level meter
+│   │   ├── segmenter.rs     # Pause-based segmenter (live and whole-file)
 │   │   ├── processing.rs    # Mono downmix, linear resampler (streaming)
 │   │   └── ring_buffer.rs   # Lock-free SPSC ring buffer (power-of-2)
 │   └── inference/
-│       ├── mod.rs            # AsrEngine trait, InferenceProgress, re-exports
+│       ├── mod.rs            # AsrEngine trait, Engine enum (Parakeet | Qwen)
+│       ├── parakeet.rs       # Parakeet through transcribe.cpp (Vulkan or CPU), Russian re-check
 │       ├── candle_backend.rs # Full Qwen3-ASR-1.7B model (encoder+decoder+MRoPE)
 │       ├── candle_audio.rs   # PCM → 128-bin log-mel spectrogram (Whisper-compat)
 │       ├── candle_tokenizer.rs # HF tokenizer wrapper, ASR prompt template
-│       └── qwen.rs           # QwenEngine lifecycle (load/unload/HF resolution)
-├── assets/                   # PNG icons for tray states (idle/recording/processing)
+│       ├── qwen.rs           # QwenEngine lifecycle (load/unload/HF resolution)
+│       └── whisper_engine.rs # Whisper (bench only)
+├── assets/                   # Tray icons (PNG) and the exe icon (ICO)
 ├── docs/
-│   └── qwen3_asr_integration_plan.md
-├── Cargo.toml                # Manifest: cuda/cpu features, release LTO
-├── build.rs                  # Git hash embedding at compile time
-├── config.example.toml       # Reference config for distribution
-├── package.ps1               # PowerShell packaging: build + CUDA DLLs + zip
-├── README.md                 # User docs, build instructions, architecture
-└── PLAN.md                   # Engineering plan: 4-phase production hardening
+│   ├── API.md                # Local API reference
+│   ├── ROADMAP.md            # Assessment and next steps (2026-10-29)
+│   ├── bench/                # Measurements and model decisions
+│   └── history/              # Superseded plans (Feb and Sep 2026)
+├── installer/voclaude.iss    # Inno Setup script
+├── fetch-transcribe.ps1      # Downloads the transcribe.cpp runtime into vendor/
+├── package.ps1               # Build + stage DLLs + zip (+ installer); -Cuda variant
+├── Cargo.toml                # Manifest: default (no CUDA), cuda, metal features
+├── build.rs                  # Git hash, delay-load of transcribe.dll, exe icon
+├── config.example.toml       # Reference config; written as the user's config on first run
+└── README.md                 # User docs, build instructions, architecture
 ```
 
 ## Module Guide
@@ -534,3 +544,31 @@ what it covers, with these additions:
 - `src/ui.rs` — the egui thread starts lazily on the first history-window request.
 - `vendor/` — candle-core and float8 with cudarc `dynamic-loading`, so CUDA
   DLLs load on first GPU use (in the worker) instead of at process start.
+
+## Update 2026-10-29 (Parakeet engine, tray menu, build defaults)
+
+- `src/inference/parakeet.rs` — `ParakeetEngine`: Parakeet GGUF models through
+  the transcribe.cpp runtime (`transcribe-cpp` crate 0.4.1). Runs on the first
+  Vulkan GPU or on the CPU (per-ISA ggml module picked at runtime). Loads once
+  per worker, warms the Vulkan pipelines with silent inputs of 1, 5, 12 and
+  30 s, and transcribes each segment with token confidences. `recheck_russian`
+  re-decodes low-confidence English runs with two words of context and keeps
+  the result when it comes back as confident Cyrillic (`parakeet_recheck`).
+- `src/inference/mod.rs` — `Engine` enum selects `ParakeetEngine` or
+  `QwenEngine` from `config.engine`; both implement `AsrEngine`.
+- Segmenter defaults differ per engine (`Config::segment_min_secs`): 6 s for
+  Parakeet so each language gets its own segment, 20 s for Qwen.
+- `src/tray.rs` — the menu now starts with a disabled status line (model and
+  device, updated from `InferenceEngineInfo`), shows the hotkeys in the labels,
+  enables "Recover Last Recording" only when the session journal has work
+  (`TrayManager::set_recoverable`), and has "Open Logs Folder". "Edit Settings"
+  and "Open Last Transcript" open the file in notepad.exe on Windows; the last
+  transcript path is read from `last_transcript.txt` at startup.
+- `src/config.rs` — a first run writes `config.example.toml` (embedded with
+  `include_str!`) as the user's config, so the file the tray opens is commented.
+- Cargo features: the default build has no CUDA dependency (Parakeet on Vulkan
+  or CPU, Qwen on CPU). `cuda` adds Qwen on NVIDIA GPUs. `package.ps1 -Cuda`
+  builds that variant; `release.yml` has a `windows` job that needs no CUDA.
+- `docs/bench/2026-10-23-model-survey.md` — the measurements behind the
+  Parakeet decision (FLEURS WER, speed on the RTX 3060 and the i5-13600K,
+  code-switching, cleanup-LLM survey).
