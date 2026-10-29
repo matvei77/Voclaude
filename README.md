@@ -25,7 +25,9 @@ transcribes while you are still speaking.
 
 The installer needs no administrator rights. It installs into
 `%LOCALAPPDATA%\Programs\Voclaude` and starts the app. A Voclaude icon appears
-in the system tray (the bottom-right corner, next to the clock).
+in the system tray (the bottom-right corner, next to the clock). Windows 11
+often hides new tray icons behind the `^` chevron ("Show hidden icons"). Click
+the chevron and drag the Voclaude icon onto the taskbar to keep it visible.
 
 On the first dictation, Voclaude downloads the speech model (about 0.6 GB)
 from Hugging Face into `%USERPROFILE%\.cache\huggingface\hub`. This happens
@@ -92,7 +94,7 @@ Right-click the Voclaude icon:
 | Open Last Transcript | Opens the newest transcription in Notepad. Opens History when nothing has been dictated yet. |
 | Open Transcripts Folder | Opens the folder with saved transcripts. |
 | Recover Last Recording | Enabled only when the last recording did not finish. Re-runs the missing part. |
-| Edit Settings (config.toml) | Opens the settings file in Notepad. Saved changes apply without a restart, except the hotkeys. |
+| Edit Settings (config.toml) | Opens the settings file in Notepad. Changes saved within five minutes apply without a restart, except the hotkeys. |
 | Open Logs Folder | Opens the log files, useful when reporting a problem. |
 | Quit Voclaude | Stops the app. |
 
@@ -167,7 +169,7 @@ means one minute of speech in 0.6 s.
 | Hardware | Parakeet Ultra Q6_K | Wait per 20 s segment |
 |---|---|---|
 | NVIDIA RTX 3060, Vulkan | about 145x on a 58-minute meeting (170 live segments), up to 182x on short segments | under 0.15 s |
-| Intel i5-13600K, CPU, 6 threads | about 26x | about 0.8 s |
+| Intel i5-13600K, CPU | about 26x | about 0.8 s |
 | Laptop CPU (Intel Core Ultra class) | not measured, estimated 10 to 15x | estimated 1.5 to 2 s |
 | Apple Silicon | not measured for Parakeet | |
 
@@ -206,7 +208,9 @@ api_port = 7770
 ```
 
 See [config.example.toml](config.example.toml) for every option with
-comments. Saved changes apply at once. A changed hotkey needs a restart.
+comments. Changes saved within five minutes of opening the file from the tray
+menu apply without a restart, except the hotkeys. Later edits apply at the next
+start.
 
 **Hotkey format.** Modifiers `Ctrl`, `Alt`, `Shift`, `Win` joined with `+`,
 then a key: letters, digits, `F1` to `F12`, `Space`, `Enter`, `Tab`, `Escape`,
