@@ -1,30 +1,34 @@
 //! System tray icon with menu.
+//!
+//! On Windows the tray is the only surface that is always visible, so every
+//! menu item either produces a visible result or is disabled.
 
 use crate::app::{AppEvent, AppState};
 
 use crossbeam_channel::Sender;
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    TrayIcon, TrayIconBuilder,
-    Icon,
-};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error};
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    Icon, TrayIcon, TrayIconBuilder,
+};
 
-/// Embedded icons (will be replaced with actual assets)
+/// Embedded tray icons, one per state.
 const ICON_IDLE: &[u8] = include_bytes!("../assets/icon_idle.png");
 const ICON_RECORDING: &[u8] = include_bytes!("../assets/icon_recording.png");
 const ICON_PROCESSING: &[u8] = include_bytes!("../assets/icon_processing.png");
 
 /// Menu item IDs
+const MENU_STATUS: &str = "status";
 const MENU_TOGGLE: &str = "toggle";
 const MENU_HISTORY: &str = "history";
-const MENU_OPEN_TRANSCRIPTS: &str = "open_transcripts";
 const MENU_OPEN_LAST_TRANSCRIPT: &str = "open_last_transcript";
+const MENU_OPEN_TRANSCRIPTS: &str = "open_transcripts";
 const MENU_RECOVER: &str = "recover_last";
 const MENU_SETTINGS: &str = "settings";
+const MENU_OPEN_LOGS: &str = "open_logs";
 const MENU_QUIT: &str = "quit";
 
 /// Pre-decoded icon data cached as raw RGBA pixels to avoid re-decoding PNG on every state change.
@@ -48,7 +52,7 @@ impl CachedIcon {
     }
 
     /// Reconstruct a `tray_icon::Icon` from the cached RGBA data.
-    /// This performs only a memory copy — no PNG decoding.
+    /// This performs only a memory copy, no PNG decoding.
     fn to_icon(&self) -> Result<Icon, Box<dyn std::error::Error>> {
         let icon = Icon::from_rgba(self.rgba.clone(), self.width, self.height)?;
         Ok(icon)
@@ -57,9 +61,15 @@ impl CachedIcon {
 
 pub struct TrayManager {
     tray: TrayIcon,
+    /// Disabled first line: which model runs on which device.
+    status_item: MenuItem,
     toggle_item: MenuItem,
+    recover_item: MenuItem,
+    record_hotkey: String,
     state: Arc<Mutex<AppState>>,
     status_detail: Arc<Mutex<Option<String>>>,
+    /// Whether the session journal holds a recording that can be re-run.
+    recoverable: AtomicBool,
     // Pre-decoded icon cache (BUG 30 fix)
     icon_idle: CachedIcon,
     icon_recording: CachedIcon,
@@ -69,7 +79,13 @@ pub struct TrayManager {
 }
 
 impl TrayManager {
-    pub fn new(event_tx: Sender<AppEvent>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `record_hotkey` and `history_hotkey` are shown in the menu labels so a
+    /// user who forgot the keys can read them off the menu.
+    pub fn new(
+        event_tx: Sender<AppEvent>,
+        record_hotkey: &str,
+        history_hotkey: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Pre-decode all icon variants once at construction time (BUG 30 fix)
         let icon_idle = CachedIcon::from_png(ICON_IDLE)?;
         let icon_recording = CachedIcon::from_png(ICON_RECORDING)?;
@@ -79,26 +95,34 @@ impl TrayManager {
         let initial_icon = icon_idle.to_icon()?;
 
         // Create menu items
-        let toggle_item = MenuItem::with_id(MENU_TOGGLE, "Start Recording", true, None);
-        let history_item = MenuItem::with_id(MENU_HISTORY, "Show History", true, None);
-        let open_transcripts_item =
-            MenuItem::with_id(MENU_OPEN_TRANSCRIPTS, "Open Transcripts Folder", true, None);
+        let status_item = MenuItem::with_id(MENU_STATUS, "Starting...", false, None);
+        let toggle_item =
+            MenuItem::with_id(MENU_TOGGLE, format!("Start Recording ({})", record_hotkey), true, None);
+        let history_item =
+            MenuItem::with_id(MENU_HISTORY, format!("History ({})", history_hotkey), true, None);
         let open_last_transcript_item =
             MenuItem::with_id(MENU_OPEN_LAST_TRANSCRIPT, "Open Last Transcript", true, None);
-        let recover_item = MenuItem::with_id(MENU_RECOVER, "Recover Last Recording", true, None);
-        let settings_item = MenuItem::with_id(MENU_SETTINGS, "Settings...", true, None);
-        let separator = PredefinedMenuItem::separator();
+        let open_transcripts_item =
+            MenuItem::with_id(MENU_OPEN_TRANSCRIPTS, "Open Transcripts Folder", true, None);
+        // Enabled by `set_recoverable` once the journal says there is work.
+        let recover_item = MenuItem::with_id(MENU_RECOVER, "Recover Last Recording", false, None);
+        let settings_item = MenuItem::with_id(MENU_SETTINGS, "Edit Settings (config.toml)", true, None);
+        let open_logs_item = MenuItem::with_id(MENU_OPEN_LOGS, "Open Logs Folder", true, None);
         let quit_item = MenuItem::with_id(MENU_QUIT, "Quit Voclaude", true, None);
 
         // Build menu
         let menu = Menu::new();
+        menu.append(&status_item)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&toggle_item)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&history_item)?;
         menu.append(&open_last_transcript_item)?;
         menu.append(&open_transcripts_item)?;
         menu.append(&recover_item)?;
-        menu.append(&separator)?;
+        menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&settings_item)?;
+        menu.append(&open_logs_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&quit_item)?;
 
@@ -118,7 +142,6 @@ impl TrayManager {
 
         // Spawn menu event handler
         let event_tx_clone = event_tx.clone();
-        let _state_clone = state.clone();
         std::thread::spawn(move || {
             let receiver = MenuEvent::receiver();
             loop {
@@ -128,36 +151,20 @@ impl TrayManager {
                 }
                 match receiver.recv_timeout(Duration::from_millis(200)) {
                     Ok(event) => {
-                        match event.id.0.as_str() {
-                            MENU_TOGGLE => {
-                                debug!("Toggle recording clicked");
-                                let _ = event_tx_clone.send(AppEvent::HotkeyPressed);
-                            }
-                            MENU_SETTINGS => {
-                                debug!("Settings clicked");
-                                let _ = event_tx_clone.send(AppEvent::OpenSettings);
-                            }
-                            MENU_HISTORY => {
-                                debug!("History clicked");
-                                let _ = event_tx_clone.send(AppEvent::ShowHistoryWindow);
-                            }
-                            MENU_OPEN_TRANSCRIPTS => {
-                                debug!("Open transcripts clicked");
-                                let _ = event_tx_clone.send(AppEvent::OpenTranscriptsFolder);
-                            }
-                            MENU_OPEN_LAST_TRANSCRIPT => {
-                                debug!("Open last transcript clicked");
-                                let _ = event_tx_clone.send(AppEvent::OpenLastTranscript);
-                            }
-                            MENU_RECOVER => {
-                                debug!("Recover last recording clicked");
-                                let _ = event_tx_clone.send(AppEvent::RecoverLastRecording);
-                            }
-                            MENU_QUIT => {
-                                debug!("Quit clicked");
-                                let _ = event_tx_clone.send(AppEvent::Quit);
-                            }
-                            _ => {}
+                        let app_event = match event.id.0.as_str() {
+                            MENU_TOGGLE => Some(AppEvent::HotkeyPressed),
+                            MENU_SETTINGS => Some(AppEvent::OpenSettings),
+                            MENU_HISTORY => Some(AppEvent::ShowHistoryWindow),
+                            MENU_OPEN_TRANSCRIPTS => Some(AppEvent::OpenTranscriptsFolder),
+                            MENU_OPEN_LAST_TRANSCRIPT => Some(AppEvent::OpenLastTranscript),
+                            MENU_RECOVER => Some(AppEvent::RecoverLastRecording),
+                            MENU_OPEN_LOGS => Some(AppEvent::OpenLogsFolder),
+                            MENU_QUIT => Some(AppEvent::Quit),
+                            _ => None,
+                        };
+                        if let Some(app_event) = app_event {
+                            debug!("Tray menu: {}", event.id.0);
+                            let _ = event_tx_clone.send(app_event);
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -165,7 +172,7 @@ impl TrayManager {
                         continue;
                     }
                     Err(_) => {
-                        // Channel disconnected — exit the thread.
+                        // Channel disconnected: exit the thread.
                         break;
                     }
                 }
@@ -174,9 +181,13 @@ impl TrayManager {
 
         Ok(Self {
             tray,
+            status_item,
             toggle_item,
+            recover_item,
+            record_hotkey: record_hotkey.to_string(),
             state,
             status_detail,
+            recoverable: AtomicBool::new(false),
             icon_idle,
             icon_recording,
             icon_processing,
@@ -205,23 +216,23 @@ impl TrayManager {
             AppState::Idle => (
                 &self.icon_idle,
                 "Voclaude - Ready".to_string(),
-                "Start Recording",
+                format!("Start Recording ({})", self.record_hotkey),
             ),
             AppState::Recording => (
                 &self.icon_recording,
                 "Voclaude - Recording...".to_string(),
-                "Stop Recording",
+                format!("Stop Recording ({})", self.record_hotkey),
             ),
             AppState::Transcribing => (
                 &self.icon_processing,
                 detail
                     .map(|message| format!("Voclaude - {}", message))
                     .unwrap_or_else(|| "Voclaude - Processing...".to_string()),
-                "Processing...",
+                "Processing...".to_string(),
             ),
         };
 
-        // Reconstruct Icon from cached RGBA data — no PNG decode (BUG 30 fix)
+        // Reconstruct Icon from cached RGBA data, no PNG decode (BUG 30 fix)
         match cached_icon.to_icon() {
             Ok(icon) => {
                 if let Err(e) = self.tray.set_icon(Some(icon)) {
@@ -243,6 +254,10 @@ impl TrayManager {
 
         // Disable toggle during transcription
         self.toggle_item.set_enabled(state != AppState::Transcribing);
+
+        // Recovery only runs while idle
+        self.recover_item
+            .set_enabled(state == AppState::Idle && self.recoverable.load(Ordering::Relaxed));
     }
 
     pub fn set_progress(&self, message: &str) {
@@ -257,6 +272,30 @@ impl TrayManager {
                 error!("Failed to set tooltip: {}", e);
             }
         }
+    }
+
+    /// Put a message in the tooltip regardless of state, until the next state
+    /// change. Used for failures that would otherwise be invisible, such as a
+    /// missing microphone.
+    pub fn set_tooltip_message(&self, message: &str) {
+        let tooltip = format!("Voclaude - {}", message);
+        if let Err(e) = self.tray.set_tooltip(Some(&tooltip)) {
+            error!("Failed to set tooltip: {}", e);
+        }
+    }
+
+    /// Enable "Recover Last Recording" only when the session journal holds a
+    /// recording that can still be re-run. Takes effect while the app is idle.
+    pub fn set_recoverable(&self, recoverable: bool) {
+        self.recoverable.store(recoverable, Ordering::Relaxed);
+        let state = self.state.lock().ok().map(|state| *state).unwrap_or(AppState::Idle);
+        self.recover_item.set_enabled(state == AppState::Idle && recoverable);
+    }
+
+    /// The first menu line, for example
+    /// "parakeet-ultra-Q6_K on vulkan (NVIDIA GeForce RTX 3060)".
+    pub fn set_engine_status(&self, text: &str) {
+        self.status_item.set_text(text);
     }
 }
 

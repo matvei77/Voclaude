@@ -9,6 +9,8 @@ pub const MODEL_QWEN3_ASR_0_6B: &str = "Qwen/Qwen3-ASR-0.6B";
 pub const MODEL_QWEN3_ASR_1_7B: &str = "Qwen/Qwen3-ASR-1.7B";
 /// Default Parakeet model, as `<owner>/<repo>/<file>` on Hugging Face.
 pub const DEFAULT_PARAKEET_MODEL: &str = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf";
+/// The commented reference config. Written as the user's config on first run.
+pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
 
 /// Return the canonical ProjectDirs for the application.
 pub fn project_dirs() -> Option<ProjectDirs> {
@@ -249,8 +251,10 @@ impl Config {
             }
             config
         } else {
-            let config = Config::default();
-            config.save()?;
+            // First run: write the commented example, so "Edit Settings" opens
+            // a file that explains every option, then use exactly what was written.
+            let config: Config = toml::from_str(EXAMPLE_CONFIG)?;
+            Self::write_atomic(&path, EXAMPLE_CONFIG)?;
             config
         };
 
@@ -322,13 +326,13 @@ impl Config {
         Ok(())
     }
 
-    /// Save config to disk atomically (write-temp-then-rename).
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let path = Self::config_path().ok_or("Could not determine config path")?;
+    /// Write `contents` to `path` through a temp file and a rename, so a crash
+    /// or power cut never leaves a half-written config. The app never
+    /// serializes `Config` back to disk: the user's file keeps its comments.
+    fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let contents = toml::to_string_pretty(self)?;
         // P-2: Use unique temp path with PID+timestamp to avoid collision on crash
         let pid = std::process::id();
         let ts = std::time::SystemTime::now()
@@ -344,7 +348,7 @@ impl Config {
         // Retry rename for Windows antivirus/indexer
         let mut last_err = None;
         for attempt in 0..5u32 {
-            match std::fs::rename(&temp_path, &path) {
+            match std::fs::rename(&temp_path, path) {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     if attempt < 4 {
@@ -641,6 +645,19 @@ mod tests {
         config.validate().expect("default config should be valid");
         assert_eq!(config.config_version, 1);
         assert_eq!(config.hotkey, "F4");
+    }
+
+    #[test]
+    fn example_config_is_the_first_run_config() {
+        let config: Config = toml::from_str(EXAMPLE_CONFIG).expect("config.example.toml must parse");
+        config.validate().expect("config.example.toml must validate");
+        let defaults = Config::default();
+        assert!(config.uses_parakeet());
+        assert_eq!(config.parakeet_model, defaults.parakeet_model);
+        assert_eq!(config.hotkey, defaults.hotkey);
+        assert_eq!(config.history_hotkey, defaults.history_hotkey);
+        assert_eq!(config.api_port, defaults.api_port);
+        assert_eq!(config.streaming, defaults.streaming);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 [package]
 name = "voclaude"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "Voice input anywhere - local-first, GPU-accelerated speech-to-text"
+description = "Voice input anywhere - local speech-to-text in the system tray (Parakeet Ultra, 25 languages)"
 license = "MIT"
 repository = "https://github.com/matvei77/Voclaude"
 
@@ -69,9 +69,15 @@ transcribe-cpp = { version = "0.4.1", default-features = false }
 transcribe-cpp-sys = { version = "0.4.1", default-features = false }
 
 [features]
-default = ["cuda"]
+# The default build needs no CUDA toolkit: Parakeet runs on any Vulkan GPU or
+# on the CPU through the transcribe.cpp runtime, and the Qwen engine runs on
+# the CPU through candle.
+default = []
+# Qwen3-ASR on NVIDIA GPUs through candle's CUDA kernels. Needs the CUDA
+# toolkit and MSVC's cl.exe on PATH at build time (package.ps1 -Cuda).
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "transcribe-cpp/metal"]
+# Kept so the older `--no-default-features --features cpu` command still works.
 cpu = []
 
 [profile.release]

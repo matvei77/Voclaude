@@ -231,9 +231,15 @@ fn main() {
             println!("  max_chunk_seconds: {}", config.max_chunk_seconds);
 
             let mut engine = Engine::from_config(&config)?;
-            println!("Engine init: OK (gpu={})", engine.active_gpu());
+            println!("Engine init: OK");
             engine.prepare(None)?;
-            println!("Model load: OK");
+            // The device is known only after the load (Parakeet falls back to
+            // the CPU when no Vulkan GPU works).
+            println!(
+                "Model load: OK ({}, {})",
+                engine.model_label(),
+                if engine.active_gpu() { "GPU" } else { "CPU" }
+            );
             drop(engine);
 
             // O-4: Test audio device availability (previously missing)

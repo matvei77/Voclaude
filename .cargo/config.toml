@@ -1,23 +1,13 @@
-# Build configuration for Voclaude
-# Sets CUDA environment for whisper-rs-sys cmake build
+# Build configuration for Voclaude.
+#
+# Quantized (Q8_0) CPU inference in the Qwen engine uses candle's AVX2 dot
+# products, which are selected at compile time. Every x86-64 CPU since 2013
+# has AVX2+FMA.
+#
+# CUDA (the optional `cuda` feature) is found through the CUDA_PATH environment
+# variable of the shell that runs cargo; `[target.*.env]` tables are not valid
+# cargo configuration and were removed.
 
-# Note: These environment variables are platform-specific.
-# On Linux, CUDA is typically found automatically at /usr/local/cuda
-# or via the system's pkg-config.
-
-[target.x86_64-pc-windows-msvc.env]
-# Use CUDA 12.8 (not 13.1 which has linking issues)
-CUDA_PATH = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
-# Use Ninja generator to avoid VS CUDA integration issues
-CMAKE_GENERATOR = "Ninja"
-
-[target.x86_64-unknown-linux-gnu.env]
-# Linux typically auto-detects CUDA at /usr/local/cuda
-# Uncomment if you have CUDA in a non-standard location:
-# CUDA_PATH = "/usr/local/cuda"
-
-# Quantized (Q8_0) CPU inference uses candle's AVX2 dot products, which are
-# selected at compile time. Every x86-64 CPU since 2013 has AVX2+FMA.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+avx2,+fma"]
 

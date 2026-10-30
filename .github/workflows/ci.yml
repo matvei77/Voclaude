@@ -1,0 +1,28 @@
+# Build and test the standard Windows build on every push and pull request.
+# No CUDA toolkit is needed: the transcribe.cpp runtime comes from
+# fetch-transcribe.ps1 and the Qwen engine compiles for the CPU.
+name: ci
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: transcribe.cpp runtime
+        shell: pwsh
+        run: |
+          .\fetch-transcribe.ps1
+          "TRANSCRIBE_DIR=$env:TRANSCRIBE_DIR" >> $env:GITHUB_ENV
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+      - name: Version
+        run: .\target\release\voclaude.exe --version

@@ -1,15 +1,21 @@
-﻿# package.ps1 - Build Voclaude and package it with CUDA DLLs for distribution.
+﻿# package.ps1 - Build Voclaude and package it for distribution.
 #
 # Usage:
-#   .\package.ps1            # GPU build (default, bundles CUDA runtime DLLs)
-#   .\package.ps1 -Cpu       # CPU-only build (no CUDA DLLs, smaller)
+#   .\package.ps1                    # standard build: Parakeet on Vulkan or CPU, Qwen on CPU
+#   .\package.ps1 -Installer         # also build the Inno Setup installer
+#   .\package.ps1 -Cuda -Installer   # CUDA build: adds the Qwen engine on NVIDIA GPUs
 #
-# Output:
-#   dist\voclaude-gpu.zip    or    dist\voclaude-cpu.zip
+# Output (dist\):
+#   voclaude-vX.Y.Z-<hash>.zip          voclaude-vX.Y.Z-setup.exe
+#   voclaude-vX.Y.Z-<hash>-cuda.zip     voclaude-vX.Y.Z-cuda-setup.exe
+#
+# The standard build needs no CUDA toolkit. The CUDA build needs the toolkit,
+# MSVC's cl.exe (found through vswhere) and bundles the CUDA runtime DLLs.
+# Keep this file ASCII only: PowerShell 5.1 misreads UTF-8 without a BOM.
 
 param(
-    [switch]$Cpu,
-    [switch]$Installer   # also build dist\voclaude-vX.Y.Z-<variant>-setup.exe with Inno Setup
+    [switch]$Cuda,
+    [switch]$Installer
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,20 +27,30 @@ $Version     = (Select-String -Path (Join-Path $ProjectRoot "Cargo.toml") -Patte
 $GitHash     = (git -C $ProjectRoot rev-parse --short=8 HEAD 2>$null)
 if (-not $GitHash) { $GitHash = "unknown" }
 
-# Build CUDA kernels for compute capability 7.5 (GTX 16xx / RTX 20xx) unless
-# told otherwise; newer GPUs JIT the PTX. Without this, candle-kernels asks
-# nvidia-smi and targets only the build machine's GPU generation.
-if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = "75" }
+if ($Cuda) {
+    $Variant = "cuda"
+    $Suffix  = "-cuda"
+} else {
+    $Variant = "standard"
+    $Suffix  = ""
+}
 
-# nvcc needs MSVC's cl.exe on PATH; find it through vswhere when the shell
-# is not a Visual Studio developer prompt.
-if (-not $Cpu -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
-    $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $VsWhere) {
-        $Cl = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" | Select-Object -First 1
-        if ($Cl) {
-            $env:PATH = (Split-Path $Cl) + ";" + $env:PATH
-            Write-Host "Using MSVC compiler: $Cl" -ForegroundColor DarkGray
+if ($Cuda) {
+    # Build CUDA kernels for compute capability 7.5 (GTX 16xx / RTX 20xx) unless
+    # told otherwise; newer GPUs JIT the PTX. Without this, candle-kernels asks
+    # nvidia-smi and targets only the build machine's GPU generation.
+    if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = "75" }
+
+    # nvcc needs MSVC's cl.exe on PATH; find it through vswhere when the shell
+    # is not a Visual Studio developer prompt.
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+        $VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path $VsWhere) {
+            $Cl = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" | Select-Object -First 1
+            if ($Cl) {
+                $env:PATH = (Split-Path $Cl) + ";" + $env:PATH
+                Write-Host "Using MSVC compiler: $Cl" -ForegroundColor DarkGray
+            }
         }
     }
 }
@@ -43,13 +59,11 @@ if (-not $Cpu -and -not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
 & (Join-Path $ProjectRoot "fetch-transcribe.ps1")
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
-if ($Cpu) {
-    $Variant = "cpu"
-    Write-Host "Building Voclaude v$Version (CPU-only)..." -ForegroundColor Cyan
-    cargo build --release --manifest-path "$ProjectRoot\Cargo.toml" --no-default-features --features cpu
+if ($Cuda) {
+    Write-Host "Building Voclaude v$Version (CUDA variant)..." -ForegroundColor Cyan
+    cargo build --release --manifest-path "$ProjectRoot\Cargo.toml" --features cuda
 } else {
-    $Variant = "gpu"
-    Write-Host "Building Voclaude v$Version (GPU/CUDA)..." -ForegroundColor Cyan
+    Write-Host "Building Voclaude v$Version (standard)..." -ForegroundColor Cyan
     cargo build --release --manifest-path "$ProjectRoot\Cargo.toml"
 }
 
@@ -79,8 +93,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "licenses") | Out
 Copy-Item -Recurse (Join-Path $ProjectRoot "vendor\transcribe-prebuilt\licenses") (Join-Path $StageDir "licenses\transcribe.cpp")
 Write-Host "  Bundled transcribe.cpp runtime ($((Get-ChildItem "$TranscribeBin\*.dll").Count) DLLs)" -ForegroundColor DarkGray
 
-# For GPU builds, bundle the required CUDA DLLs
-if (-not $Cpu) {
+# CUDA variant: bundle the CUDA runtime DLLs the Qwen engine imports.
+if ($Cuda) {
     # DLLs we need (nvcuda.dll ships with NVIDIA drivers, no need to bundle).
     # Keep this broader than the current import table because NVIDIA DLLs can
     # depend on sibling runtime DLLs depending on CUDA version.
@@ -142,30 +156,31 @@ if (-not $Cpu) {
         Copy-Item $entry.Value $StageDir
         Write-Host "  Bundled $dll" -ForegroundColor DarkGray
     }
+}
 
-    # MSVC runtime is frequently missing on clean corporate Windows images.
-    # Bundle it when present so users do not have to install VC++ redistributables.
-    $MsvcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
-    $MsvcRoots = @(
-        "$env:WINDIR\System32",
-        "$env:WINDIR\SysWOW64"
-    ) + ($env:PATH -split ';')
-    foreach ($dllName in $MsvcDlls) {
-        $dllPath = $null
-        foreach ($root in $MsvcRoots) {
-            if (-not $root -or -not (Test-Path $root)) { continue }
-            $candidate = Join-Path $root $dllName
-            if (Test-Path $candidate) {
-                $dllPath = $candidate
-                break
-            }
+# MSVC runtime is frequently missing on clean corporate Windows images.
+# Bundle it when present so users do not have to install VC++ redistributables.
+# voclaude.exe and transcribe.dll both import it.
+$MsvcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+$MsvcRoots = @(
+    "$env:WINDIR\System32",
+    "$env:WINDIR\SysWOW64"
+) + ($env:PATH -split ';')
+foreach ($dllName in $MsvcDlls) {
+    $dllPath = $null
+    foreach ($root in $MsvcRoots) {
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        $candidate = Join-Path $root $dllName
+        if (Test-Path $candidate) {
+            $dllPath = $candidate
+            break
         }
-        if ($dllPath) {
-            Copy-Item $dllPath $StageDir
-            Write-Host "  Bundled $dllName" -ForegroundColor DarkGray
-        } else {
-            Write-Host "  WARNING: Could not find $dllName" -ForegroundColor Yellow
-        }
+    }
+    if ($dllPath) {
+        Copy-Item $dllPath $StageDir
+        Write-Host "  Bundled $dllName" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  WARNING: Could not find $dllName" -ForegroundColor Yellow
     }
 }
 
@@ -176,45 +191,38 @@ if (Test-Path $ExampleConfig) {
 }
 
 $ReadmePath = Join-Path $StageDir "README-FIRST.txt"
-$ReadmeText = if ($Cpu) {
+$CudaNote = if ($Cuda) {
 @"
-Voclaude CPU build
-==================
 
-Run voclaude.exe. No Rust, Python, CUDA Toolkit, or NVIDIA GPU is required.
-
-The model downloads on first transcription. For normal corporate laptops, use
-model_tier = "medium" in config.toml so Voclaude uses Qwen3-ASR-0.6B.
-
-Useful checks:
-  voclaude.exe --validate --cpu --model-tier medium
-  voclaude.exe --list-models
+This CUDA build also runs the optional Qwen3-ASR engine on NVIDIA GPUs
+(engine = "qwen" in config.toml). The CUDA runtime DLLs are bundled. Do NOT
+install the CUDA Toolkit; a 2025 or newer NVIDIA driver is enough.
 "@
-} else {
-@"
-Voclaude GPU build
+} else { "" }
+$ReadmeText = @"
+Voclaude $Version
 ==================
 
-Run voclaude.exe. Do NOT install the CUDA Toolkit on the user's machine.
-This package bundles the CUDA runtime DLLs that Voclaude imports.
+Run voclaude.exe. It lives in the system tray.
+Press F4, speak, press F4 again, then paste with Ctrl+V.
 
 Requirements:
-  - Windows 10/11 64-bit
-  - NVIDIA GPU
-  - Recent NVIDIA driver
+  - Windows 10/11, 64-bit
+  - a microphone
+  - internet for the first run: the speech model (about 0.6 GB) downloads once
+  - any GPU with a Vulkan driver makes it faster; without one it runs on the CPU
 
-Useful checks:
-  voclaude.exe --validate --gpu --model-tier medium
+Settings: right-click the tray icon > Edit Settings (config.toml).
+Checks from a terminal:
+  voclaude.exe --validate
   voclaude.exe --list-models
-
-If validation says CUDA is unavailable, update the NVIDIA driver. The CUDA
-Toolkit is a developer dependency, not an end-user install step.
+$CudaNote
+Documentation: https://github.com/matvei77/Voclaude
 "@
-}
 Set-Content -Path $ReadmePath -Value $ReadmeText -Encoding ASCII
 
 # Create zip (include git hash for traceability)
-$ZipName = "voclaude-v$Version-$GitHash-$Variant.zip"
+$ZipName = "voclaude-v$Version-$GitHash$Suffix.zip"
 $ZipPath = Join-Path $DistDir $ZipName
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 
@@ -246,7 +254,7 @@ if ($Installer) {
             Write-Host "Installer build failed." -ForegroundColor Red
             exit 1
         }
-        $SetupPath = Join-Path $DistDir "voclaude-v$Version-$Variant-setup.exe"
+        $SetupPath = Join-Path $DistDir "voclaude-v$Version$Suffix-setup.exe"
         $SetupSize = (Get-Item $SetupPath).Length / 1MB
         Write-Host "Installer: $SetupPath ($([math]::Round($SetupSize, 1)) MB)" -ForegroundColor Green
     }

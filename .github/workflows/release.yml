@@ -1,13 +1,14 @@
-# Builds release artifacts when a tag like v0.4.0 is pushed.
+# Builds release artifacts when a tag like v0.6.0 is pushed.
 #
-# Windows: CUDA build, zipped with the CUDA runtime DLLs (same as package.ps1).
-#          STATUS 2026-09-04 (evening): candle-kernels is now vendored without
-#          the bf16 MoE kernels (vendor/candle-kernels), so compute 7.5 builds
-#          with any CUDA 12.x/13.x toolkit. The Jimver CUDA 13.0 install still
-#          failed last time; release zips and installers are built locally with
-#          `package.ps1 -Installer` (CUDA 13.1) until the hosted job is verified.
-# macOS:   Metal build. Compiles on macos-latest (verified 2026-09-04) but has
-#          not been run on a Mac yet; the artifact is unsigned.
+# windows:      the standard build (Parakeet on Vulkan or CPU, Qwen on CPU).
+#               Needs no CUDA toolkit. Produces the zip and the Inno Setup
+#               installer that the README points users to.
+# windows-cuda: adds the Qwen engine on NVIDIA GPUs (candle CUDA kernels).
+#               STATUS 2026-09-04: the Jimver CUDA install failed on the hosted
+#               runner last time; CUDA builds are made locally with
+#               `package.ps1 -Cuda -Installer` until this job is verified.
+# macos:        Metal build. Compiles on macos-latest (verified 2026-09-04) but
+#               has not been run on a Mac; the artifact is unsigned.
 name: release
 
 on:
@@ -17,6 +18,28 @@ on:
 
 jobs:
   windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Package (zip + installer)
+        shell: pwsh
+        run: .\package.ps1 -Installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voclaude-windows
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*-setup.exe
+
+  windows-cuda:
     runs-on: windows-2022 # CUDA 12.x does not accept VS 2025 on windows-latest
     continue-on-error: true
     steps:
@@ -29,22 +52,26 @@ jobs:
           cuda: "13.0.0"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
-      - name: Package
+      - name: Package (CUDA zip + installer)
         shell: pwsh
         env:
           # Runners have no GPU, so candle-kernels cannot ask nvidia-smi.
           # 7.5 = GTX 16xx / RTX 20xx; newer GPUs JIT the PTX.
           CUDA_COMPUTE_CAP: "75"
-        run: .\package.ps1
+        run: .\package.ps1 -Cuda -Installer
       - uses: actions/upload-artifact@v4
         with:
-          name: voclaude-windows
-          path: dist/*.zip
+          name: voclaude-windows-cuda
+          path: |
+            dist/*-cuda.zip
+            dist/*-cuda-setup.exe
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: |
+            dist/*-cuda.zip
+            dist/*-cuda-setup.exe
 
   macos:
     runs-on: macos-latest
@@ -53,7 +80,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build (Metal)
-        run: cargo build --release --no-default-features --features metal
+        run: cargo build --release --features metal
       - name: Package
         run: |
           mkdir -p dist/voclaude-macos
