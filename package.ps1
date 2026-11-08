@@ -7,8 +7,10 @@
 #   add -PatchedTranscribe            # bundle the phrase-bias transcribe.dll (parakeet_phrases)
 #
 # Output (dist\):
-#   voclaude-vX.Y.Z-<hash>.zip          voclaude-vX.Y.Z-setup.exe
-#   voclaude-vX.Y.Z-<hash>-cuda.zip     voclaude-vX.Y.Z-cuda-setup.exe
+#   voclaude-vX.Y.Z-<hash>.zip          voclaude-vX.Y.Z-setup.exe       voclaude-setup.exe
+#   voclaude-vX.Y.Z-<hash>-cuda.zip     voclaude-vX.Y.Z-cuda-setup.exe  voclaude-cuda-setup.exe
+# The setup files without a version are the same installers under a fixed
+# name, so .../releases/latest/download/voclaude-setup.exe always works.
 #
 # The standard build needs no CUDA toolkit. The CUDA build needs the toolkit,
 # MSVC's cl.exe (found through vswhere) and bundles the CUDA runtime DLLs.
@@ -215,8 +217,12 @@ $ReadmeText = @"
 Voclaude $Version
 ==================
 
-Run voclaude.exe. It lives in the system tray.
+Voclaude lives in the system tray (bottom right, next to the clock).
 Press F4, speak, press F4 again, then paste with Ctrl+V.
+
+Left-click the tray icon, or press Ctrl+Shift+H, to open the Voclaude window:
+your dictations, names to spell right, the model, settings, the local API
+and the log.
 
 Requirements:
   - Windows 10/11, 64-bit
@@ -224,7 +230,7 @@ Requirements:
   - internet for the first run: the speech model (about 0.6 GB) downloads once
   - any GPU with a Vulkan driver makes it faster; without one it runs on the CPU
 
-Settings: right-click the tray icon > Edit Settings (config.toml).
+Settings: the Settings and Model tabs of the window (saved to config.toml).
 Checks from a terminal:
   voclaude.exe --validate
   voclaude.exe --list-models
@@ -248,8 +254,9 @@ $FileCount = (Get-ChildItem $StageDir).Count
 Write-Host "`nPackaged $FileCount files -> $ZipName ($([math]::Round($ZipSize, 1)) MB)" -ForegroundColor Green
 Write-Host "Location: $ZipPath" -ForegroundColor Green
 
-# One-click installer (Inno Setup 6). Per-user install, no admin prompt,
-# optional "start with Windows", launches the app when done.
+# One-click installer (Inno Setup 6). Per-user install, no admin prompt, no
+# wizard pages; the first install starts Voclaude at sign-in; the app starts
+# when setup ends.
 if ($Installer) {
     $IsccCandidates = @(
         "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
@@ -259,6 +266,7 @@ if ($Installer) {
     $Iscc = $IsccCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $Iscc) {
         Write-Host "Inno Setup 6 not found (winget install JRSoftware.InnoSetup); skipping installer." -ForegroundColor Yellow
+        if ($env:GITHUB_ACTIONS) { exit 1 }  # a release without an installer is broken
     } else {
         Write-Host "`nBuilding installer..." -ForegroundColor Cyan
         & $Iscc /Q "/DAppVersion=$Version" "/DStageDir=$StageDir" "/DOutputDir=$DistDir" "/DVariant=$Variant" (Join-Path $ProjectRoot "installer\voclaude.iss")
@@ -269,6 +277,10 @@ if ($Installer) {
         $SetupPath = Join-Path $DistDir "voclaude-v$Version$Suffix-setup.exe"
         $SetupSize = (Get-Item $SetupPath).Length / 1MB
         Write-Host "Installer: $SetupPath ($([math]::Round($SetupSize, 1)) MB)" -ForegroundColor Green
+        # Same file under a fixed name for the releases/latest/download link.
+        $LatestPath = Join-Path $DistDir "voclaude$Suffix-setup.exe"
+        Copy-Item $SetupPath $LatestPath -Force
+        Write-Host "Installer: $LatestPath (fixed name)" -ForegroundColor Green
     }
 }
 

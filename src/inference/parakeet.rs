@@ -281,7 +281,12 @@ impl Loaded {
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let label = format!("{} on {}", name, where_);
         let phrase_bias = model.supports(Feature::Vocabulary);
-        info!("Loaded {} in {:.1}s", label, started.elapsed().as_secs_f64());
+        info!(
+            "Loaded {} in {:.1}s (phrase bias: {})",
+            label,
+            started.elapsed().as_secs_f64(),
+            if phrase_bias { "yes" } else { "no, this transcribe.dll lacks it; only exact spoken forms apply" }
+        );
         Ok(Loaded { session, _model: model, on_gpu, phrase_bias, label, size_mb })
     }
 }

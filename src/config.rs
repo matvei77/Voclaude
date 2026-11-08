@@ -2,7 +2,7 @@
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub const MODEL_QWEN3_ASR_0_6B: &str = "Qwen/Qwen3-ASR-0.6B";
@@ -12,9 +12,44 @@ pub const DEFAULT_PARAKEET_MODEL: &str = "handy-computer/parakeet-ultra-gguf/par
 /// The commented reference config. Written as the user's config on first run.
 pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
 
-/// Return the canonical ProjectDirs for the application.
-pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("com", "voclaude", "Voclaude")
+/// The app's folders: settings (`config.toml`), data (history, recordings,
+/// logs) and caches.
+pub struct AppDirs {
+    config: PathBuf,
+    data: PathBuf,
+    cache: PathBuf,
+}
+
+impl AppDirs {
+    pub fn config_dir(&self) -> &Path {
+        &self.config
+    }
+    pub fn data_dir(&self) -> &Path {
+        &self.data
+    }
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache
+    }
+}
+
+/// The app's folders. Normally the per-user folders (`%APPDATA%\voclaude\
+/// Voclaude\{config,data}`, `%LOCALAPPDATA%\voclaude\Voclaude\cache`). With
+/// `VOCLAUDE_HOME` set, all three are under that folder (`<home>\config`,
+/// `<home>\data`, `<home>\cache`): a separate profile for test runs.
+pub fn project_dirs() -> Option<AppDirs> {
+    if let Some(home) = home_override() {
+        return Some(AppDirs { config: home.join("config"), data: home.join("data"), cache: home.join("cache") });
+    }
+    ProjectDirs::from("com", "voclaude", "Voclaude").map(|d| AppDirs {
+        config: d.config_dir().to_path_buf(),
+        data: d.data_dir().to_path_buf(),
+        cache: d.cache_dir().to_path_buf(),
+    })
+}
+
+/// `VOCLAUDE_HOME`, when set and not empty.
+pub fn home_override() -> Option<PathBuf> {
+    std::env::var_os("VOCLAUDE_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +470,9 @@ impl Config {
     /// new `Voclaude` path.  Copies (not moves) for safety — the old directory
     /// is left intact.
     pub fn migrate_from_legacy() {
+        if home_override().is_some() {
+            return;
+        }
         let legacy = match ProjectDirs::from("com", "voclaude", "VoclaudeQwenRuntime") {
             Some(dirs) => dirs,
             None => return,

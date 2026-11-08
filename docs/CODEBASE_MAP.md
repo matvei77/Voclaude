@@ -29,11 +29,10 @@ graph TB
         TrayMgr[tray.rs<br/>Tray icon + menu]
     end
 
-    subgraph UI["UI Layer (egui/eframe)"]
-        UiMgr[ui.rs UiManager<br/>App-thread handle]
-        RootApp[ui.rs RootApp<br/>Invisible root viewport]
-        HistoryVP[History Viewport<br/>Deferred child window]
-        LogBuf[LogBuffer<br/>In-process tracing ring]
+    subgraph UI["Window process (voclaude console, egui/eframe)"]
+        Host[console_host.rs<br/>Spawns window, pipes status]
+        Console[console/mod.rs<br/>Status strip + 6 tabs]
+        Files[history.json, config.toml,<br/>unsure log, data/logs]
     end
 
     subgraph Inference["Inference Layer"]
@@ -59,12 +58,13 @@ graph TB
     AppLoop --> Capture
     AppLoop --> Session
     AppLoop --> History
-    AppLoop --> UiMgr
+    AppLoop --> Host
     AppLoop --> Clip
     AppLoop --> Config
     Main --> AppLoop
-    UiMgr -->|SharedUiState| RootApp
-    RootApp --> HistoryVP
+    Host -->|stdin JSON lines: status, level| Console
+    Console -->|stdout: commands| Host
+    Console -->|reads, edits via config_edit| Files
     Capture --> RingBuf
     RingBuf --> Processing
     Processing -->|audio.f32| QwenEng
@@ -83,7 +83,12 @@ Voclaude/
 ├── src/
 │   ├── main.rs              # Entry point, CLI args, logging init
 │   ├── app.rs               # Event loop, state machine, inference worker
-│   ├── ui.rs                # Multi-viewport egui (invisible root + history)
+│   ├── console/             # The Voclaude window, its own process (`voclaude console`): tabs, theme, IPC types
+│   ├── console_host.rs      # Tray side: start the window, stream status, receive commands
+│   ├── instance.rs          # One tray app per profile; a second launch opens the window
+│   ├── config_edit.rs       # Edit single settings in config.toml (comments kept, validated)
+│   ├── autostart.rs         # "Start with Windows" (HKCU Run value)
+│   ├── phrases.rs           # `voclaude phrases` and the Names tab's list logic
 │   ├── config.rs            # TOML config, validation, legacy migration
 │   ├── hotkey.rs            # Global hotkey registration, unified listener
 │   ├── tray.rs              # System tray icon, context menu, state icons
@@ -156,9 +161,9 @@ Idle ──[HotkeyPressed]──► Recording ──[HotkeyPressed]──► Tra
 | Inference worker | `spawn_inference_worker()` | Owns QwenEngine, processes commands |
 | Hotkey listener | `HotkeyManager` | Dispatches global hotkey events |
 | Tray menu | `TrayManager` | Dispatches menu click events |
-| egui/eframe | `UiManager` | Renders UI viewports |
-| Keepalive | `UiManager` | Repaint poke every 100ms |
-| Settings watcher | Ad-hoc | Polls config mtime on change |
+| Console reader/writer | `ConsoleHost` | Pipes to the window process, only while it is open |
+| Open-console listener | `instance::listen_for_open` | Waits for a second launch's signal |
+| Settings watcher | `spawn_settings_watcher` | Polls config mtime every 3 s |
 
 **Dependencies**: All other modules
 **Dependents**: `main.rs`
@@ -230,30 +235,26 @@ Idle ──[HotkeyPressed]──► Recording ──[HotkeyPressed]──► Tra
 
 ---
 
-### UI Layer (`src/ui.rs`)
+### Window (`src/console/`, `src/console_host.rs`)
 
-**Purpose**: egui multi-viewport UI — invisible root viewport hosting a deferred History child window, plus in-process `LogBuffer` for tracing.
+**Purpose**: the Voclaude window, run as its own process so the tray process never loads the GUI stack (OpenGL driver, fonts). Closing the window ends the process.
 
-| File | Purpose | Tokens |
-|------|---------|--------|
-| `src/ui.rs` | UiManager, RootApp, History viewport, LogBuffer | 5,726 |
-
-**Key types**: `LogBuffer`, `UiStatus`, `SharedUiState`, `UiManager`, `RootApp`
-
-**Viewport architecture**:
-```
-eframe thread ─── RootApp.update() [invisible 1×1 root, no taskbar]
-    └── ctx.show_viewport_deferred("voclaude_history") ─── History window
-```
+| File | Purpose |
+|------|---------|
+| `src/console/mod.rs` | `voclaude console [--ipc]` entry, status strip, sidebar, stdin reader, foreground handling |
+| `src/console/ipc.rs` | `Status`, `ToConsole` (status, level, history changed, focus), `FromConsole` (toggle recording, delete entry, recover) |
+| `src/console/{dictations,names,model,settings,api_tab,log_tab}.rs` | One file per tab |
+| `src/console/{theme,widgets,localtime}.rs` | Colours and system fonts, shared widgets, local-time formatting |
+| `src/console_host.rs` | Tray side: spawn, rate-limited status/level, commands as `AppEvent::ConsoleCommand` |
 
 **Patterns**:
-- Root viewport: 1×1 px, invisible, no decorations, intercepts close (CancelClose)
-- Keepalive thread pokes `request_repaint()` every 100ms
-- `viewport_alive` AtomicBool gates focus commands until first paint
-- `SharedUiState` is all-Arc, lock-poison tolerant
+- Live status only over the pipe; history, config, unsure log and logs are read from disk. Deletes go through the tray process (it owns `history.json`).
+- Settings are written with `config_edit::save` (toml_edit, then `Config` parse + `validate()` before `write_atomic`); the settings watcher applies them, so the file, the CLI and the window never disagree.
+- Engine settings are described per engine in `model.rs`; config.toml keys stay flat.
+- eframe drops repaints while the window is minimized, so `Focus` is handled on the stdin thread (`raise_own_window`), outside the `Live` lock.
 
-**Dependencies**: `eframe`, `winit`, `arboard`, `windows_sys`
-**Dependents**: `app.rs`
+**Dependencies**: `eframe`, `image`, `ureq` (API health), `hf_hub` (download state), `windows_sys`
+**Dependents**: `app.rs` (through `console_host`), `main.rs`
 
 ---
 
@@ -470,9 +471,9 @@ sequenceDiagram
 - **Console-less GUI**: `MessageBoxW` used for fatal errors since Windows GUI subsystem has no stdout.
 - **`eframe`/`winit` version lock**: eframe 0.27 requires winit 0.29; bumping one without the other breaks the build.
 
-### UI Race Conditions
-- **History viewport close race**: `show_viewport_deferred` close events only fire during active repaints; 200ms repaint timer mitigates but doesn't eliminate.
-- **Keepalive required**: without the 100ms repaint poke, egui stops repainting idle windows and events are missed.
+### Window
+- **Minimized window gets no `update()`**: eframe drops repaint requests while minimized; anything that must run then (restore + focus) runs on the stdin reader thread.
+- **Foreground rights**: the tray process calls `AllowSetForegroundWindow(child)` before sending `Focus`; the window attaches to the foreground thread's input for `SetForegroundWindow`.
 
 ## Navigation Guide
 
@@ -504,16 +505,18 @@ sequenceDiagram
 2. Processing: `src/audio/processing.rs` (downmix, resample)
 3. Ring buffer: `src/audio/ring_buffer.rs` (capacity, SPSC logic)
 
-**To add a new UI panel/viewport**:
-1. Add shared state fields to `SharedUiState` in `src/ui.rs`
-2. Add control methods to `UiManager`
-3. Add viewport rendering in `RootApp::update()` using `show_viewport_deferred`
+**To add a tab to the window**:
+1. Add a module under `src/console/` with a `State` and `show(&mut self, ui, env)`
+2. Add it to `Tab`/`TABS` and the central-panel match in `src/console/mod.rs`
+3. Live data from the tray process: add a field to `ipc::Status` (or a `ToConsole` message) and set it in `app.rs`
+
+**To test with sample data**: set `VOCLAUDE_HOME` to a scratch folder (config, data and cache live under it; hotkeys and `api_port` in that profile must differ from the running app's).
 
 **To build and package**:
 - Debug: `cargo build`
 - Release (GPU): `cargo build --release`
 - Release (CPU): `cargo build --release --no-default-features --features cpu`
-- Package: `powershell -File package.ps1` (bundles CUDA DLLs + zip)
+- Package: `.\package.ps1 -Installer -PatchedTranscribe` (what releases ship)
 
 ## Update 2026-09-04 (streaming, worker process, quantization)
 
@@ -535,7 +538,7 @@ what it covers, with these additions:
 - `src/inference/candle_backend.rs` — fused rms-norm/rope/softmax kernels,
   merged QKV and gate/up projections, optional Q8_0/Q4_K weights
   (`ProjLinear`), GGUF cache of the quantized projections under
-  `%LOCALAPPDATA%oclaude\Voclaude\cache\weights`, per-phase
+  `%LOCALAPPDATA%\voclaude\Voclaude\cache\weights`, per-phase
   `TranscribeStats`. The prompt template follows the model's
   `chat_template.json` (`candle_tokenizer.rs`, `PromptStyle`).
 - `src/bench.rs` — `voclaude --bench` harness (`--stream` simulates the live
@@ -572,3 +575,24 @@ what it covers, with these additions:
 - `docs/bench/2026-10-23-model-survey.md` — the measurements behind the
   Parakeet decision (FLEURS WER, speed on the RTX 3060 and the i5-13600K,
   code-switching, cleanup-LLM survey).
+
+## Update 2026-11-08 (names, the Voclaude window, one-click install)
+
+- `parakeet_phrases` (names to spell right) with a bounded decoder bias in a
+  patched `transcribe.dll` (`build-transcribe-patched.ps1`,
+  `docs/bench/intel-optimization/`), `voclaude phrases`, and the unsure-word
+  log. Details in `docs/bench/intel-optimization/QUALITY-Q1-PHRASES.md`.
+- `src/ui.rs` and its `LogBuffer` are gone. The window is `src/console/`, a
+  separate process (see "Window" above). The tray menu has five items; a left
+  click opens the window. Logs go to `data/logs` only (no ANSI colours); the
+  10-second main-loop status and window-message lines are debug/trace.
+- `src/instance.rs`: one tray app per data folder; a second launch signals the
+  running app to open its window.
+- `src/config.rs`: `project_dirs()` honours `VOCLAUDE_HOME` (test profiles).
+- Hotkeys and the API (port, token, model) are re-applied on a settings change
+  without a restart; config errors reach the window and the tray tooltip.
+- Install: `installer/voclaude.iss` has no wizard pages, writes the Run value on
+  the first install only, deletes stale CUDA DLLs in the standard variant, and
+  starts the app. `package.ps1` also writes `voclaude-setup.exe` for the
+  `releases/latest/download` link that `install.ps1` uses.
+- Next: tray-process memory and paged history, issue #7.

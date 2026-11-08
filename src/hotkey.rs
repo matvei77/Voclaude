@@ -99,7 +99,7 @@ impl HotkeyManager {
         Ok(Self { manager, hotkeys, shutdown, listener_handle: Some(listener_handle) })
     }
 
-    fn parse_hotkey(s: &str) -> Result<HotKey, Box<dyn std::error::Error>> {
+    pub(crate) fn parse_hotkey(s: &str) -> Result<HotKey, Box<dyn std::error::Error>> {
         let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
 
         let mut modifiers = Modifiers::empty();

@@ -16,30 +16,37 @@ transcribes while you are still speaking.
 
 ## Install (Windows)
 
-1. Open the [Releases](https://github.com/matvei77/Voclaude/releases) page.
-2. Download the newest `voclaude-vX.Y.Z-setup.exe` and run it.
-3. If Windows shows "Windows protected your PC", click **More info**, then
-   **Run anyway**. The installer is not code-signed yet.
-4. Keep the "Start Voclaude when I sign in" box checked if you want Voclaude
-   to be ready after every login. Click Install.
+**One click:** download
+[voclaude-setup.exe](https://github.com/matvei77/Voclaude/releases/latest/download/voclaude-setup.exe)
+and run it.
 
-The installer needs no administrator rights. It installs into
-`%LOCALAPPDATA%\Programs\Voclaude` and starts the app. A Voclaude icon appears
-in the system tray (the bottom-right corner, next to the clock). Windows 11
-often hides new tray icons behind the `^` chevron ("Show hidden icons"). Click
-the chevron and drag the Voclaude icon onto the taskbar to keep it visible.
+**One command**, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/matvei77/Voclaude/master/install.ps1 | iex
+```
+
+Either way there are no questions and no administrator prompt. Voclaude
+installs into `%LOCALAPPDATA%\Programs\Voclaude`, starts, and starts again
+every time you sign in to Windows (switch that off in Settings). Run the
+installer again to update; your settings, history and names stay.
+
+If Windows shows "Windows protected your PC", click **More info**, then
+**Run anyway**. The installer is not code-signed yet.
+
+A Voclaude icon appears in the system tray (the bottom-right corner, next to
+the clock). Windows 11 often hides new tray icons behind the `^` chevron
+("Show hidden icons"). Drag the Voclaude icon onto the taskbar to keep it
+visible.
 
 On the first dictation, Voclaude downloads the speech model (about 0.6 GB)
 from Hugging Face into `%USERPROFILE%\.cache\huggingface\hub`. This happens
-once. It needs an internet connection and takes a few minutes. The first run
-on a GPU also compiles the GPU programs once (about 10 s). Later starts load
-the model in 1 to 2 s.
+once and takes a few minutes. The first run on a GPU also compiles the GPU
+programs once (about 10 s). Later starts load the model in 1 to 2 s.
 
-Prefer no installer? `voclaude-vX.Y.Z-<hash>.zip` unzips anywhere. Run
-`voclaude.exe` from that folder.
-
-Releases before 0.6.0 ship the older Qwen3-ASR engine and the CUDA runtime.
-They still work, but they are more than 20 times larger and do not include Parakeet.
+Prefer no installer? The `voclaude-vX.Y.Z-<hash>.zip` on the
+[Releases](https://github.com/matvei77/Voclaude/releases) page unzips
+anywhere. Run `voclaude.exe` from that folder.
 
 ### Requirements
 
@@ -61,7 +68,8 @@ far faster than speech (see [Speed](#speed-and-latency)).
 2. Press **F4** again. The icon returns to normal and the text is on the clipboard.
 3. Press **Ctrl+V** in any program to paste.
 
-That is the whole workflow. Some details:
+That is the whole workflow. Left-click the tray icon (or press
+**Ctrl+Shift+H**) to open the Voclaude window. Some details:
 
 - **Mixed languages.** Voclaude cuts the recording into segments at pauses and
   recognizes each segment in its own language. An English sentence, a Russian
@@ -79,33 +87,47 @@ That is the whole workflow. Some details:
   it starts again. "Recover Last Recording" in the tray menu re-runs a failed
   transcription by hand.
 - **Idle footprint.** Inference runs in a separate process that exits after
-  60 s without work. While idle, Voclaude uses no video memory and about 20 MB
-  of RAM.
+  60 s without work, and the window is a separate process that ends when you
+  close it. While idle, Voclaude uses no video memory and about 20 MB of RAM.
+- **No pop-ups.** Voclaude shows no notifications. The tray icon turns red
+  while it records, and the window shows what it is doing.
+
+### The Voclaude window
+
+| Tab | What it is for |
+|---|---|
+| Dictations | Every dictation, newest first, with time and length. Search, copy, delete. Click a misspelled word to add it to Names. |
+| Names | Names and terms Parakeet should spell right, spellings worth adding, and a check of what the list changes on your recent recordings. |
+| Model | The speech engine, and only that engine's settings: model file, GPU or CPU, CPU threads, Russian re-check. |
+| Settings | Start with Windows, hotkeys, text formatting, live transcription, storage. |
+| API | Status, port and token of the local API, and ready-to-copy snippets, including a prompt for an agent. |
+| Log | What Voclaude did, in local time, with a level filter. |
+
+The strip across the top shows the state (Idle, Recording, Transcribing), the
+model, the device, the speed of the last dictation and the API port, with a
+Record button. Changes are saved to `config.toml` and apply within a few
+seconds, hotkeys included. `Ctrl+1` to `Ctrl+6` switch tabs.
 
 ### The tray menu
 
-Right-click the Voclaude icon:
+Left-click the icon to open the window. Right-click it for the menu:
 
 | Item | What it does |
 |---|---|
-| *model and device* | Shows which model is loaded and whether it runs on the GPU or the CPU. |
+| *model and device* | Which model runs, on the GPU or the CPU. |
 | Start Recording (F4) / Stop Recording (F4) | Same as the hotkey. |
-| History (Ctrl+Shift+H) | Opens the History window: every transcription, searchable, with a Copy button per entry. |
-| Open Last Transcript | Opens the newest transcription in Notepad. Opens History when nothing has been dictated yet. |
-| Open Transcripts Folder | Opens the folder with saved transcripts. |
+| Open Voclaude (Ctrl+Shift+H) | Opens the window, or brings it to the front. |
 | Recover Last Recording | Enabled only when the last recording did not finish. Re-runs the missing part. |
-| Edit Settings (config.toml) | Opens the settings file in Notepad. Saved changes apply within a few seconds, without a restart, except the hotkeys. |
-| Open Logs Folder | Opens the log files, useful when reporting a problem. |
-| Quit Voclaude | Stops the app. |
+| Quit Voclaude | Stops the app and closes the window. |
 
 ### Keyboard shortcuts
 
 | Shortcut | Action |
 |---|---|
 | `F4` | Start or stop recording |
-| `Ctrl+Shift+H` | Show or hide the History window |
+| `Ctrl+Shift+H` | Open the Voclaude window |
 
-Both are configurable (see [Settings](#settings)).
+Both can be changed in Settings.
 
 ## Languages
 
@@ -183,15 +205,17 @@ because segments are transcribed while you talk. Numbers are from
 
 ## Settings
 
-Voclaude writes a commented settings file on the first start:
+Change settings in the window (the Settings and Model tabs). They are stored
+in a commented file, which you can also edit by hand ("Open config.toml" at the
+bottom of Settings):
 
 `%APPDATA%\voclaude\Voclaude\config\config.toml`
 
-Open it from the tray menu ("Edit Settings"). The most useful options:
+The most useful options:
 
 ```toml
 hotkey = "F4"                   # start or stop recording
-history_hotkey = "Ctrl+Shift+H"  # show or hide the History window
+history_hotkey = "Ctrl+Shift+H"  # open the Voclaude window
 add_trailing_space = true
 capitalize_first = true
 use_gpu = true                  # false = always use the CPU
@@ -209,12 +233,13 @@ api_port = 7770
 ```
 
 See [config.example.toml](config.example.toml) for every option with
-comments. Saved changes apply within a few seconds, without a restart, except
-the hotkeys.
+comments. Saved changes apply within a few seconds, without a restart. A file
+with an error is not applied: the window and the tray tooltip say why.
 
-**Names and terms.** Parakeet can misspell names ("Quan" for Qwen). Put the
-right spelling in `parakeet_phrases`, optionally with the spellings Parakeet
-writes for it, or manage the list from a terminal:
+**Names and terms.** Parakeet can misspell names ("Quan" for Qwen). Add the
+right spelling on the Names tab, or click the misspelled word on the
+Dictations tab. The list is `parakeet_phrases` in the settings file, and a
+terminal works too:
 
 ```powershell
 voclaude phrases                          # list the entries
@@ -224,9 +249,10 @@ voclaude phrases check                    # what the list changes on your recent
 voclaude phrases remove Qwen Quen         # drop a spoken form (or the whole term)
 ```
 
-Only words Parakeet was unsure of are changed, Russian words never. The full
-effect needs the phrase-bias `transcribe.dll` (`package.ps1 -PatchedTranscribe`);
-with the official DLL only the listed spellings are replaced.
+Only words Parakeet was unsure of are changed, Russian words never. Releases
+ship the phrase-bias `transcribe.dll` that this needs. A build from source has
+the official DLL, which replaces only the listed spellings, unless you package
+it with `package.ps1 -PatchedTranscribe`.
 
 **Hotkey format.** Modifiers `Ctrl`, `Alt`, `Shift`, `Win` joined with `+`,
 then a key: letters, digits, `F1` to `F12`, `Space`, `Enter`, `Tab`, `Escape`,
@@ -249,7 +275,8 @@ While Voclaude runs, it serves an OpenAI-compatible transcription endpoint on
 `http://127.0.0.1:7770`. Only programs on the same computer can reach it. The
 endpoint uses the same loaded model as dictation, decodes audio and video
 files (wav, mp3, flac, ogg, m4a, mp4, mov, mkv, and anything else through
-`ffmpeg` when it is installed), and adds every result to the History window.
+`ffmpeg` when it is installed), and adds every result to Dictations. The API
+tab in the window shows the address and has a ready-to-copy prompt for agents.
 
 ```
 voclaude transcribe meeting.mp4
@@ -273,6 +300,8 @@ terminal it was started from.
 | `voclaude --list-models` | The default Parakeet file and the Qwen tiers |
 | `voclaude --test audio.wav` | Transcribe one file with the configured engine and print the text |
 | `voclaude transcribe <file>...` | Send files to the running app's API and print the text |
+| `voclaude phrases ...` | List, add, remove, suggest and check names (see [Settings](#settings)) |
+| `voclaude console` | Open the Voclaude window (the running app opens it) |
 | `voclaude --bench <dir>` | Benchmark harness (Qwen and Whisper engines only) |
 
 Options for `--validate` and `--test`: `--cpu`, `--gpu`, `--engine parakeet|qwen`,
@@ -325,6 +354,7 @@ shell (nvcc needs `cl.exe` on PATH).
 .\package.ps1                     # dist\voclaude-vX.Y.Z-<hash>.zip
 .\package.ps1 -Installer          # also dist\voclaude-vX.Y.Z-setup.exe (needs Inno Setup 6)
 .\package.ps1 -Cuda -Installer    # the CUDA variant: -cuda.zip and -cuda-setup.exe
+.\package.ps1 -Installer -PatchedTranscribe   # what releases ship: with the phrase-bias transcribe.dll
 ```
 
 The zip holds `voclaude.exe`, the transcribe.cpp DLLs, the MSVC runtime DLLs,
@@ -360,23 +390,28 @@ run on a Mac, and Parakeet through Metal has not been measured.
 
 - `ci.yml` builds and tests the standard Windows build on every push and pull
   request. No CUDA toolkit is involved.
-- `release.yml` builds the zip and installer when a `v*` tag is pushed, plus
-  the CUDA variant and a macOS build on a best-effort basis.
+- `release.yml` builds the zip and installer (with the phrase-bias
+  `transcribe.dll`) when a `v*` tag is pushed, plus the CUDA variant and a
+  macOS build on a best-effort basis. The installer is attached twice: with
+  its version, and as `voclaude-setup.exe` for the stable download link.
 
 ## Architecture
 
-Two processes. The tray process owns the microphone, the hotkeys, the
-clipboard, the History window and the local API. The worker process owns the
-speech model. "Unloading" the model means the worker exits, which returns all
-GPU and host memory to the system and keeps a crash in the model runtime from
-taking the recorder down.
+Three processes. The tray process owns the microphone, the hotkeys, the
+clipboard, the history and the local API. The worker process owns the speech
+model. "Unloading" the model means the worker exits, which returns all GPU and
+host memory to the system and keeps a crash in the model runtime from taking
+the recorder down. The window (`voclaude console`) is a third process, started
+when you open it and gone when you close it, so the tray process never loads
+the GUI stack. It gets live status over a pipe and reads everything else from
+the files below.
 
 ```
 tray process (voclaude.exe)                              worker process (voclaude.exe --worker)
 ┌────────────────────────────────────────────────┐       ┌─────────────────────────────────────┐
 │ global hotkey (F4) ──► event loop (app.rs)     │ JSON  │ Engine (inference/mod.rs)           │
 │ tray icon + menu (tray.rs)      │              │ lines │   Parakeet: transcribe.cpp / ggml   │
-│ History window, egui (ui.rs)    │              │ over  │     Vulkan GPU or per-ISA CPU       │
+│ window process (console_host.rs)│              │ over  │     Vulkan GPU or per-ISA CPU       │
 │ local API :7770 (api.rs)        ▼              │ pipes │   Qwen3-ASR: candle (CUDA or CPU)   │
 │ mic ─► CPAL ─► 16 kHz ─► segmenter ────────────┼───────┼─► transcribe one segment ─► text    │
 │          (audio/)        │      journal        │       │                                     │
@@ -402,8 +437,11 @@ next is in [docs/ROADMAP.md](docs/ROADMAP.md).
 not code-signed. Click "More info", then "Run anyway".
 
 **Nothing happens when I press F4.** Another program may own the F4 hotkey.
-Change `hotkey` in the settings, for example to `Ctrl+Shift+Space`. Hover the
-tray icon: the tooltip shows the last error, such as a missing microphone.
+Change it in Settings, for example to `Ctrl+Shift+Space`. Hover the tray icon:
+the tooltip shows the last error, such as a missing microphone.
+
+**Voclaude does not start after I sign in.** Settings, Start with Windows must
+be on and must say "this copy starts".
 
 **No microphone found.** Check the default input device in Windows sound
 settings, and that desktop apps may use the microphone (Settings, Privacy,
@@ -416,14 +454,15 @@ download.
 
 **It runs on the CPU although I have a GPU.** Run `voclaude --validate` in a
 terminal. It prints the device transcribe.cpp picked. Update the GPU driver if
-no Vulkan device is listed. `use_gpu = true` must be set in the settings.
+no Vulkan device is listed. Model, Device must be GPU.
 
 **Russian came out in Latin letters.** Make sure `parakeet_recheck = true`
 (the default) and that the Russian part is spoken with a short pause around it
 when it is longer than a few words, so it gets its own segment.
 
-**Something else.** Tray menu, "Open Logs Folder". The newest
-`voclaude.log.YYYY-MM-DD` has the timeline of every event.
+**Something else.** The Log tab shows what happened; "Open logs folder" there
+has the files. The newest `voclaude.log.YYYY-MM-DD` has the timeline of every
+event.
 
 ## Credits and licenses
 

@@ -107,10 +107,6 @@ impl HistoryStore {
         self.entries.len()
     }
 
-    pub fn entries(&self) -> &[HistoryEntry] {
-        &self.entries
-    }
-
     pub fn append(
         &mut self,
         text: String,
@@ -129,6 +125,30 @@ impl HistoryStore {
     }
 
     /// Takes effect at the next append (settings reload).
+    /// Remove the entry `id` and delete its recording. Returns false if there
+    /// is no such entry.
+    pub fn delete(&mut self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(index) = self.entries.iter().position(|e| e.id == id) else {
+            return Ok(false);
+        };
+        let entry = self.entries.remove(index);
+        if let Some(path) = entry.audio_path {
+            let p = Path::new(&path);
+            if p.exists() {
+                if let Err(err) = std::fs::remove_file(p) {
+                    warn!("Failed to delete audio file {:?}: {}", p, err);
+                }
+            }
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// The newest entry limit; applied at the next append.
+    pub fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_entries = max_entries.max(1);
+    }
+
     pub fn set_audio_retention_count(&mut self, count: usize) {
         self.audio_retention_count = count;
     }

@@ -53,7 +53,9 @@ Errors come back as `{"error": {"message": "..."}}` with 400 (bad request or
 path not found), 401 (token), 413 (upload over 2 GiB), 415 (undecodable), 500
 (inference failed), 503 (app shutting down), or 504 (chunk timed out).
 
-Every completed request is added to the History window like a dictation.
+Every completed request is added to Dictations in the Voclaude window, like
+a dictation. The window's API tab shows the address, the token and
+ready-to-copy snippets, including a prompt for an agent.
 
 ## Using it from an agent
 

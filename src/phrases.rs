@@ -67,7 +67,7 @@ pub fn cli(args: &[String]) -> i32 {
 // The list in config.toml
 // ---------------------------------------------------------------------------
 
-fn render(p: &Phrase) -> String {
+pub(crate) fn render(p: &Phrase) -> String {
     if p.forms.is_empty() {
         p.term.clone()
     } else {
@@ -76,15 +76,10 @@ fn render(p: &Phrase) -> String {
 }
 
 fn config_text() -> Res<(PathBuf, String)> {
-    let path = Config::config_path().ok_or("could not determine the config path")?;
-    if !path.exists() {
-        Config::load()?; // writes the commented example
-    }
-    let text = std::fs::read_to_string(&path)?;
-    Ok((path, text))
+    crate::config_edit::read()
 }
 
-fn entries_of(text: &str) -> Res<Vec<String>> {
+pub(crate) fn entries_of(text: &str) -> Res<Vec<String>> {
     let doc: toml_edit::Document = text.parse()?;
     match doc.get("parakeet_phrases") {
         None => Ok(Vec::new()),
@@ -99,7 +94,7 @@ fn entries_of(text: &str) -> Res<Vec<String>> {
 
 /// `text` with `parakeet_phrases` set to `entries` (one per line). Everything
 /// else in the file is kept as written. Fails if the app could not load the result.
-fn with_entries(text: &str, entries: &[String]) -> Res<String> {
+pub(crate) fn with_entries(text: &str, entries: &[String]) -> Res<String> {
     let mut doc: toml_edit::Document = text.parse()?;
     let mut array = toml_edit::Array::new();
     for e in entries {
@@ -127,7 +122,7 @@ fn with_entries(text: &str, entries: &[String]) -> Res<String> {
     Ok(out)
 }
 
-fn save(path: &Path, text: &str, phrases: &[Phrase]) -> Res<()> {
+pub(crate) fn save(path: &Path, text: &str, phrases: &[Phrase]) -> Res<()> {
     let entries: Vec<String> = phrases.iter().map(render).collect();
     Config::write_atomic(path, &with_entries(text, &entries)?)
 }
@@ -137,7 +132,7 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// Add `term`, or spoken forms to an existing `term`. Returns false if nothing changed.
-fn add_to(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool {
+pub(crate) fn add_to(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool {
     let (index, mut changed) = match phrases.iter().position(|p| p.term == term) {
         Some(i) => (i, false),
         None => {
@@ -156,7 +151,7 @@ fn add_to(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool {
 }
 
 /// Remove `term` (no forms given) or only the given forms. Returns false if not found.
-fn remove_from(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool {
+pub(crate) fn remove_from(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool {
     let Some(index) = phrases.iter().position(|p| p.term == term).or_else(|| phrases.iter().position(|p| same(&p.term, term)))
     else {
         return false;
@@ -173,14 +168,23 @@ fn remove_from(phrases: &mut Vec<Phrase>, term: &str, forms: &[String]) -> bool 
 
 /// TERM and FORMs from the command line; "=" and "," would break the entry syntax.
 fn term_and_forms(args: &[String]) -> Res<(String, Vec<String>)> {
-    let tidy = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut values = args.iter().map(|a| tidy(a)).filter(|a| !a.is_empty());
     let term = values.next().ok_or_else(|| format!("missing TERM\n{}", USAGE))?;
     let forms: Vec<String> = values.collect();
-    if std::iter::once(&term).chain(&forms).any(|v| v.contains('=') || v.contains(',')) {
+    if std::iter::once(&term).chain(&forms).any(|v| !allowed(v)) {
         return Err("terms and spoken forms cannot contain '=' or ','".into());
     }
     Ok((term, forms))
+}
+
+/// One space between words, no leading or trailing space.
+pub(crate) fn tidy(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// "=" and "," would break the entry syntax ("Term = form, form").
+pub(crate) fn allowed(v: &str) -> bool {
+    !v.contains('=') && !v.contains(',')
 }
 
 fn list() -> Res<()> {
@@ -227,21 +231,21 @@ fn remove(args: &[String]) -> Res<()> {
 // ---------------------------------------------------------------------------
 
 /// One line of data/unsure-words.jsonl.
-struct UnsureWord {
-    word: String,
-    p: f64,
-    term: Option<String>,
+pub(crate) struct UnsureWord {
+    pub word: String,
+    pub p: f64,
+    pub term: Option<String>,
 }
 
-#[derive(Debug, Default, PartialEq)]
-struct Suggestion {
-    term: String,
-    word: String,
-    unsure: usize,
-    history: usize,
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct Suggestion {
+    pub term: String,
+    pub word: String,
+    pub unsure: usize,
+    pub history: usize,
 }
 
-fn is_latin_word(w: &str) -> bool {
+pub(crate) fn is_latin_word(w: &str) -> bool {
     !w.is_empty() && w.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '\'') && w.chars().any(|c| c.is_ascii_alphabetic())
 }
 
@@ -249,7 +253,7 @@ fn is_latin_word(w: &str) -> bool {
 /// words of the phrase re-check (acoustic doubt), and from capitalised words
 /// inside sentences in the history (names), skipping words used so often that
 /// they are ordinary words.
-fn suggestions(phrases: &[Phrase], history: &[String], unsure: &[UnsureWord]) -> Vec<Suggestion> {
+pub(crate) fn suggestions(phrases: &[Phrase], history: &[String], unsure: &[UnsureWord]) -> Vec<Suggestion> {
     let spellings: Vec<(&str, &str)> = phrases
         .iter()
         .flat_map(|p| std::iter::once((p.term.as_str(), p.term.as_str())).chain(p.forms.iter().map(move |f| (f.as_str(), p.term.as_str()))))
@@ -309,7 +313,7 @@ fn suggestions(phrases: &[Phrase], history: &[String], unsure: &[UnsureWord]) ->
     out
 }
 
-fn read_unsure_log() -> Vec<UnsureWord> {
+pub(crate) fn read_unsure_log() -> Vec<UnsureWord> {
     let Some(text) = unsure_log_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return Vec::new() };
     text.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -324,7 +328,7 @@ fn read_unsure_log() -> Vec<UnsureWord> {
 }
 
 /// History entries, newest first: (created_at_ms, text, kept audio file).
-fn read_history() -> Res<Vec<(u64, String, Option<PathBuf>)>> {
+pub(crate) fn read_history() -> Res<Vec<(u64, String, Option<PathBuf>)>> {
     let path = project_dirs().ok_or("could not determine the data folder")?.data_dir().join("history.json");
     if !path.exists() {
         return Ok(Vec::new());
@@ -368,31 +372,52 @@ fn suggest() -> Res<()> {
         }
     }
     // Feedback: what the list wrote, and recurring doubts no entry covers.
-    let mut written: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut doubts: BTreeMap<String, (usize, f64)> = BTreeMap::new();
-    for u in &unsure {
-        match &u.term {
-            Some(t) => *written.entry(t.as_str()).or_default() += 1,
-            None => {
-                let d = doubts.entry(u.word.clone()).or_insert((0, f64::INFINITY));
-                d.0 += 1;
-                d.1 = d.1.min(u.p);
-            }
-        }
-    }
+    let written = written_counts(&unsure);
     if !written.is_empty() {
         let parts: Vec<String> = written.iter().map(|(t, n)| format!("{} {}x", t, n)).collect();
         println!("Written by the list so far: {}", parts.join(", "));
     }
-    let mut recurring: Vec<(String, (usize, f64))> = doubts.into_iter().filter(|(w, (n, _))| *n >= 2 && is_latin_word(w)).collect();
-    recurring.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    let recurring = recurring_doubts(&phrases, &unsure);
     if !recurring.is_empty() {
         println!("Words Parakeet was unsure of more than once (a name? add it with its right spelling):");
-        for (w, (n, p)) in recurring.iter().take(15) {
+        for (w, n, p) in recurring.iter().take(15) {
             println!("  {:<18} {:>2}x, lowest confidence {:.2}", w, n, p);
         }
     }
     Ok(())
+}
+
+/// How often the list wrote each term, most first.
+pub(crate) fn written_counts(unsure: &[UnsureWord]) -> Vec<(String, usize)> {
+    let mut written: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in unsure.iter().filter_map(|u| u.term.as_deref()) {
+        *written.entry(t).or_default() += 1;
+    }
+    let mut out: Vec<(String, usize)> = written.into_iter().map(|(t, n)| (t.to_string(), n)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Fillers Parakeet is often unsure of; never a name.
+const FILLERS: &[&str] = &["uh", "um", "uhm", "er", "erm", "ah", "eh", "oh", "hmm", "mm", "mhm", "huh"];
+
+/// Words Parakeet was unsure of at least twice that no entry covers:
+/// (word, times, lowest confidence), most frequent first. Spellings already
+/// in the list and filler words are left out.
+pub(crate) fn recurring_doubts(phrases: &[Phrase], unsure: &[UnsureWord]) -> Vec<(String, usize, f64)> {
+    let known = |w: &str| phrases.iter().any(|p| same(&p.term, w) || p.forms.iter().any(|f| same(f, w)));
+    let mut doubts: BTreeMap<String, (String, usize, f64)> = BTreeMap::new();
+    for u in unsure.iter().filter(|u| u.term.is_none()) {
+        let d = doubts.entry(u.word.to_lowercase()).or_insert((u.word.clone(), 0, f64::INFINITY));
+        d.1 += 1;
+        d.2 = d.2.min(u.p);
+    }
+    let mut out: Vec<(String, usize, f64)> = doubts
+        .into_values()
+        .filter(|(w, n, _)| *n >= 2 && is_latin_word(w) && !known(w) && !FILLERS.contains(&w.to_lowercase().as_str()))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +425,7 @@ fn suggest() -> Res<()> {
 // ---------------------------------------------------------------------------
 
 /// Word spans that differ between `a` and `b` (longest common subsequence).
-fn word_diff(a: &str, b: &str) -> Vec<(String, String)> {
+pub(crate) fn word_diff(a: &str, b: &str) -> Vec<(String, String)> {
     let x: Vec<&str> = a.split_whitespace().collect();
     let y: Vec<&str> = b.split_whitespace().collect();
     let (n, m) = (x.len(), y.len());
@@ -570,6 +595,17 @@ mod tests {
         for noise in ["GPUs", "Tron", "Jonathan's"] {
             assert!(!words.contains(&noise), "{} is short, unlike enough or a possessive: {:?}", noise, words);
         }
+    }
+
+    #[test]
+    fn recurring_doubts_skip_known_spellings_and_fillers() {
+        let phrases = vec![p("Jonathan", &["Jonathon"]), p("Lisa", &[])];
+        let u = |w: &str, p: f64| UnsureWord { word: w.into(), p, term: None };
+        let unsure = vec![u("Uh", 0.3), u("uh", 0.2), u("lisa", 0.5), u("Lisa", 0.4), u("Jonathon", 0.4), u("Jonathon", 0.3), u("Lyza", 0.4), u("lyza", 0.2), u("Once", 0.5)];
+        let out = recurring_doubts(&phrases, &unsure);
+        assert_eq!(out.len(), 1, "{:?}", out);
+        assert_eq!((out[0].0.as_str(), out[0].1), ("Lyza", 2));
+        assert!((out[0].2 - 0.2).abs() < 1e-9);
     }
 
     #[test]
