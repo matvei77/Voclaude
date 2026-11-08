@@ -50,6 +50,17 @@ cpu_threads = 0
 # it comes back as confident Russian. Costs ~5% extra GPU time.
 parakeet_recheck = true
 
+# Names and terms Parakeet should spell exactly. After "=" you can list spoken
+# forms: spellings Parakeet writes when it mishears the term (copy them from
+# your history). Only words the model was unsure of are checked. A term is
+# written when a second decode, biased towards this list, spells the term or a
+# spoken form over those words, or when the words are exactly a spoken form.
+# A change of case alone is never made, and Russian words are never replaced.
+# The biased decode needs the patched transcribe.dll (vocabulary support for
+# Parakeet); with the official DLL only exact spoken forms apply. Empty: off.
+# parakeet_phrases = ["Hemingway = Hemengwe, Hemengway, Megway", "Qwen = Quan, Quen", "Codex = codecs"]
+parakeet_phrases = []
+
 # Model tier (Qwen engine):
 #   fast / small / medium  = Qwen3-ASR-0.6B, lower memory, best for CPU or laptop GPUs
 #   best / large / accurate = Qwen3-ASR-1.7B, highest quality, best for stronger NVIDIA GPUs

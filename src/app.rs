@@ -1384,6 +1384,7 @@ impl App {
                             self.config.engine = new_config.engine.clone();
                             self.config.parakeet_model = new_config.parakeet_model.clone();
                             self.config.cpu_threads = new_config.cpu_threads;
+                            self.config.parakeet_phrases = new_config.parakeet_phrases.clone();
                             self.config.quantization = new_config.quantization.clone();
                             self.config.adaptive_max_new_tokens = new_config.adaptive_max_new_tokens;
                             self.config.max_chunk_seconds = new_config.max_chunk_seconds;

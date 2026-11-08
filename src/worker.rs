@@ -182,7 +182,15 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
                         message: p.message,
                     });
                 };
-                match engine.prepare(Some(&mut cb)) {
+                let started = std::time::Instant::now();
+                let prepared = engine.prepare(Some(&mut cb));
+                crate::profile::emit(serde_json::json!({
+                    "kind": "worker_preload",
+                    "ms": crate::profile::ms_since(started),
+                    "ok": prepared.is_ok(),
+                    "gpu": engine.active_gpu(),
+                }));
+                match prepared {
                     Ok(()) => {
                         emit(&WireEvent::EngineInfo {
                             using_gpu: engine.active_gpu(),
@@ -208,11 +216,26 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
                 if !was_loaded {
                     emit(&WireEvent::Progress { loading: true, message: "Loading model...".to_string() });
                 }
-                let result = read_f32_range(&path, start, end).and_then(|samples| {
+                let started = std::time::Instant::now();
+                let read = read_f32_range(&path, start, end);
+                let (read_ms, n_samples) = (crate::profile::ms_since(started), read.as_ref().map_or(0, |s| s.len()));
+                let started = std::time::Instant::now();
+                let result = read.and_then(|samples| {
                     engine
                         .transcribe_segment(&samples, context.as_deref())
                         .map_err(|e| e.to_string())
                 });
+                crate::profile::emit(serde_json::json!({
+                    "kind": "worker_segment",
+                    "index": index,
+                    "start": start,
+                    "end": end,
+                    "samples": n_samples,
+                    "read_ms": read_ms,
+                    "engine_ms": crate::profile::ms_since(started),
+                    "loaded_model": !was_loaded,
+                    "ok": result.is_ok(),
+                }));
                 if !was_loaded && engine_is_loaded(&engine) {
                     emit(&WireEvent::EngineInfo {
                         using_gpu: engine.active_gpu(),
@@ -246,7 +269,14 @@ pub fn run_child() -> Result<(), Box<dyn std::error::Error>> {
                     model: engine.model_label(),
                     model_size_mb: engine.model_size_mb(),
                 });
-                match engine.transcribe_file_with_progress(&path, Some(&mut cb)) {
+                let started = std::time::Instant::now();
+                let result = engine.transcribe_file_with_progress(&path, Some(&mut cb));
+                crate::profile::emit(serde_json::json!({
+                    "kind": "worker_file",
+                    "engine_ms": crate::profile::ms_since(started),
+                    "ok": result.is_ok(),
+                }));
+                match result {
                     Ok(text) => emit(&WireEvent::File { ok: true, text: Some(text), error: None }),
                     Err(e) => emit(&WireEvent::File { ok: false, text: None, error: Some(e.to_string()) }),
                 }
@@ -472,6 +502,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                 let changed = new_config.engine != config.engine
                     || new_config.parakeet_model != config.parakeet_model
                     || new_config.cpu_threads != config.cpu_threads
+                    || new_config.parakeet_phrases != config.parakeet_phrases
                     || new_config.segment_min_seconds != config.segment_min_seconds
                     || new_config.segment_max_seconds != config.segment_max_seconds
                     || new_config.segment_pause_seconds != config.segment_pause_seconds
