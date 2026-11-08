@@ -503,6 +503,7 @@ fn proxy_loop(rx: Receiver<InferenceCommand>, event_tx: Sender<AppEvent>, config
                     || new_config.parakeet_model != config.parakeet_model
                     || new_config.cpu_threads != config.cpu_threads
                     || new_config.parakeet_phrases != config.parakeet_phrases
+                    || new_config.parakeet_unsure_log != config.parakeet_unsure_log
                     || new_config.segment_min_seconds != config.segment_min_seconds
                     || new_config.segment_max_seconds != config.segment_max_seconds
                     || new_config.segment_pause_seconds != config.segment_pause_seconds

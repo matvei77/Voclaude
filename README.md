@@ -94,7 +94,7 @@ Right-click the Voclaude icon:
 | Open Last Transcript | Opens the newest transcription in Notepad. Opens History when nothing has been dictated yet. |
 | Open Transcripts Folder | Opens the folder with saved transcripts. |
 | Recover Last Recording | Enabled only when the last recording did not finish. Re-runs the missing part. |
-| Edit Settings (config.toml) | Opens the settings file in Notepad. Changes saved within five minutes apply without a restart, except the hotkeys. |
+| Edit Settings (config.toml) | Opens the settings file in Notepad. Saved changes apply within a few seconds, without a restart, except the hotkeys. |
 | Open Logs Folder | Opens the log files, useful when reporting a problem. |
 | Quit Voclaude | Stops the app. |
 
@@ -209,9 +209,24 @@ api_port = 7770
 ```
 
 See [config.example.toml](config.example.toml) for every option with
-comments. Changes saved within five minutes of opening the file from the tray
-menu apply without a restart, except the hotkeys. Later edits apply at the next
-start.
+comments. Saved changes apply within a few seconds, without a restart, except
+the hotkeys.
+
+**Names and terms.** Parakeet can misspell names ("Quan" for Qwen). Put the
+right spelling in `parakeet_phrases`, optionally with the spellings Parakeet
+writes for it, or manage the list from a terminal:
+
+```powershell
+voclaude phrases                          # list the entries
+voclaude phrases add Qwen Quan Quen       # term, then how Parakeet misspells it
+voclaude phrases suggest                  # spellings worth adding, from your history
+voclaude phrases check                    # what the list changes on your recent recordings
+voclaude phrases remove Qwen Quen         # drop a spoken form (or the whole term)
+```
+
+Only words Parakeet was unsure of are changed, Russian words never. The full
+effect needs the phrase-bias `transcribe.dll` (`package.ps1 -PatchedTranscribe`);
+with the official DLL only the listed spellings are replaced.
 
 **Hotkey format.** Modifiers `Ctrl`, `Alt`, `Shift`, `Win` joined with `+`,
 then a key: letters, digits, `F1` to `F12`, `Space`, `Enter`, `Tab`, `Escape`,

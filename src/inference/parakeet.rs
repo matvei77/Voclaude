@@ -69,6 +69,8 @@ pub struct ParakeetEngine {
     cpu_threads: u32,
     recheck: bool,
     phrases: Vec<Phrase>,
+    /// Append the phrase re-check's unsure words to data/unsure-words.jsonl.
+    unsure_log: bool,
     segmenter: SegmenterConfig,
     loaded: Option<Loaded>,
 }
@@ -134,6 +136,7 @@ impl ParakeetEngine {
             cpu_threads: config.cpu_threads,
             recheck: config.parakeet_recheck,
             phrases: parse_phrases(&config.parakeet_phrases),
+            unsure_log: config.parakeet_unsure_log,
             segmenter: config.segmenter_config(),
             loaded: None,
         })
@@ -173,7 +176,7 @@ impl ParakeetEngine {
                     let started = Instant::now();
                     let words = timed_words(&result);
                     let (found, biased_run) =
-                        phrase_edits(&mut loaded.session, loaded.phrase_bias, samples, &words, &self.phrases, &edits);
+                        phrase_edits(&mut loaded.session, loaded.phrase_bias, samples, &words, &self.phrases, &edits, self.unsure_log);
                     phrase_ms = started.elapsed().as_secs_f64() * 1000.0;
                     (phrase_biased, phrase_count) = (biased_run, found.len());
                     debug!(
@@ -447,12 +450,12 @@ fn russian_replacements(session: &mut Session, samples: &[f32], first: &Transcri
 }
 
 /// A word without the punctuation around it.
-fn word_core(text: &str) -> &str {
+pub(crate) fn word_core(text: &str) -> &str {
     text.trim_matches(|c| PHRASE_PUNCT.contains(c))
 }
 
 /// 1 - (edit distance / longer length) over the lowercase letters of `a` and `b`.
-fn letter_similarity(a: &str, b: &str) -> f64 {
+pub(crate) fn letter_similarity(a: &str, b: &str) -> f64 {
     let letters = |s: &str| s.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphabetic()).collect::<Vec<_>>();
     let (a, b) = (letters(a), letters(b));
     if a.is_empty() || b.is_empty() {
@@ -502,8 +505,10 @@ fn phrase_edits(
     words: &[TimedWord],
     phrases: &[Phrase],
     russian: &[Edit],
+    unsure_log: bool,
 ) -> (Vec<Edit>, bool) {
-    let mut open = phrase_candidates(words, phrases, russian);
+    let candidates = phrase_candidates(words, phrases, russian);
+    let mut open = candidates.clone();
     if !open.contains(&true) {
         return (Vec::new(), false);
     }
@@ -519,7 +524,61 @@ fn phrase_edits(
         }
     }
     edits.extend(spoken_form_edits(words, phrases, &mut open));
+    if unsure_log {
+        log_unsure_words(words, &candidates, &edits);
+    }
     (edits, biased_run)
+}
+
+/// Where the phrase re-check keeps the words Parakeet was unsure of, for
+/// `voclaude phrases suggest` (one JSON object per line).
+pub(crate) fn unsure_log_path() -> Option<PathBuf> {
+    crate::config::project_dirs().map(|d| d.data_dir().join("unsure-words.jsonl"))
+}
+
+/// Above this size the oldest half of the unsure-word log is dropped.
+const UNSURE_LOG_MAX_BYTES: u64 = 1_000_000;
+
+/// Append each candidate word (the word without punctuation, its confidence
+/// and the term it became, if any) to the unsure-word log. Words only, no
+/// sentences. Errors are logged and ignored: dictation must not fail on this.
+fn log_unsure_words(words: &[TimedWord], candidates: &[bool], edits: &[Edit]) {
+    use std::io::Write;
+    let Some(path) = unsure_log_path() else { return };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut lines = String::new();
+    for (k, w) in words.iter().enumerate().filter(|(k, _)| candidates[*k]) {
+        let term = edits.iter().find(|e| e.first <= k && k <= e.last).map(|e| e.text.as_str());
+        let record = serde_json::json!({
+            "t": now_ms,
+            "word": word_core(&w.text),
+            "p": (f64::from(w.p) * 1000.0).round() / 1000.0,
+            "term": term,
+        });
+        lines.push_str(&record.to_string());
+        lines.push('\n');
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let result = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if std::fs::metadata(&path).map(|m| m.len() > UNSURE_LOG_MAX_BYTES).unwrap_or(false) {
+            let old = std::fs::read_to_string(&path)?;
+            let keep = old.len() / 2;
+            let cut = old[keep..].find('\n').map(|i| keep + i + 1).unwrap_or(old.len());
+            std::fs::write(&path, &old[cut..])?;
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(&path)?.write_all(lines.as_bytes())
+    })();
+    if let Err(e) = result {
+        debug!("Unsure-word log not written: {}", e);
+    }
 }
 
 /// Every term and spoken form, in list order, without duplicates.

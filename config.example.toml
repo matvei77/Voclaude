@@ -59,7 +59,16 @@ parakeet_recheck = true
 # The biased decode needs the patched transcribe.dll (vocabulary support for
 # Parakeet); with the official DLL only exact spoken forms apply. Empty: off.
 # parakeet_phrases = ["Hemingway = Hemengwe, Hemengway, Megway", "Qwen = Quan, Quen", "Codex = codecs"]
+# Manage the list from a terminal: `voclaude phrases add Qwen Quan`, `voclaude
+# phrases suggest` (spellings to add, from your history and the unsure-word
+# log), `voclaude phrases check` (what the list changes on your recent
+# recordings). Saved changes apply within a few seconds, without a restart.
 parakeet_phrases = []
+
+# With a phrase list, keep the words Parakeet was unsure of (word, confidence,
+# the term it became; never sentences) in data\unsure-words.jsonl, at most
+# about 1 MB, for `voclaude phrases suggest`.
+parakeet_unsure_log = true
 
 # Model tier (Qwen engine):
 #   fast / small / medium  = Qwen3-ASR-0.6B, lower memory, best for CPU or laptop GPUs
