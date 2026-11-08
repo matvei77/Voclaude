@@ -1,7 +1,9 @@
 //! System tray icon with menu.
 //!
 //! On Windows the tray is the only surface that is always visible, so every
-//! menu item either produces a visible result or is disabled.
+//! menu item either produces a visible result or is disabled. A left click
+//! opens the Voclaude window; everything else (history, settings, logs,
+//! folders) lives there.
 
 use crate::app::{AppEvent, AppState};
 
@@ -12,7 +14,7 @@ use std::time::Duration;
 use tracing::{debug, error};
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIcon, TrayIconBuilder,
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 /// Embedded tray icons, one per state.
@@ -23,12 +25,8 @@ const ICON_PROCESSING: &[u8] = include_bytes!("../assets/icon_processing.png");
 /// Menu item IDs
 const MENU_STATUS: &str = "status";
 const MENU_TOGGLE: &str = "toggle";
-const MENU_HISTORY: &str = "history";
-const MENU_OPEN_LAST_TRANSCRIPT: &str = "open_last_transcript";
-const MENU_OPEN_TRANSCRIPTS: &str = "open_transcripts";
+const MENU_OPEN: &str = "open";
 const MENU_RECOVER: &str = "recover_last";
-const MENU_SETTINGS: &str = "settings";
-const MENU_OPEN_LOGS: &str = "open_logs";
 const MENU_QUIT: &str = "quit";
 
 /// Pre-decoded icon data cached as raw RGBA pixels to avoid re-decoding PNG on every state change.
@@ -64,8 +62,9 @@ pub struct TrayManager {
     /// Disabled first line: which model runs on which device.
     status_item: MenuItem,
     toggle_item: MenuItem,
+    open_item: MenuItem,
     recover_item: MenuItem,
-    record_hotkey: String,
+    record_hotkey: Mutex<String>,
     state: Arc<Mutex<AppState>>,
     status_detail: Arc<Mutex<Option<String>>>,
     /// Whether the session journal holds a recording that can be re-run.
@@ -79,12 +78,12 @@ pub struct TrayManager {
 }
 
 impl TrayManager {
-    /// `record_hotkey` and `history_hotkey` are shown in the menu labels so a
+    /// `record_hotkey` and `window_hotkey` are shown in the menu labels so a
     /// user who forgot the keys can read them off the menu.
     pub fn new(
         event_tx: Sender<AppEvent>,
         record_hotkey: &str,
-        history_hotkey: &str,
+        window_hotkey: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Pre-decode all icon variants once at construction time (BUG 30 fix)
         let icon_idle = CachedIcon::from_png(ICON_IDLE)?;
@@ -98,16 +97,9 @@ impl TrayManager {
         let status_item = MenuItem::with_id(MENU_STATUS, "Starting...", false, None);
         let toggle_item =
             MenuItem::with_id(MENU_TOGGLE, format!("Start Recording ({})", record_hotkey), true, None);
-        let history_item =
-            MenuItem::with_id(MENU_HISTORY, format!("History ({})", history_hotkey), true, None);
-        let open_last_transcript_item =
-            MenuItem::with_id(MENU_OPEN_LAST_TRANSCRIPT, "Open Last Transcript", true, None);
-        let open_transcripts_item =
-            MenuItem::with_id(MENU_OPEN_TRANSCRIPTS, "Open Transcripts Folder", true, None);
+        let open_item = MenuItem::with_id(MENU_OPEN, format!("Open Voclaude ({})", window_hotkey), true, None);
         // Enabled by `set_recoverable` once the journal says there is work.
         let recover_item = MenuItem::with_id(MENU_RECOVER, "Recover Last Recording", false, None);
-        let settings_item = MenuItem::with_id(MENU_SETTINGS, "Edit Settings (config.toml)", true, None);
-        let open_logs_item = MenuItem::with_id(MENU_OPEN_LOGS, "Open Logs Folder", true, None);
         let quit_item = MenuItem::with_id(MENU_QUIT, "Quit Voclaude", true, None);
 
         // Build menu
@@ -115,23 +107,24 @@ impl TrayManager {
         menu.append(&status_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&toggle_item)?;
-        menu.append(&PredefinedMenuItem::separator())?;
-        menu.append(&history_item)?;
-        menu.append(&open_last_transcript_item)?;
-        menu.append(&open_transcripts_item)?;
+        menu.append(&open_item)?;
         menu.append(&recover_item)?;
-        menu.append(&PredefinedMenuItem::separator())?;
-        menu.append(&settings_item)?;
-        menu.append(&open_logs_item)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&quit_item)?;
 
-        // Build tray icon
+        // Build tray icon. Left click opens the window; right click the menu.
         let tray = TrayIconBuilder::new()
             .with_tooltip("Voclaude - Ready")
             .with_icon(initial_icon)
             .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
             .build()?;
+        let click_tx = event_tx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                let _ = click_tx.send(AppEvent::OpenConsole);
+            }
+        }));
 
         let state = Arc::new(Mutex::new(AppState::Idle));
         let status_detail = Arc::new(Mutex::new(None));
@@ -153,12 +146,8 @@ impl TrayManager {
                     Ok(event) => {
                         let app_event = match event.id.0.as_str() {
                             MENU_TOGGLE => Some(AppEvent::HotkeyPressed),
-                            MENU_SETTINGS => Some(AppEvent::OpenSettings),
-                            MENU_HISTORY => Some(AppEvent::ShowHistoryWindow),
-                            MENU_OPEN_TRANSCRIPTS => Some(AppEvent::OpenTranscriptsFolder),
-                            MENU_OPEN_LAST_TRANSCRIPT => Some(AppEvent::OpenLastTranscript),
+                            MENU_OPEN => Some(AppEvent::OpenConsole),
                             MENU_RECOVER => Some(AppEvent::RecoverLastRecording),
-                            MENU_OPEN_LOGS => Some(AppEvent::OpenLogsFolder),
                             MENU_QUIT => Some(AppEvent::Quit),
                             _ => None,
                         };
@@ -183,8 +172,9 @@ impl TrayManager {
             tray,
             status_item,
             toggle_item,
+            open_item,
             recover_item,
-            record_hotkey: record_hotkey.to_string(),
+            record_hotkey: Mutex::new(record_hotkey.to_string()),
             state,
             status_detail,
             recoverable: AtomicBool::new(false),
@@ -212,16 +202,17 @@ impl TrayManager {
         } else {
             None
         };
+        let record_hotkey = self.record_hotkey.lock().map(|k| k.clone()).unwrap_or_default();
         let (cached_icon, tooltip, menu_text) = match state {
             AppState::Idle => (
                 &self.icon_idle,
                 "Voclaude - Ready".to_string(),
-                format!("Start Recording ({})", self.record_hotkey),
+                format!("Start Recording ({})", record_hotkey),
             ),
             AppState::Recording => (
                 &self.icon_recording,
                 "Voclaude - Recording...".to_string(),
-                format!("Stop Recording ({})", self.record_hotkey),
+                format!("Stop Recording ({})", record_hotkey),
             ),
             AppState::Transcribing => (
                 &self.icon_processing,
@@ -292,6 +283,16 @@ impl TrayManager {
         self.recover_item.set_enabled(state == AppState::Idle && recoverable);
     }
 
+    /// New hotkeys: update the menu labels.
+    pub fn set_hotkeys(&self, record_hotkey: &str, window_hotkey: &str) {
+        if let Ok(mut k) = self.record_hotkey.lock() {
+            *k = record_hotkey.to_string();
+        }
+        let state = self.state.lock().ok().map(|state| *state).unwrap_or(AppState::Idle);
+        self.set_state(state);
+        self.open_item.set_text(format!("Open Voclaude ({})", window_hotkey));
+    }
+
     /// The first menu line, for example
     /// "parakeet-ultra-Q6_K on vulkan (NVIDIA GeForce RTX 3060)".
     pub fn set_engine_status(&self, text: &str) {
@@ -303,5 +304,6 @@ impl Drop for TrayManager {
     fn drop(&mut self) {
         // Signal the menu event thread to exit cleanly (BUG 31 fix)
         self.menu_shutdown.store(true, Ordering::Relaxed);
+        TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
     }
 }

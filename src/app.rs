@@ -7,7 +7,8 @@ use crate::history::{AudioMetadata, HistoryEntry, HistoryStore};
 use crate::hotkey::HotkeyManager;
 use crate::inference::{InferenceProgress, InferenceStage};
 use crate::tray::TrayManager;
-use crate::ui::{LogBuffer, UiManager, UiStatus};
+use crate::console::ipc::{FromConsole, Status as UiStatus};
+use crate::console_host::ConsoleHost;
 use crate::session::{RecordingSession, SessionStore};
 use crate::worker::{read_f32_range, InferenceCommand};
 
@@ -19,7 +20,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn, trace};
@@ -32,18 +32,12 @@ use notify_rust::Notification;
 pub enum AppEvent {
     /// Hotkey pressed - toggle recording
     HotkeyPressed,
-    /// Toggle history window
-    ToggleHistoryWindow,
-    /// Show history window
-    ShowHistoryWindow,
-    /// Open transcripts folder
-    OpenTranscriptsFolder,
-    /// Open last transcript
-    OpenLastTranscript,
-    /// Open config file
-    OpenSettings,
-    /// Open the folder with the log files
-    OpenLogsFolder,
+    /// Show the console window (hotkey, tray click, a second launch)
+    OpenConsole,
+    /// A command from the console window
+    ConsoleCommand(FromConsole),
+    /// config.toml changed on disk but could not be applied
+    ConfigError(String),
     /// Quit requested
     Quit,
     /// Inference progress update
@@ -91,12 +85,9 @@ impl AppEvent {
     fn kind(&self) -> &'static str {
         match self {
             AppEvent::HotkeyPressed => "HotkeyPressed",
-            AppEvent::ToggleHistoryWindow => "ToggleHistoryWindow",
-            AppEvent::ShowHistoryWindow => "ShowHistoryWindow",
-            AppEvent::OpenTranscriptsFolder => "OpenTranscriptsFolder",
-            AppEvent::OpenLastTranscript => "OpenLastTranscript",
-            AppEvent::OpenSettings => "OpenSettings",
-            AppEvent::OpenLogsFolder => "OpenLogsFolder",
+            AppEvent::OpenConsole => "OpenConsole",
+            AppEvent::ConsoleCommand(_) => "ConsoleCommand",
+            AppEvent::ConfigError(_) => "ConfigError",
             AppEvent::Quit => "Quit",
             AppEvent::InferenceProgress(_) => "InferenceProgress",
             AppEvent::TranscriptionComplete(Ok(_)) => "TranscriptionComplete(ok)",
@@ -322,16 +313,16 @@ pub struct App {
     event_tx: Sender<AppEvent>,
     event_rx: Receiver<AppEvent>,
     is_running: bool,
-    ui: UiManager,
-    #[allow(dead_code)]
-    log_buffer: LogBuffer,
+    console: ConsoleHost,
+    /// config.toml failed to load at startup (the defaults are in use).
+    startup_config_error: Option<String>,
 }
 
 impl App {
     /// Run the application
-    pub fn run(config: Config, log_buffer: LogBuffer) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(config: Config, startup_config_error: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         let (event_tx, event_rx) = unbounded::<AppEvent>();
-        let ui = UiManager::new(log_buffer.clone(), config.use_gpu)?;
+        let console = ConsoleHost::new(event_tx.clone());
 
         let mut app = App {
             config,
@@ -339,8 +330,8 @@ impl App {
             event_tx,
             event_rx,
             is_running: true,
-            ui,
-            log_buffer,
+            console,
+            startup_config_error,
         };
 
         app.run_event_loop()
@@ -363,16 +354,18 @@ impl App {
         ));
         info!("Tray icon ready");
 
-        // Initialize hotkey listener - single unified thread for all hotkeys
+        // Initialize hotkey listener - single unified thread for all _hotkeys
         // to avoid GlobalHotKeyEvent receiver contention.
-        let _hotkey = HotkeyManager::new_multi(
+        let mut _hotkeys = Some(HotkeyManager::new_multi(
             &[
                 (&self.config.hotkey, AppEvent::HotkeyPressed),
-                (&self.config.history_hotkey, AppEvent::ToggleHistoryWindow),
+                (&self.config.history_hotkey, AppEvent::OpenConsole),
             ],
             self.event_tx.clone(),
-        )?;
-        info!("Hotkeys registered: {} (record), {} (history)", self.config.hotkey, self.config.history_hotkey);
+        )?);
+        // A second launch (Start menu, `voclaude console`) opens the window.
+        crate::instance::listen_for_open(self.event_tx.clone(), AppEvent::OpenConsole);
+        info!("Hotkeys registered: {} (record), {} (window)", self.config.hotkey, self.config.history_hotkey);
 
         // Initialize audio capture (segments are announced through event_tx)
         let (level_tx, level_rx) = bounded::<f32>(64);
@@ -390,17 +383,8 @@ impl App {
         info!("Inference worker ready (model will load on first use)");
 
         // Local HTTP API for other programs (127.0.0.1 only).
-        let mut api_server = if self.config.api_enabled {
-            match crate::api::ApiServer::start(&self.config, self.event_tx.clone()) {
-                Ok(server) => Some(server),
-                Err(e) => {
-                    warn!("API server not started: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let mut api_error: Option<String> = None;
+        let mut api_server = start_api(&self.config, &self.event_tx, &mut api_error);
 
         // Clipboard
         let mut clipboard = arboard::Clipboard::new()?;
@@ -411,20 +395,24 @@ impl App {
         let (history_update_tx, history_update_rx) = bounded::<HistoryEntry>(32);
         let mut history = HistoryStore::load(self.config.history_max_entries, self.config.audio_retention_count, history_update_tx)?;
         info!("History loaded: {} entries", history.len());
-        for entry in history.entries() {
-            self.ui.push_history(entry.text.clone());
-        }
 
-        let mut ui_status = UiStatus::new(
-            self.config.hotkey.clone(),
-            self.config.use_gpu,
-            self.config.model_display_name(),
-            None,
-        );
-        ui_status.history_count = history.len();
-        ui_status.input_device = Some(audio.device_name());
-        ui_status.input_level = Some(0.0);
-        self.ui.set_status(ui_status.clone());
+        let mut ui_status = UiStatus {
+            state: "Idle".to_string(),
+            model: self.config.model_display_name(),
+            use_gpu: self.config.use_gpu,
+            history_count: history.len(),
+            input_device: Some(audio.device_name()),
+            api_port: api_server.as_ref().map(|_| self.config.api_port),
+            api_error: api_error.clone(),
+            config_error: self.startup_config_error.clone(),
+            record_hotkey: self.config.hotkey.clone(),
+            console_hotkey: self.config.history_hotkey.clone(),
+            ..Default::default()
+        };
+        if let Some(err) = &self.startup_config_error {
+            _tray.set_tooltip_message(&shorten_error_message(&format!("config.toml has an error, using defaults: {}", err), 120));
+        }
+        self.console.set_status(&ui_status);
 
         let mut session_store = SessionStore::load()?;
 
@@ -436,8 +424,6 @@ impl App {
         let mut transcribe_started_at: Option<Instant> = None;
         // last_transcript.txt is rewritten after every transcription, so the
         // tray's "Open Last Transcript" works after a restart too.
-        let mut last_transcript_path: Option<PathBuf> =
-            last_transcript_output_path().filter(|path| path.exists());
 
         // Live (streaming) session bookkeeping
         let mut live: Option<LiveSession> = None;
@@ -461,13 +447,15 @@ impl App {
             }
         }
         _tray.set_recoverable(recoverable_now(&session_store));
+        ui_status.recoverable = recoverable_now(&session_store);
+        self.console.set_status(&ui_status);
         if recover_request_at_start {
             let _ = self.event_tx.send(AppEvent::RecoverLastRecording);
         }
 
         info!("=== VOCLAUDE READY ===");
         info!("Press {} to start recording", self.config.hotkey);
-        info!("Press {} to toggle history window", self.config.history_hotkey);
+        info!("Press {} to open the window", self.config.history_hotkey);
         info!("Main thread ID: {:?}", std::thread::current().id());
 
         // Log Windows thread ID for debugging
@@ -485,6 +473,7 @@ impl App {
 
         let mut loop_count: u64 = 0;
         let mut last_status_log = Instant::now();
+        let mut last_console_poll = Instant::now();
         let mut messages_pumped: u64 = 0;
 
         // Watchdog respawn counter and backoff state
@@ -505,7 +494,7 @@ impl App {
         while self.is_running {
             loop_count += 1;
 
-            // Pump Windows messages (required for hotkeys and tray to work)
+            // Pump Windows messages (required for _hotkeys and tray to work)
             let (pumped, os_quit) = Self::pump_messages();
             messages_pumped += pumped as u64;
             // E-1: Handle OS shutdown/logoff via WM_QUIT
@@ -519,12 +508,17 @@ impl App {
 
             // Log status every 10 seconds
             if last_status_log.elapsed() > Duration::from_secs(10) {
-                info!("=== MAIN LOOP STATUS ===");
-                info!("Loop iterations: {}", loop_count);
-                info!("Messages pumped total: {}", messages_pumped);
-                info!("Current state: {:?}", self.state);
-                info!("Event channel len: {}", self.event_rx.len());
+                debug!("=== MAIN LOOP STATUS ===");
+                debug!("Loop iterations: {}", loop_count);
+                debug!("Messages pumped total: {}", messages_pumped);
+                debug!("Current state: {:?}", self.state);
+                debug!("Event channel len: {}", self.event_rx.len());
                 last_status_log = Instant::now();
+            }
+
+            if last_console_poll.elapsed() >= Duration::from_millis(500) {
+                last_console_poll = Instant::now();
+                self.console.poll();
             }
 
             // E-3: Check deferred respawn (non-blocking, no sleep on main thread)
@@ -583,8 +577,8 @@ impl App {
                     pending_audio_metadata = None;
                     _tray.set_state(AppState::Idle);
                     ui_status.state = "Idle".to_string();
-                    ui_status.last_message = Some("Inference engine restarted after error".to_string());
-                    self.ui.set_status(ui_status.clone());
+                    say_error(&mut ui_status, "Inference engine restarted after error".to_string());
+                    self.console.set_status(&ui_status);
                 }
                 // E-14: Reset idle_unload_requested on watchdog respawn
                 idle_unload_requested = false;
@@ -601,6 +595,8 @@ impl App {
                     if let Err(err) = inference_tx.try_send(InferenceCommand::Unload) {
                         warn!("Failed to request model unload: {}", err);
                     }
+                    ui_status.model_loaded = false;
+                    self.console.set_status(&ui_status);
                     idle_unload_requested = true;
                 }
             }
@@ -668,8 +664,8 @@ impl App {
                             total
                         )
                     };
-                    ui_status.last_message = Some(msg);
-                    self.ui.set_status(ui_status.clone());
+                    say(&mut ui_status, msg);
+                    self.console.set_status(&ui_status);
                 }
             }
 
@@ -678,16 +674,15 @@ impl App {
                 latest_level = Some(level.clamp(0.0, 1.0));
             }
             if let Some(level) = latest_level {
-                ui_status.input_level = Some(level);
-                self.ui.set_status(ui_status.clone());
+                if self.state == AppState::Recording {
+                    self.console.set_level(level);
+                }
             }
 
             // Process events (non-blocking)
             match self.event_rx.try_recv() {
                 Ok(event) => {
-                    info!("=== APP EVENT RECEIVED ===");
-                    info!("Event: {}", event.kind());
-                    info!("Time since last activity: {:?}", last_activity.elapsed());
+                    debug!("Event: {} ({:?} since last activity)", event.kind(), last_activity.elapsed());
 
                     match event {
                         AppEvent::HotkeyPressed => {
@@ -705,8 +700,8 @@ impl App {
                                             _tray.set_tooltip_message(&shorten_error_message(&e.to_string(), 100));
                                             notifications.notify("Failed to start recording");
                                             ui_status.state = "Idle".to_string();
-                                            ui_status.last_message = Some(format!("Recording failed: {}", e));
-                                            self.ui.set_status(ui_status.clone());
+                                            say_error(&mut ui_status, format!("Recording failed: {}", e));
+                                            self.console.set_status(&ui_status);
                                             continue;
                                         }
                                     };
@@ -731,8 +726,8 @@ impl App {
                                     last_recording_tick = Instant::now();
                                     _tray.set_state(AppState::Recording);
                                     ui_status.state = "Recording".to_string();
-                                    ui_status.last_message = Some("Recording...".to_string());
-                                    self.ui.set_status(ui_status.clone());
+                                    say(&mut ui_status, "Recording...".to_string());
+                                    self.console.set_status(&ui_status);
                                 }
                                 AppState::Recording => {
                                     info!("Stopping recording...");
@@ -746,9 +741,8 @@ impl App {
                                                 self.state = AppState::Idle;
                                                 _tray.set_state(AppState::Idle);
                                                 ui_status.state = "Idle".to_string();
-                                                ui_status.last_message = Some("No audio captured".to_string());
-                                                ui_status.input_level = Some(0.0);
-                                                self.ui.set_status(ui_status.clone());
+                                                say(&mut ui_status, "No audio captured".to_string());
+                                                self.console.set_status(&ui_status);
                                                 continue;
                                             }
 
@@ -764,8 +758,8 @@ impl App {
                                             _tray.set_state(AppState::Transcribing);
                                             transcribe_started_at = Some(Instant::now());
                                             ui_status.state = "Transcribing".to_string();
-                                            ui_status.last_message = Some("Transcribing audio...".to_string());
-                                            self.ui.set_status(ui_status.clone());
+                                            say(&mut ui_status, "Transcribing audio...".to_string());
+                                            self.console.set_status(&ui_status);
 
                                             // E-7: Track audio file path for cleanup
                                             pending_audio_path = Some(recording.path.clone());
@@ -790,12 +784,12 @@ impl App {
                                                     live_ref.done_count(),
                                                     dispatch_queue.len()
                                                 );
-                                                ui_status.last_message = Some(format!(
+                                                say(&mut ui_status, format!(
                                                     "Finishing ({}/{} segments)...",
                                                     live_ref.done_count(),
                                                     live_ref.segments.len()
                                                 ));
-                                                self.ui.set_status(ui_status.clone());
+                                                self.console.set_status(&ui_status);
                                                 if live_ref.all_done() {
                                                     let text = live_ref.joined_text();
                                                     let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Ok(text)));
@@ -815,9 +809,8 @@ impl App {
                                                     pending_audio_metadata = None;
                                                     _tray.set_state(AppState::Idle);
                                                     ui_status.state = "Idle".to_string();
-                                                    ui_status.last_message = Some("Transcription failed to start".to_string());
-                                                    ui_status.input_level = Some(0.0);
-                                                    self.ui.set_status(ui_status.clone());
+                                                    say_error(&mut ui_status, "Transcription failed to start".to_string());
+                                                    self.console.set_status(&ui_status);
                                                 }
                                             }
                                         }
@@ -830,9 +823,8 @@ impl App {
                                             self.state = AppState::Idle;
                                             _tray.set_state(AppState::Idle);
                                             ui_status.state = "Idle".to_string();
-                                            ui_status.last_message = Some("Failed to stop recording".to_string());
-                                            ui_status.input_level = Some(0.0);
-                                            self.ui.set_status(ui_status.clone());
+                                            say_error(&mut ui_status, "Failed to stop recording".to_string());
+                                            self.console.set_status(&ui_status);
                                         }
                                     }
                                 }
@@ -849,8 +841,8 @@ impl App {
                                 || (self.state == AppState::Recording && progress.stage == InferenceStage::LoadingModel)
                             {
                                 _tray.set_progress(&progress.message);
-                                ui_status.last_message = Some(progress.message.clone());
-                                self.ui.set_status(ui_status.clone());
+                                say(&mut ui_status, progress.message.clone());
+                                self.console.set_status(&ui_status);
                                 if last_progress_stage != Some(progress.stage) {
                                     notifications.notify(&progress.message);
                                     last_progress_stage = Some(progress.stage);
@@ -863,14 +855,14 @@ impl App {
                             model_size_mb,
                         } => {
                             ui_status.use_gpu = using_gpu;
+                            ui_status.model_loaded = true;
                             ui_status.model = model;
-                            ui_status.model_size_mb = Some(model_size_mb);
+                            debug!("Model size: {} MB", model_size_mb);
                             _tray.set_engine_status(&engine_status_line(&ui_status.model, using_gpu));
                             if self.config.use_gpu && !using_gpu {
-                                ui_status.last_message =
-                                    Some("GPU init failed; using CPU".to_string());
+                                say_error(&mut ui_status, "GPU init failed; using CPU".to_string());
                             }
-                            self.ui.set_status(ui_status.clone());
+                            self.console.set_status(&ui_status);
                         }
                         AppEvent::TranscriptionComplete(result) => {
                             // E-6: Guard against stale results from respawned worker
@@ -942,13 +934,8 @@ impl App {
                                         if let Some(path) = last_transcript_output_path() {
                                             if let Err(err) = write_transcript_file(&path, &history_text) {
                                                 warn!("Failed to save last transcript: {}", err);
-                                            } else if saved_transcript_path.is_none() {
-                                                last_transcript_path = Some(path);
                                             }
                                         }
-                                    }
-                                    if let Some(path) = saved_transcript_path.as_ref() {
-                                        last_transcript_path = Some(path.clone());
                                     }
                                     let mut history_entry_id = None;
                                     let mut history_error = None;
@@ -1001,14 +988,14 @@ impl App {
                                     if let Err(e) = clipboard.set_text(&clipboard_text) {
                                         error!("Failed to copy to clipboard: {}", e);
                                         ui_status.state = "Idle".to_string();
-                                        ui_status.last_message = Some("Clipboard copy failed".to_string());
-                                        self.ui.set_status(ui_status.clone());
+                                        say_error(&mut ui_status, "Clipboard copy failed".to_string());
+                                        self.console.set_status(&ui_status);
                                     } else {
                                         info!("Copied to clipboard!");
                                         notifications.notify(notify_message);
                                         ui_status.state = "Idle".to_string();
-                                        ui_status.last_message = Some(notify_message.to_string());
-                                        self.ui.set_status(ui_status.clone());
+                                        say(&mut ui_status, notify_message.to_string());
+                                        self.console.set_status(&ui_status);
                                     }
                                 }
                                 Err(e) => {
@@ -1018,9 +1005,8 @@ impl App {
                                     let short = shorten_error_message(&e, 140);
                                     notifications.notify(&format!("Transcription failed: {}", short));
                                     ui_status.state = "Idle".to_string();
-                                    ui_status.last_message =
-                                        Some(format!("Transcription failed: {}", short));
-                                    self.ui.set_status(ui_status.clone());
+                                    say_error(&mut ui_status, format!("Transcription failed: {}", short));
+                                    self.console.set_status(&ui_status);
                                 }
                             }
 
@@ -1040,8 +1026,8 @@ impl App {
                             last_progress_stage = None;
                             _tray.set_state(AppState::Idle);
                             _tray.set_recoverable(recoverable_now(&session_store));
-                            ui_status.input_level = Some(0.0);
-                            self.ui.set_status(ui_status.clone());
+                            ui_status.recoverable = recoverable_now(&session_store);
+                            self.console.set_status(&ui_status);
 
                             // Model stays resident for fast re-use.
                             // The idle_unload_seconds timer (default 30s) handles
@@ -1103,8 +1089,8 @@ impl App {
                             let done = live_ref.done_count();
                             let total = live_ref.segments.len();
                             if self.state == AppState::Transcribing {
-                                ui_status.last_message = Some(format!("Finishing ({}/{} segments)...", done, total));
-                                self.ui.set_status(ui_status.clone());
+                                say(&mut ui_status, format!("Finishing ({}/{} segments)...", done, total));
+                                self.console.set_status(&ui_status);
                             }
 
                             if live_ref.recording_done && live_ref.all_settled() {
@@ -1147,14 +1133,16 @@ impl App {
                             };
                             if !session.can_retry() {
                                 notifications.notify("Last recording already completed");
-                                ui_status.last_message = Some("Last recording already completed".to_string());
-                                self.ui.set_status(ui_status.clone());
+                                say(&mut ui_status, "Last recording already completed".to_string());
+                                self.console.set_status(&ui_status);
                                 continue;
                             }
                             let Some(path) = session.audio_path().filter(|p| p.exists()) else {
                                 notifications.notify("Audio for the last recording is gone");
                                 let _ = session_store.mark_failed("Recovery audio file missing".to_string());
                                 _tray.set_recoverable(false);
+                                ui_status.recoverable = false;
+                                self.console.set_status(&ui_status);
                                 continue;
                             };
                             match recover_live_session(&session, &path, self.config.segmenter_config()) {
@@ -1182,8 +1170,8 @@ impl App {
                                     self.state = AppState::Transcribing;
                                     _tray.set_state(AppState::Transcribing);
                                     ui_status.state = "Recovering".to_string();
-                                    ui_status.last_message = Some("Recovering last recording...".to_string());
-                                    self.ui.set_status(ui_status.clone());
+                                    say(&mut ui_status, "Recovering last recording...".to_string());
+                                    self.console.set_status(&ui_status);
                                     if all_done {
                                         let _ = self.event_tx.send(AppEvent::TranscriptionComplete(Ok(text)));
                                     }
@@ -1191,94 +1179,46 @@ impl App {
                                 Err(err) => {
                                     warn!("Recovery failed: {}", err);
                                     notifications.notify("Recovery failed");
-                                    ui_status.last_message = Some(format!("Recovery failed: {}", err));
-                                    self.ui.set_status(ui_status.clone());
+                                    say_error(&mut ui_status, format!("Recovery failed: {}", err));
+                                    self.console.set_status(&ui_status);
                                 }
                             }
                         }
                         AppEvent::HistoryUpdated(entry) => {
                             debug!("History updated: {}", entry.id);
-                            self.ui.push_history(entry.text);
+                            self.console.history_changed();
                             ui_status.history_count = history.len();
-                            self.ui.set_status(ui_status.clone());
+                            self.console.set_status(&ui_status);
                         }
-                        AppEvent::ToggleHistoryWindow => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            // Reload history from disk before showing so entries
-                            // are always fresh, even across hide/show cycles.
-                            let entries: Vec<String> = history
-                                .entries()
-                                .iter()
-                                .map(|e| e.text.clone())
-                                .collect();
-                            self.ui.reload_history(entries);
-                            if !self.ui.toggle() {
-                                warn!("History window toggle failed (UI thread may have exited)");
-                                notifications.notify("History window is unavailable");
+                        AppEvent::OpenConsole => {
+                            self.console.open();
+                        }
+                        AppEvent::ConsoleCommand(cmd) => match cmd {
+                            FromConsole::ToggleRecording => {
+                                let _ = self.event_tx.send(AppEvent::HotkeyPressed);
                             }
-                        }
-                        AppEvent::ShowHistoryWindow => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            let entries: Vec<String> = history
-                                .entries()
-                                .iter()
-                                .map(|e| e.text.clone())
-                                .collect();
-                            info!("ShowHistoryWindow: {} entries to display", entries.len());
-                            self.ui.reload_history(entries);
-                            if !self.ui.show() {
-                                warn!("History window show failed (UI thread may have exited)");
-                                notifications.notify("History window is unavailable");
+                            FromConsole::RecoverLast => {
+                                let _ = self.event_tx.send(AppEvent::RecoverLastRecording);
                             }
-                        }
-                        AppEvent::OpenLastTranscript => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            match last_transcript_path.as_ref() {
-                                Some(path) if path.exists() => {
-                                    if let Err(err) = open_text_file(path) {
-                                        warn!("Failed to open transcript: {}", err);
-                                    }
+                            FromConsole::DeleteHistory { id } => match history.delete(&id) {
+                                Ok(true) => {
+                                    info!("Deleted history entry {}", id);
+                                    self.console.history_changed();
+                                    ui_status.history_count = history.len();
+                                    self.console.set_status(&ui_status);
                                 }
-                                _ => {
-                                    // Nothing saved yet: the History window is the visible fallback.
-                                    notifications.notify("No saved transcript yet");
-                                    let _ = self.event_tx.send(AppEvent::ShowHistoryWindow);
+                                Ok(false) => debug!("History entry {} not found", id),
+                                Err(e) => {
+                                    warn!("Could not delete history entry: {}", e);
+                                    say_error(&mut ui_status, format!("Could not delete the dictation: {}", e));
+                                    self.console.set_status(&ui_status);
                                 }
-                            }
-                        }
-                        AppEvent::OpenSettings => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            match ensure_config_file() {
-                                Ok(path) => {
-                                    // The always-on settings watcher (started with the
-                                    // event loop) applies the saved changes.
-                                    if let Err(err) = open_text_file(&path) {
-                                        warn!("Failed to open config file: {}", err);
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("Failed to resolve config file: {}", err);
-                                    notifications.notify("Failed to open config file");
-                                }
-                            }
-                        }
-                        AppEvent::OpenTranscriptsFolder => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            if let Err(err) = open_transcripts_folder() {
-                                warn!("Failed to open transcripts folder: {}", err);
-                            }
-                        }
-                        AppEvent::OpenLogsFolder => {
-                            last_activity = Instant::now();
-                            idle_unload_requested = false;
-                            if let Err(err) = open_logs_folder() {
-                                warn!("Failed to open logs folder: {}", err);
-                            }
+                            },
+                        },
+                        AppEvent::ConfigError(err) => {
+                            _tray.set_tooltip_message(&shorten_error_message(&format!("config.toml not applied: {}", err), 120));
+                            ui_status.config_error = Some(err);
+                            self.console.set_status(&ui_status);
                         }
                         AppEvent::ApiTranscribeRange { path, start, end, reply } => {
                             last_activity = Instant::now();
@@ -1313,17 +1253,18 @@ impl App {
                             let _ = inference_tx.try_send(InferenceCommand::Shutdown);
                             // E-13: Cancel settings watcher on quit
                             settings_watcher_cancel.store(true, Ordering::Relaxed);
+                            self.console.shutdown();
                             self.is_running = false;
                         }
                         // E-8/S-7: Apply runtime-updatable config fields
                         AppEvent::ConfigReloaded(new_config) => {
-                            let mut needs_restart = Vec::new();
-                            if new_config.hotkey != self.config.hotkey {
-                                needs_restart.push("hotkey");
-                            }
-                            if new_config.history_hotkey != self.config.history_hotkey {
-                                needs_restart.push("history_hotkey");
-                            }
+                            let old = self.config.clone();
+                            self.config.hotkey = new_config.hotkey.clone();
+                            self.config.history_hotkey = new_config.history_hotkey.clone();
+                            self.config.api_enabled = new_config.api_enabled;
+                            self.config.api_port = new_config.api_port;
+                            self.config.api_token = new_config.api_token.clone();
+                            let mut problems: Vec<String> = Vec::new();
                             // Model/GPU settings take effect when the inference worker
                             // next starts (it is restarted below if it is idle).
                             // Apply runtime-updatable fields
@@ -1337,6 +1278,7 @@ impl App {
                             self.config.require_gpu = new_config.require_gpu;
                             self.config.audio_retention_count = new_config.audio_retention_count;
                             history.set_audio_retention_count(new_config.audio_retention_count);
+                            history.set_max_entries(new_config.history_max_entries);
                             self.config.model = new_config.model.clone();
                             self.config.model_path = new_config.model_path.clone();
                             self.config.model_tier = new_config.model_tier.clone();
@@ -1361,15 +1303,71 @@ impl App {
                             }
                             audio.set_segmenter_config(self.config.segmenter_config());
                             notifications.enabled = new_config.show_notifications;
-                            let msg = if needs_restart.is_empty() {
-                                "Settings applied successfully".to_string()
+
+                            // Hotkeys apply at once: release the old ones, take the new.
+                            if old.hotkey != self.config.hotkey || old.history_hotkey != self.config.history_hotkey {
+                                _hotkeys = None;
+                                let bind = |c: &Config| {
+                                    HotkeyManager::new_multi(
+                                        &[(&c.hotkey, AppEvent::HotkeyPressed), (&c.history_hotkey, AppEvent::OpenConsole)],
+                                        self.event_tx.clone(),
+                                    )
+                                };
+                                match bind(&self.config) {
+                                    Ok(h) => {
+                                        info!("Hotkeys now {} (record), {} (window)", self.config.hotkey, self.config.history_hotkey);
+                                        _hotkeys = Some(h);
+                                    }
+                                    Err(e) => {
+                                        warn!("New _hotkeys not registered: {}", e);
+                                        problems.push(format!("_hotkeys not changed ({})", e));
+                                        self.config.hotkey = old.hotkey.clone();
+                                        self.config.history_hotkey = old.history_hotkey.clone();
+                                        _hotkeys = bind(&self.config).ok();
+                                    }
+                                }
+                                _tray.set_hotkeys(&self.config.hotkey, &self.config.history_hotkey);
+                            }
+
+                            // The API serves the model it was started with: restart it
+                            // when its settings or the model change.
+                            let api_changed = old.api_enabled != self.config.api_enabled
+                                || old.api_port != self.config.api_port
+                                || old.api_token != self.config.api_token
+                                || old.active_model() != self.config.active_model()
+                                || old.use_gpu != self.config.use_gpu;
+                            if api_changed {
+                                if let Some(mut server) = api_server.take() {
+                                    server.stop();
+                                }
+                                api_server = start_api(&self.config, &self.event_tx, &mut api_error);
+                                if let Some(e) = &api_error {
+                                    problems.push(format!("API: {}", e));
+                                }
+                            }
+
+                            // A new model loads at the next recording.
+                            if old.active_model() != self.config.active_model() || old.use_gpu != self.config.use_gpu || old.engine != self.config.engine {
+                                ui_status.model = self.config.model_display_name();
+                                ui_status.use_gpu = self.config.use_gpu;
+                                ui_status.model_loaded = false;
+                            }
+                            ui_status.api_port = api_server.as_ref().map(|_| self.config.api_port);
+                            ui_status.api_error = api_error.clone();
+                            ui_status.record_hotkey = self.config.hotkey.clone();
+                            ui_status.console_hotkey = self.config.history_hotkey.clone();
+                            if ui_status.config_error.take().is_some() {
+                                _tray.set_state(self.state); // clears the error tooltip
+                            }
+                            if problems.is_empty() {
+                                info!("Settings applied");
+                                say(&mut ui_status, "Settings applied");
                             } else {
-                                format!("Settings saved (restart required for: {})", needs_restart.join(", "))
-                            };
-                            info!("{}", msg);
-                            notifications.notify(&msg);
-                            ui_status.last_message = Some(msg);
-                            self.ui.set_status(ui_status.clone());
+                                let msg = format!("Settings applied, except: {}", problems.join("; "));
+                                warn!("{}", msg);
+                                say_error(&mut ui_status, msg);
+                            }
+                            self.console.set_status(&ui_status);
                         }
                     }
                 }
@@ -1441,7 +1439,7 @@ impl App {
                     }
                     WM_TIMER | WM_NULL => {}
                     _ => {
-                        debug!("Windows message: {} (hwnd: {:?}, wParam: {}, lParam: {})",
+                        trace!("Windows message: {} (hwnd: {:?}, wParam: {}, lParam: {})",
                                msg.message, msg.hwnd, msg.wParam, msg.lParam);
                     }
                 }
@@ -1489,17 +1487,7 @@ fn write_transcript_file(path: &Path, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn logs_dir() -> Option<PathBuf> {
-    project_dirs().map(|dirs| dirs.data_dir().join("logs"))
-}
 
-fn open_logs_folder() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(dir) = logs_dir() else {
-        return Err("Could not determine logs directory".into());
-    };
-    fs::create_dir_all(&dir)?;
-    open_path(&dir)
-}
 
 /// Whether the tray's "Recover Last Recording" has a recording to re-run.
 fn recoverable_now(store: &SessionStore) -> bool {
@@ -1519,63 +1507,9 @@ fn engine_status_line(label: &str, using_gpu: bool) -> String {
     format!("{} · {}", short, if using_gpu { "GPU" } else { "CPU" })
 }
 
-/// Open a text file in an editor. Windows starts notepad.exe explicitly:
-/// `.toml` has no default association on a stock install, so a ShellExecute
-/// "open" shows an "open with" prompt or nothing at all.
-fn open_text_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("notepad.exe").arg(path).spawn()?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        open_path(path)
-    }
-}
 
-fn open_transcripts_folder() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(dir) = transcripts_dir() else {
-        return Err("Could not determine transcripts directory".into());
-    };
-    fs::create_dir_all(&dir)?;
-    open_path(&dir)
-}
 
-fn open_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // "start" opens files with default app and folders in Explorer.
-        // First "" arg is the window title (required by start when path is quoted).
-        Command::new("cmd")
-            .args(["/c", "start", ""])
-            .arg(path)
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .spawn()?;
-    }
 
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(path).spawn()?;
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Command::new("xdg-open").arg(path).spawn()?;
-    }
-
-    Ok(())
-}
-
-fn ensure_config_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path = Config::config_path().ok_or("Could not determine config path")?;
-    if !path.exists() {
-        // `load` writes the commented example when the file is missing.
-        Config::load()?;
-    }
-    Ok(path)
-}
 
 /// Reload config.toml whenever its modification time changes, for the whole
 /// run: every 3 s, one `metadata` call. A file that fails to load is reported
@@ -1601,7 +1535,12 @@ fn spawn_settings_watcher(path: PathBuf, event_tx: Sender<AppEvent>, cancel: Arc
                     break;
                 }
             }
-            Err(err) => warn!("Config change not applied (invalid settings): {}", err),
+            Err(err) => {
+                warn!("Config change not applied (invalid settings): {}", err);
+                if event_tx.send(AppEvent::ConfigError(err.to_string())).is_err() {
+                    break;
+                }
+            }
         }
     });
     if let Err(err) = spawned {
@@ -1619,4 +1558,32 @@ fn shorten_error_message(input: &str, max_chars: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+/// Show `text` in the window's status strip.
+fn say(status: &mut UiStatus, text: impl Into<String>) {
+    status.last_message = Some(text.into());
+    status.last_message_is_error = false;
+}
+
+/// Show a failure in the window's status strip.
+fn say_error(status: &mut UiStatus, text: impl Into<String>) {
+    status.last_message = Some(text.into());
+    status.last_message_is_error = true;
+}
+
+/// Start the local API if it is enabled. `error` says why it is not listening.
+fn start_api(config: &Config, event_tx: &Sender<AppEvent>, error: &mut Option<String>) -> Option<crate::api::ApiServer> {
+    *error = None;
+    if !config.api_enabled {
+        return None;
+    }
+    match crate::api::ApiServer::start(config, event_tx.clone()) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            warn!("API server not started: {}", e);
+            *error = Some(e);
+            None
+        }
+    }
 }

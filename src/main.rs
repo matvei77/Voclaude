@@ -6,45 +6,26 @@
 mod api;
 mod app;
 mod audio;
+mod autostart;
 mod bench;
 mod config;
+mod config_edit;
+mod console;
+mod console_host;
 mod history;
 mod hotkey;
 mod inference;
+mod instance;
 mod phrases;
 mod profile;
 mod session;
 mod tray;
-mod ui;
 mod worker;
 
 use app::App;
 use config::Config;
 use inference::{AsrEngine, Engine};
 use tracing::{info, error, Level};
-
-/// Writer that sends output to both the UI log buffer and a file appender.
-struct CombinedWriter {
-    ui: ui::LogBufferMakeWriter,
-    file: tracing_appender::non_blocking::NonBlocking,
-}
-
-impl std::io::Write for CombinedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use tracing_subscriber::fmt::MakeWriter;
-        // Write to file first (non-blocking)
-        let _ = std::io::Write::write(&mut self.file, buf);
-        // Write to UI buffer (includes stdout)
-        let mut ui_writer = self.ui.make_writer();
-        ui_writer.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // O-6: Propagate file flush errors instead of discarding
-        std::io::Write::flush(&mut self.file)?;
-        Ok(())
-    }
-}
 
 fn main() {
     // Defer cuBLAS/cuDNN kernel loading until first use (~200-400 MB saved).
@@ -84,6 +65,11 @@ fn main() {
     if args.len() > 1 && args[1] == "transcribe" {
         attach_console_for_cli();
         std::process::exit(api::cli_transcribe(&args[2..]));
+    }
+
+    // `voclaude console`: the Voclaude window (its own process; see src/console)
+    if args.len() > 1 && args[1] == "console" {
+        std::process::exit(console::run(&args[2..]));
     }
 
     // `voclaude phrases ...`: manage and check the parakeet_phrases list
@@ -152,11 +138,17 @@ fn main() {
         return;
     }
 
-    // Normal mode: log to UI buffer + file
-    let log_buffer = ui::LogBuffer::new(400);
-    let log_writer = log_buffer.make_writer();
+    // Normal mode. One tray app per profile: a second launch (Start menu,
+    // desktop icon) opens the running app's window instead.
+    let _instance = match instance::acquire() {
+        Some(instance) => instance,
+        None => {
+            instance::signal_open();
+            return;
+        }
+    };
 
-    // File logging: %LOCALAPPDATA%/Voclaude/logs/ with daily rotation, keep 5 files
+    // File logging: data/logs, daily files, keep the newest 5
     let _file_guard = if let Some(dirs) = config::project_dirs() {
         let log_dir = dirs.data_dir().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
@@ -173,14 +165,12 @@ fn main() {
         }
         let file_appender = tracing_appender::rolling::daily(&log_dir, "voclaude.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-        // Dual writer: UI buffer + file
-        let combined = CombinedWriter { ui: log_writer, file: non_blocking };
         tracing_subscriber::fmt()
             .with_max_level(Level::DEBUG)
             .with_target(false)
+            .with_ansi(false)
             .compact()
-            .with_writer(std::sync::Mutex::new(combined))
+            .with_writer(non_blocking)
             .init();
         Some(guard)
     } else {
@@ -188,7 +178,7 @@ fn main() {
             .with_max_level(Level::DEBUG)
             .with_target(false)
             .compact()
-            .with_writer(log_writer)
+            .with_writer(std::io::stderr)
             .init();
         None
     };
@@ -196,7 +186,9 @@ fn main() {
     Config::migrate_from_legacy();
     info!("Voclaude {} starting...", env!("CARGO_PKG_VERSION"));
 
-    // Load config
+    // Load config. A broken file falls back to the defaults, and the tray
+    // tooltip and the window say so.
+    let mut startup_config_error: Option<String> = None;
     let mut config = match Config::load() {
         Ok(c) => {
             info!("Config loaded successfully");
@@ -212,6 +204,7 @@ fn main() {
         }
         Err(e) => {
             error!("Failed to load config: {}", e);
+            startup_config_error = Some(e.to_string());
             Config::default()
         }
     };
@@ -275,7 +268,7 @@ fn main() {
     }
 
     // Run the app
-    if let Err(e) = App::run(config, log_buffer) {
+    if let Err(e) = App::run(config, startup_config_error) {
         error!("Application error: {}", e);
         show_fatal_error_dialog(&format!("Application error: {}", e));
         std::process::exit(1);

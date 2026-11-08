@@ -1,6 +1,6 @@
 [package]
 name = "voclaude"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Voice input anywhere - local speech-to-text in the system tray (Parakeet Ultra, 25 languages)"
 license = "MIT"
@@ -57,7 +57,7 @@ transcribe-cpp = { version = "0.4.1", default-features = false, features = ["dyn
 transcribe-cpp-sys = { version = "0.4.1", default-features = false }   # native log callback
 
 # Windows message loop
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_LibraryLoader"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"      # embeds assets/icon.ico into voclaude.exe
