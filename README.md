@@ -198,6 +198,7 @@ use_gpu = true                  # false = always use the CPU
 engine = "parakeet"             # or "qwen" (see below)
 parakeet_model = "handy-computer/parakeet-ultra-gguf/parakeet-ultra-Q6_K.gguf"
 parakeet_recheck = true         # keep short Russian phrases inside English in Cyrillic
+parakeet_phrases = []           # names to spell exactly: ["Qwen = Quan, Quen"] (see config.example.toml)
 cpu_threads = 0                 # CPU threads for Parakeet, 0 = automatic
 idle_unload_seconds = 60        # free the GPU this long after the last dictation
 streaming = true                # transcribe segments while recording

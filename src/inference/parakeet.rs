@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use transcribe_cpp::{
-    Device, DeviceType, Model, ModelOptions, RunOptions, Session, SessionOptions, TimestampKind, Transcript,
+    Device, DeviceType, Feature, Model, ModelOptions, RunOptions, Session, SessionOptions, TimestampKind, Transcript,
 };
 use transcribe_cpp_sys as sys;
 
@@ -47,12 +47,28 @@ const RECHECK_PAUSE_SECS: f64 = 0.2;
 /// pipeline size class that real segments (up to 45 s) reach.
 const WARMUP_SECS: [usize; 4] = [1, 5, 12, 30];
 
+// Phrase re-check (`parakeet_phrases`), from the 2026-11-08 runs over 55
+// names clips and 140 negative/reference clips (docs/bench/intel-optimization).
+/// A Latin word not in a shaky run is still a candidate below this confidence...
+const PHRASE_NEAR_P: f32 = 0.97;
+/// ...if its letters are at least this similar to a term or spoken form.
+const PHRASE_NEAR_SIM: f64 = 0.6;
+/// The words a biased decode replaces must be at least this similar to what it spelled.
+const PHRASE_ACCEPT_SIM: f64 = 0.4;
+/// At most this many first-pass words become one term.
+const PHRASE_MAX_WORDS: usize = 3;
+/// Tolerance (seconds) when matching biased-decode words to first-pass words.
+const PHRASE_SLACK_SECS: f64 = 0.12;
+/// Leading and trailing characters that are not part of a word.
+const PHRASE_PUNCT: &str = "\"'“”‘’«»()[]{}.,!?;:…-—–";
+
 pub struct ParakeetEngine {
     model_spec: String,
     use_gpu: bool,
     require_gpu: bool,
     cpu_threads: u32,
     recheck: bool,
+    phrases: Vec<Phrase>,
     segmenter: SegmenterConfig,
     loaded: Option<Loaded>,
 }
@@ -62,8 +78,51 @@ struct Loaded {
     session: Session,
     _model: Model,
     on_gpu: bool,
+    /// transcribe.dll applies RunOptions::vocabulary to the Parakeet decoder.
+    phrase_bias: bool,
     label: String,
     size_mb: u64,
+}
+
+/// One `parakeet_phrases` entry: the spelling to write, and spoken forms
+/// (spellings Parakeet writes when it mishears the term).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phrase {
+    pub term: String,
+    pub forms: Vec<String>,
+}
+
+/// Parse `"Hemingway = Hemengwe, Megway"` entries; blank entries are skipped.
+pub fn parse_phrases(entries: &[String]) -> Vec<Phrase> {
+    let tidy = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let (term, forms) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+            let term = tidy(term);
+            if term.is_empty() {
+                return None;
+            }
+            let forms = forms.split(',').map(tidy).filter(|f| !f.is_empty() && *f != term).collect();
+            Some(Phrase { term, forms })
+        })
+        .collect()
+}
+
+/// A replacement of first-pass words `first..=last`. Russian re-check text
+/// follows the sentence case; a phrase term keeps its exact spelling.
+#[derive(Debug, Clone, PartialEq)]
+struct Edit {
+    first: usize,
+    last: usize,
+    text: String,
+    exact_case: bool,
+}
+
+impl Edit {
+    fn russian((first, last, text): (usize, usize, String)) -> Self {
+        Edit { first, last, text, exact_case: false }
+    }
 }
 
 impl ParakeetEngine {
@@ -74,6 +133,7 @@ impl ParakeetEngine {
             require_gpu: config.require_gpu,
             cpu_threads: config.cpu_threads,
             recheck: config.parakeet_recheck,
+            phrases: parse_phrases(&config.parakeet_phrases),
             segmenter: config.segmenter_config(),
             loaded: None,
         })
@@ -102,12 +162,53 @@ impl ParakeetEngine {
                     secs / wall.max(1e-6),
                     result.timings.encode_ms
                 );
+                let mut edits: Vec<Edit> = Vec::new();
+                let started_ru = Instant::now();
                 if self.recheck {
-                    if let Some(text) = recheck_russian(&mut loaded.session, samples, &result) {
-                        return Ok(text);
-                    }
+                    edits.extend(russian_replacements(&mut loaded.session, samples, &result).into_iter().map(Edit::russian));
                 }
-                Ok(result.text.trim().to_string())
+                let (russian_ms, russian_edits) = (started_ru.elapsed().as_secs_f64() * 1000.0, edits.len());
+                let (mut phrase_ms, mut phrase_biased, mut phrase_count) = (0.0, false, 0);
+                if !self.phrases.is_empty() {
+                    let started = Instant::now();
+                    let words = timed_words(&result);
+                    let (found, biased_run) =
+                        phrase_edits(&mut loaded.session, loaded.phrase_bias, samples, &words, &self.phrases, &edits);
+                    phrase_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    (phrase_biased, phrase_count) = (biased_run, found.len());
+                    debug!(
+                        "Phrase re-check: {} edit(s), biased decode {}, {:.0} ms",
+                        found.len(),
+                        if biased_run { "run" } else { "skipped" },
+                        phrase_ms
+                    );
+                    edits.extend(found);
+                    edits.sort_by_key(|e| e.first);
+                }
+                // Text-free timing record (VOCLAUDE_WORKER_PROFILE=1, src/profile.rs).
+                // first_ms: wall time of the first decode; mel/encode/decode_ms: its native
+                // phases; phrase_ms includes the biased second decode when it ran.
+                let round = |ms: f64| (ms * 10.0).round() / 10.0;
+                crate::profile::emit(serde_json::json!({
+                    "kind": "parakeet_segment",
+                    "samples": samples.len(),
+                    "gpu": loaded.on_gpu,
+                    "first_ms": round(wall * 1000.0),
+                    "mel_ms": round(result.timings.mel_ms as f64),
+                    "encode_ms": round(result.timings.encode_ms as f64),
+                    "decode_ms": round(result.timings.decode_ms as f64),
+                    "russian_recheck": self.recheck,
+                    "russian_ms": round(russian_ms),
+                    "russian_edits": russian_edits,
+                    "phrases": self.phrases.len(),
+                    "phrase_ms": round(phrase_ms),
+                    "phrase_biased": phrase_biased,
+                    "phrase_edits": phrase_count,
+                }));
+                if edits.is_empty() {
+                    return Ok(result.text.trim().to_string());
+                }
+                Ok(splice(&timed_words(&result), &edits))
             }
             Err(transcribe_cpp::Error::InputTooShort(_)) => Ok(String::new()),
             // The decoder stopped early (budget or a loop). A retry gives the same
@@ -176,8 +277,9 @@ impl Loaded {
         }
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let label = format!("{} on {}", name, where_);
+        let phrase_bias = model.supports(Feature::Vocabulary);
         info!("Loaded {} in {:.1}s", label, started.elapsed().as_secs_f64());
-        Ok(Loaded { session, _model: model, on_gpu, label, size_mb })
+        Ok(Loaded { session, _model: model, on_gpu, phrase_bias, label, size_mb })
     }
 }
 
@@ -195,7 +297,14 @@ impl AsrEngine for ParakeetEngine {
                 message: "Loading Parakeet...".to_string(),
             });
         }
-        self.loaded = Some(self.load()?);
+        let loaded = self.load()?;
+        if !self.phrases.is_empty() && !loaded.phrase_bias {
+            warn!(
+                "parakeet_phrases: this transcribe.dll has no Parakeet vocabulary support; \
+                 only exact spoken forms are used"
+            );
+        }
+        self.loaded = Some(loaded);
         Ok(())
     }
 
@@ -307,12 +416,12 @@ fn script(word: &str) -> Script {
 /// Russian phrase inside English comes out spelled in Latin letters ("Casa
 /// Veras Riv" for "кассовый разрыв"), and the model is unsure of those words.
 /// Decoded again with only a word or two of English around it, the same audio
-/// comes out in Cyrillic. Returns the segment text with such phrases replaced,
-/// or `None` if nothing changed.
+/// comes out in Cyrillic. Returns the (first, last, text) replacements, empty
+/// if nothing changed.
 ///
 /// One way only: re-decoding unsure words of a Russian segment in Latin
 /// letters gave Polish and Slovak, not English.
-fn recheck_russian(session: &mut Session, samples: &[f32], first: &Transcript) -> Option<String> {
+fn russian_replacements(session: &mut Session, samples: &[f32], first: &Transcript) -> Vec<(usize, usize, String)> {
     let words = timed_words(first);
     let secs = samples.len() as f64 / 16_000.0;
     let mut replacements: Vec<(usize, usize, String)> = Vec::new();
@@ -334,7 +443,182 @@ fn recheck_russian(session: &mut Session, samples: &[f32], first: &Transcript) -
             }
         }
     }
-    (!replacements.is_empty()).then(|| splice(&words, &replacements))
+    replacements
+}
+
+/// A word without the punctuation around it.
+fn word_core(text: &str) -> &str {
+    text.trim_matches(|c| PHRASE_PUNCT.contains(c))
+}
+
+/// 1 - (edit distance / longer length) over the lowercase letters of `a` and `b`.
+fn letter_similarity(a: &str, b: &str) -> f64 {
+    let letters = |s: &str| s.chars().flat_map(char::to_lowercase).filter(|c| c.is_alphabetic()).collect::<Vec<_>>();
+    let (a, b) = (letters(a), letters(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + usize::from(ca != cb)));
+        }
+        prev = cur;
+    }
+    1.0 - prev[b.len()] as f64 / a.len().max(b.len()) as f64
+}
+
+/// True if most of `w` lies inside `t0..t1` (seconds): half its duration, or
+/// its time point for a zero-width word.
+fn inside(w: &TimedWord, t0: f64, t1: f64) -> bool {
+    if w.t1 <= w.t0 {
+        return w.t0 >= t0 - PHRASE_SLACK_SECS && w.t0 <= t1 + PHRASE_SLACK_SECS;
+    }
+    let half = PHRASE_SLACK_SECS / 2.0;
+    let inter = (w.t1.min(t1 + half) - w.t0.max(t0 - half)).max(0.0);
+    inter >= 0.5 * (w.t1 - w.t0)
+}
+
+/// List terms for the words Parakeet was unsure of. A first-pass word is a
+/// candidate if it is Latin and either in a shaky run (as for the Russian
+/// re-check) or below `PHRASE_NEAR_P` and spelled like a term or spoken form.
+/// Up to `PHRASE_MAX_WORDS` candidate words become one term when:
+///
+/// - a decode of the same audio biased towards the list (transcribe.dll
+///   vocabulary support) spells the term, or one of its spoken forms, over
+///   them, and they are at least `PHRASE_ACCEPT_SIM` similar to that spelling;
+///   the bias only re-ranks the model's own top guesses (see the patched
+///   decoder), so this is acoustic evidence, not a text match; or
+/// - they are exactly a listed spoken form (case-insensitive).
+///
+/// Words already replaced by the Russian re-check stay as they are, and a
+/// change of case alone is never made. Returns the edits and whether the
+/// biased decode ran (it runs only when a candidate exists).
+fn phrase_edits(
+    session: &mut Session,
+    decoder_bias: bool,
+    samples: &[f32],
+    words: &[TimedWord],
+    phrases: &[Phrase],
+    russian: &[Edit],
+) -> (Vec<Edit>, bool) {
+    let mut open = phrase_candidates(words, phrases, russian);
+    if !open.contains(&true) {
+        return (Vec::new(), false);
+    }
+    let mut edits = Vec::new();
+    let mut biased_run = false;
+    if decoder_bias {
+        let options =
+            RunOptions { timestamps: TimestampKind::Token, vocabulary: phrase_vocabulary(phrases), ..Default::default() };
+        // A decoder stop or too-short input: keep the first pass for this route.
+        if let Ok(biased) = session.run(samples, &options) {
+            biased_run = true;
+            edits.extend(acoustic_phrase_edits(words, &timed_words(&biased), phrases, &mut open));
+        }
+    }
+    edits.extend(spoken_form_edits(words, phrases, &mut open));
+    (edits, biased_run)
+}
+
+/// Every term and spoken form, in list order, without duplicates.
+fn phrase_vocabulary(phrases: &[Phrase]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in phrases.iter().flat_map(|p| std::iter::once(&p.term).chain(&p.forms)) {
+        if !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// Which first-pass words a phrase may replace (see `phrase_edits`).
+fn phrase_candidates(words: &[TimedWord], phrases: &[Phrase], russian: &[Edit]) -> Vec<bool> {
+    let shaky: Vec<usize> = shaky_runs(words).into_iter().flat_map(|(i, j)| i..=j).collect();
+    let spellings: Vec<&str> =
+        phrases.iter().flat_map(|p| std::iter::once(p.term.as_str()).chain(p.forms.iter().map(String::as_str))).collect();
+    let mut open: Vec<bool> = words
+        .iter()
+        .enumerate()
+        .map(|(k, w)| {
+            let core = word_core(&w.text);
+            script(core) == Script::Latin
+                && (shaky.contains(&k)
+                    || (w.p < PHRASE_NEAR_P && spellings.iter().any(|s| letter_similarity(core, s) >= PHRASE_NEAR_SIM)))
+        })
+        .collect();
+    for e in russian {
+        open[e.first..=e.last].iter_mut().for_each(|o| *o = false);
+    }
+    open
+}
+
+fn span_core(words: &[TimedWord], i: usize, j: usize) -> String {
+    words[i..=j].iter().map(|w| word_core(&w.text)).collect::<Vec<_>>().join(" ")
+}
+
+fn take_edit(edits: &mut Vec<Edit>, open: &mut [bool], i: usize, j: usize, term: &str) {
+    open[i..=j].iter_mut().for_each(|o| *o = false);
+    edits.push(Edit { first: i, last: j, text: term.to_string(), exact_case: true });
+}
+
+/// Edits backed by the biased decode `biased`: a complete term (exact
+/// spelling) or spoken form (any case) over open first-pass words.
+fn acoustic_phrase_edits(words: &[TimedWord], biased: &[TimedWord], phrases: &[Phrase], open: &mut [bool]) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    // Terms first, then spoken forms.
+    let targets: Vec<(&str, &str, bool)> = phrases
+        .iter()
+        .map(|p| (p.term.as_str(), p.term.as_str(), true))
+        .chain(phrases.iter().flat_map(|p| p.forms.iter().map(move |f| (f.as_str(), p.term.as_str(), false))))
+        .collect();
+    for bi in 0..biased.len() {
+        for &(spelling, term, exact) in &targets {
+            let parts: Vec<&str> = spelling.split(' ').collect();
+            if bi + parts.len() > biased.len() {
+                continue;
+            }
+            let got = biased[bi..bi + parts.len()].iter().map(|w| word_core(&w.text));
+            if !got.zip(&parts).all(|(g, p)| if exact { g == *p } else { g.to_lowercase() == p.to_lowercase() }) {
+                continue;
+            }
+            let (t0, t1) = (biased[bi].t0, biased[bi + parts.len() - 1].t1);
+            let idx: Vec<usize> = (0..words.len()).filter(|&k| inside(&words[k], t0, t1)).collect();
+            let (Some(&i), Some(&j)) = (idx.first(), idx.last()) else { continue };
+            if idx.len() > PHRASE_MAX_WORDS || j - i + 1 != idx.len() || !open[i..=j].iter().all(|o| *o) {
+                continue;
+            }
+            let old = span_core(words, i, j);
+            if old.to_lowercase() == term.to_lowercase() || letter_similarity(&old, spelling) < PHRASE_ACCEPT_SIM {
+                continue;
+            }
+            take_edit(&mut edits, open, i, j, term);
+        }
+    }
+    edits
+}
+
+/// Edits for open first-pass words that are exactly a spoken form, all below
+/// `PHRASE_NEAR_P`. Needs no biased decode.
+fn spoken_form_edits(words: &[TimedWord], phrases: &[Phrase], open: &mut [bool]) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    for i in 0..words.len() {
+        for n in 1..=PHRASE_MAX_WORDS {
+            let j = i + n - 1;
+            if j >= words.len() {
+                break;
+            }
+            if !open[i..=j].iter().all(|o| *o) || !words[i..=j].iter().all(|w| w.p < PHRASE_NEAR_P) {
+                continue;
+            }
+            let old = span_core(words, i, j).to_lowercase();
+            if let Some(p) = phrases.iter().find(|p| p.forms.iter().any(|f| f.to_lowercase() == old)) {
+                take_edit(&mut edits, open, i, j, &p.term);
+            }
+        }
+    }
+    edits
 }
 
 /// Runs of unsure Latin words in a mostly Latin segment, as (first, last)
@@ -444,28 +728,35 @@ fn russian_replacement(
     Some((first, last, text))
 }
 
-/// The segment text with each (first, last, text) replacement spliced in.
+/// The segment text with each edit spliced in (edits sorted, not overlapping).
 /// Punctuation after a replacement comes from the first pass, which heard the
-/// whole sentence; capitalisation follows the sentence position.
-fn splice(words: &[TimedWord], replacements: &[(usize, usize, String)]) -> String {
+/// whole sentence. Russian re-check text follows the sentence case; a phrase
+/// term keeps its spelling and the punctuation before the replaced word.
+fn splice(words: &[TimedWord], edits: &[Edit]) -> String {
     const ENDS: [char; 6] = ['.', ',', '?', '!', ';', ':'];
     let mut parts: Vec<String> = Vec::new();
     let mut next = 0;
-    for (first, last, text) in replacements {
-        parts.extend(words[next..*first].iter().map(|w| w.text.clone()));
-        let trailing = &words[*last].text[words[*last].text.trim_end_matches(ENDS).len()..];
-        let mut text = format!("{}{}", text.trim_end_matches(ENDS), trailing);
-        let starts_sentence = *first == 0 || words[*first - 1].text.ends_with(['.', '?', '!']);
-        let mut chars = text.chars();
-        if let Some(c) = chars.next() {
-            if starts_sentence {
-                text = c.to_uppercase().chain(chars).collect();
-            } else if !words[*first].text.starts_with(char::is_uppercase) {
-                text = c.to_lowercase().chain(chars).collect();
+    for e in edits {
+        parts.extend(words[next..e.first].iter().map(|w| w.text.clone()));
+        let trailing = &words[e.last].text[words[e.last].text.trim_end_matches(ENDS).len()..];
+        let mut text = format!("{}{}", e.text.trim_end_matches(ENDS), trailing);
+        if e.exact_case {
+            let first = &words[e.first].text;
+            let lead = &first[..first.len() - first.trim_start_matches(|c| PHRASE_PUNCT.contains(c)).len()];
+            text = format!("{}{}", lead, text);
+        } else {
+            let starts_sentence = e.first == 0 || words[e.first - 1].text.ends_with(['.', '?', '!']);
+            let mut chars = text.chars();
+            if let Some(c) = chars.next() {
+                if starts_sentence {
+                    text = c.to_uppercase().chain(chars).collect();
+                } else if !words[e.first].text.starts_with(char::is_uppercase) {
+                    text = c.to_lowercase().chain(chars).collect();
+                }
             }
         }
         parts.push(text);
-        next = last + 1;
+        next = e.last + 1;
     }
     parts.extend(words[next..].iter().map(|w| w.text.clone()));
     parts.join(" ")
@@ -605,7 +896,7 @@ mod tests {
         let found = russian_replacement(&words, 4, 6, &redecode(), 1.64);
         assert_eq!(found, Some((4, 6, "кассовый разрыв.".to_string())));
         assert_eq!(
-            splice(&words, &[found.unwrap()]),
+            splice(&words, &[Edit::russian(found.unwrap())]),
             "And uh it's called кассовый разрыв to cover everyone's salaries correctly."
         );
     }
@@ -631,12 +922,100 @@ mod tests {
         ];
         let found = russian_replacement(&words, 1, 2, &redecode, 0.0).expect("confident Russian");
         assert_eq!(found.0, 1, "the number must not be replaced");
-        assert_eq!(splice(&words, &[found]), "2000 тысяч евро в месяц.");
+        assert_eq!(splice(&words, &[Edit::russian(found)]), "2000 тысяч евро в месяц.");
     }
 
     #[test]
     fn splice_keeps_first_pass_punctuation_and_sentence_case() {
         let words = vec![w(0.0, 0.5, 0.7, "Kassovy"), w(0.5, 1.0, 0.7, "razriv,"), w(1.0, 1.5, 1.0, "right.")];
-        assert_eq!(splice(&words, &[(0, 1, "кассовый разрыв.".to_string())]), "Кассовый разрыв, right.");
+        assert_eq!(
+            splice(&words, &[Edit::russian((0, 1, "кассовый разрыв.".to_string()))]),
+            "Кассовый разрыв, right."
+        );
+    }
+
+    fn phrases() -> Vec<Phrase> {
+        parse_phrases(&[
+            "Hemingway = Hemengwe, Megway".to_string(),
+            "Qwen = Quan, Quen".to_string(),
+            "  Jonathan ".to_string(),
+            "".to_string(),
+            "Codex = codec".to_string(),
+        ])
+    }
+
+    /// "send it to uh Hemenque, then" (first pass): the name is shaky.
+    fn hemenque() -> Vec<TimedWord> {
+        vec![
+            w(0.0, 0.3, 1.0, "send"),
+            w(0.3, 0.5, 1.0, "it"),
+            w(0.5, 0.7, 1.0, "to"),
+            w(0.8, 1.0, 0.93, "uh"),
+            w(1.1, 1.8, 0.81, "Hemenque,"),
+            w(1.9, 2.3, 1.0, "then"),
+        ]
+    }
+
+    #[test]
+    fn phrase_entries_parse_terms_and_spoken_forms() {
+        let p = phrases();
+        assert_eq!(p.len(), 4, "blank entries are skipped");
+        assert_eq!(p[0], Phrase { term: "Hemingway".into(), forms: vec!["Hemengwe".into(), "Megway".into()] });
+        assert_eq!(p[2], Phrase { term: "Jonathan".into(), forms: vec![] });
+        assert_eq!(phrase_vocabulary(&p)[..4], ["Hemingway", "Hemengwe", "Megway", "Qwen"]);
+    }
+
+    #[test]
+    fn letter_similarity_ignores_case_and_punctuation() {
+        assert!((letter_similarity("Hemengwe,", "Hemingway") - (1.0 - 3.0 / 9.0)).abs() < 1e-9);
+        assert!((letter_similarity("codecs", "Codex") - (1.0 - 2.0 / 6.0)).abs() < 1e-9);
+        assert_eq!(letter_similarity("Qwen", "qwen"), 1.0);
+        assert_eq!(letter_similarity("", "Qwen"), 0.0);
+    }
+
+    #[test]
+    fn candidates_are_unsure_or_near_latin_words_only() {
+        let mut words = hemenque();
+        words.push(w(2.4, 2.8, 0.95, "codecs")); // confident but spelled like "codec"
+        words.push(w(2.9, 3.2, 0.99, "Codecs")); // too confident
+        words.push(w(3.3, 3.6, 0.80, "Квен")); // Cyrillic
+        let open = phrase_candidates(&words, &phrases(), &[]);
+        assert_eq!(open, vec![false, false, false, false, true, false, true, false, false]);
+        let russian = [Edit::russian((4, 4, "Хемингуэй".to_string()))];
+        assert!(!phrase_candidates(&words, &phrases(), &russian)[4], "Russian re-check wins");
+    }
+
+    #[test]
+    fn biased_decode_spelling_a_spoken_form_writes_the_term() {
+        let words = hemenque();
+        let mut open = phrase_candidates(&words, &phrases(), &[]);
+        let biased = vec![w(0.0, 0.3, 1.0, "send"), w(0.3, 0.5, 1.0, "it"), w(0.5, 0.7, 1.0, "to"),
+                          w(0.8, 1.0, 0.93, "uh"), w(1.12, 1.78, 0.80, "Hemengwe,"), w(1.9, 2.3, 1.0, "then")];
+        let edits = acoustic_phrase_edits(&words, &biased, &phrases(), &mut open);
+        assert_eq!(edits, vec![Edit { first: 4, last: 4, text: "Hemingway".into(), exact_case: true }]);
+        assert_eq!(splice(&words, &edits), "send it to uh Hemingway, then");
+    }
+
+    #[test]
+    fn biased_decode_over_confident_words_or_case_only_is_rejected() {
+        let words = vec![w(0.0, 0.4, 0.99, "Jonathon"), w(0.5, 0.9, 0.86, "codex")];
+        let mut open = vec![false, true];
+        let biased = vec![w(0.0, 0.4, 0.99, "Jonathan"), w(0.5, 0.9, 0.86, "Codex")];
+        assert!(acoustic_phrase_edits(&words, &biased, &phrases(), &mut open).is_empty());
+    }
+
+    #[test]
+    fn exact_spoken_forms_need_an_unsure_word() {
+        let words = vec![w(0.0, 0.3, 0.88, "Quan"), w(0.3, 0.6, 1.0, "image"), w(0.7, 1.0, 0.99, "Quan")];
+        let mut open = vec![true, false, true];
+        let edits = spoken_form_edits(&words, &phrases(), &mut open);
+        assert_eq!(edits, vec![Edit { first: 0, last: 0, text: "Qwen".into(), exact_case: true }]);
+    }
+
+    #[test]
+    fn exact_case_edit_keeps_leading_punctuation() {
+        let words = vec![w(0.0, 0.5, 0.8, "(Megway,"), w(0.5, 0.9, 1.0, "model)")];
+        let edits = [Edit { first: 0, last: 0, text: "Hemingway".into(), exact_case: true }];
+        assert_eq!(splice(&words, &edits), "(Hemingway, model)");
     }
 }

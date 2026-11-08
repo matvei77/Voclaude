@@ -4,6 +4,7 @@
 #   .\package.ps1                    # standard build: Parakeet on Vulkan or CPU, Qwen on CPU
 #   .\package.ps1 -Installer         # also build the Inno Setup installer
 #   .\package.ps1 -Cuda -Installer   # CUDA build: adds the Qwen engine on NVIDIA GPUs
+#   add -PatchedTranscribe            # bundle the phrase-bias transcribe.dll (parakeet_phrases)
 #
 # Output (dist\):
 #   voclaude-vX.Y.Z-<hash>.zip          voclaude-vX.Y.Z-setup.exe
@@ -15,7 +16,8 @@
 
 param(
     [switch]$Cuda,
-    [switch]$Installer
+    [switch]$Installer,
+    [switch]$PatchedTranscribe  # bundle the phrase-bias transcribe.dll (build-transcribe-patched.ps1)
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,6 +94,16 @@ Copy-Item "$TranscribeBin\*.dll" $StageDir
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "licenses") | Out-Null
 Copy-Item -Recurse (Join-Path $ProjectRoot "vendor\transcribe-prebuilt\licenses") (Join-Path $StageDir "licenses\transcribe.cpp")
 Write-Host "  Bundled transcribe.cpp runtime ($((Get-ChildItem "$TranscribeBin\*.dll").Count) DLLs)" -ForegroundColor DarkGray
+
+# Optional: replace transcribe.dll with the phrase-bias build (same ABI, same
+# ggml DLLs). Without it, parakeet_phrases uses exact spoken forms only.
+if ($PatchedTranscribe) {
+    & (Join-Path $ProjectRoot "build-transcribe-patched.ps1")
+    $PatchedDll = Join-Path $ProjectRoot "vendor\transcribe-patched\transcribe.dll"
+    if (-not (Test-Path $PatchedDll)) { Write-Host "Patched transcribe.dll missing." -ForegroundColor Red; exit 1 }
+    Copy-Item $PatchedDll $StageDir -Force
+    Write-Host "  Bundled phrase-bias transcribe.dll (sha256 $((Get-FileHash $PatchedDll).Hash))" -ForegroundColor DarkGray
+}
 
 # CUDA variant: bundle the CUDA runtime DLLs the Qwen engine imports.
 if ($Cuda) {

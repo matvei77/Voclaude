@@ -1,0 +1,420 @@
+From 45a1f65c60926b779112497df37638528fc2bf8d Mon Sep 17 00:00:00 2001
+From: opus <opus@local>
+Date: Sun, 8 Nov 2026 14:41:20 +0100
+Subject: [PATCH] Parakeet TDT: bounded phrase bias for RunOptions::vocabulary
+ (B3)
+
+---
+ src/arch/parakeet/decoder.cpp | 208 +++++++++++++++++++++++++++++++++-
+ src/arch/parakeet/decoder.h   |  28 ++++-
+ src/arch/parakeet/model.cpp   |  69 ++++++++++-
+ 3 files changed, 300 insertions(+), 5 deletions(-)
+
+diff --git a/src/arch/parakeet/decoder.cpp b/src/arch/parakeet/decoder.cpp
+index 52defc3..ce037e7 100644
+--- a/src/arch/parakeet/decoder.cpp
++++ b/src/arch/parakeet/decoder.cpp
+@@ -43,6 +43,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <memory>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -1009,6 +1011,177 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
+     return static_cast<float>(1.0 - entropy / max_entropy);
+ }
+ 
++// Phrase matcher for PhraseBias: active partial matches over the raw target
++// strings, advanced by the raw piece of every emitted token.
++class PhraseMatcher {
++  public:
++    explicit PhraseMatcher(const PhraseBias & b) : b_(b) {}
++
++    // True if `piece` continues an active match, or opens a target at a step
++    // where the acoustic best piece `acoustic` also opens a word with the same
++    // first-letter case. A start piece other than the acoustic best needs at
++    // least two characters after the marker. These rules keep the bias from
++    // turning a mid-word step into a word start ("Hemen Gwei"), from changing
++    // case ("git" -> "Git"), and from committing to a one-letter prefix of a
++    // target that the audio will not complete.
++    bool extends(const std::string & piece, const std::string * acoustic) const {
++        if (piece.empty()) {
++            return false;
++        }
++        for (const Active & a : active_) {
++            if (continues(b_.targets[static_cast<size_t>(a.target)], a.off, piece)) {
++                return true;
++            }
++        }
++        if (!may_start(piece, acoustic)) {
++            return false;
++        }
++        for (const std::string & t : b_.targets) {
++            if (continues(t, 0, piece)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // Advance with an emitted piece. `end_frame` is the frame the emitted
++    // token ends at (step_at_emit + duration): the gap timeout counts from it,
++    // so TDT duration jumps inside a word do not drop the match.
++    void advance(const std::string & piece, int end_frame) {
++        const int step = end_frame;
++        std::vector<Active> next;
++        for (const Active & a : active_) {
++            const std::string & t = b_.targets[static_cast<size_t>(a.target)];
++            if (continues(t, a.off, piece) && a.off + piece.size() < t.size()) {
++                next.push_back({ a.target, a.off + piece.size(), step });
++            }
++        }
++        if (opens_word(piece)) {
++            for (size_t i = 0; i < b_.targets.size(); ++i) {
++                if (continues(b_.targets[i], 0, piece) && piece.size() < b_.targets[i].size()) {
++                    next.push_back({ static_cast<int>(i), piece.size(), step });
++                }
++            }
++        }
++        active_.swap(next);
++    }
++
++    bool active() const { return !active_.empty(); }
++
++    // Drop matches that made no progress for more than max_gap_frames.
++    void tick(int step) {
++        size_t k = 0;
++        for (const Active & a : active_) {
++            if (step - a.last_step <= b_.max_gap_frames) {
++                active_[k++] = a;
++            }
++        }
++        active_.resize(k);
++    }
++
++  private:
++    struct Active {
++        int    target;
++        size_t off;
++        int    last_step;
++    };
++
++    // A word-initial piece with at least one character after the marker (the
++    // bare marker piece is a prefix of every target and is never boosted).
++    static bool opens_word(const std::string & piece) {
++        return piece.size() > 3 && std::memcmp(piece.data(), "\xE2\x96\x81", 3) == 0;
++    }
++
++    static int letter_case(unsigned char c) {
++        return (c >= 'A' && c <= 'Z') ? 1 : (c >= 'a' && c <= 'z') ? 0 : 2;  // 2: not ASCII
++    }
++
++    static bool may_start(const std::string & piece, const std::string * acoustic) {
++        if (!opens_word(piece) || acoustic == nullptr || !opens_word(*acoustic)) {
++            return false;
++        }
++        if (piece == *acoustic) {
++            return true;
++        }
++        return piece.size() >= 5 &&  // marker (3 bytes) + at least 2 characters
++               letter_case(static_cast<unsigned char>(piece[3])) ==
++                   letter_case(static_cast<unsigned char>((*acoustic)[3]));
++    }
++
++    static bool continues(const std::string & target, size_t off, const std::string & piece) {
++        return off + piece.size() <= target.size() && target.compare(off, piece.size(), piece) == 0;
++    }
++
++    const PhraseBias &  b_;
++    std::vector<Active> active_;
++};
++
++// Token for a non-blank step under PhraseBias: the best of the top_k
++// acoustic non-blank tokens after the bonus. `acoustic_best` is the unbiased
++// argmax (non-blank, so it is among the top_k). Ties keep the acoustic order.
++int phrase_biased_token(const float * token_logits, int n_token_cls, int blank_id, int acoustic_best,
++                        PhraseBias & bias, const PhraseMatcher & matcher, std::vector<int> & scratch_top) {
++    const int k = std::max(1, std::min(bias.top_k, n_token_cls - 1));
++    scratch_top.clear();
++    for (int i = 0; i < n_token_cls; ++i) {
++        if (i == blank_id) {
++            continue;
++        }
++        if (static_cast<int>(scratch_top.size()) < k) {
++            scratch_top.push_back(i);
++        } else if (token_logits[i] > token_logits[scratch_top.back()]) {
++            scratch_top.back() = i;
++        } else {
++            continue;
++        }
++        // Keep scratch_top sorted by logit, descending (stable for ties).
++        for (size_t j = scratch_top.size() - 1; j > 0 && token_logits[scratch_top[j]] > token_logits[scratch_top[j - 1]];
++             --j) {
++            std::swap(scratch_top[j], scratch_top[j - 1]);
++        }
++    }
++    // scratch_top[0] is acoustic_best (ties keep the first index in both).
++    auto piece_of = [&](int id) -> const std::string * {
++        return (id >= 0 && id < static_cast<int>(bias.pieces.size())) ? bias.pieces[static_cast<size_t>(id)] : nullptr;
++    };
++    const std::string * acoustic   = piece_of(acoustic_best);
++    int                 best       = acoustic_best;
++    float               best_score = -INFINITY;
++    bool                any_boost  = false;
++    for (int id : scratch_top) {
++        const std::string * piece   = piece_of(id);
++        const bool          boosted = piece != nullptr && matcher.extends(*piece, acoustic);
++        const float score   = token_logits[id] + (boosted ? bias.bonus : 0.0f);
++        any_boost           = any_boost || boosted;
++        if (score > best_score) {
++            best_score = score;
++            best       = id;
++        }
++    }
++    if (any_boost) {
++        ++bias.boosted_steps;
++    }
++    if (best != acoustic_best) {
++        ++bias.flips;
++    }
++    if (bias.trace && (any_boost || matcher.active())) {
++        std::string line;
++        for (int id : scratch_top) {
++            const std::string * piece =
++                (id < static_cast<int>(bias.pieces.size())) ? bias.pieces[static_cast<size_t>(id)] : nullptr;
++            char buf[160];
++            std::snprintf(buf, sizeof(buf), " %s%s=%.2f", (piece != nullptr && matcher.extends(*piece, acoustic)) ? "+" : "",
++                          piece != nullptr ? piece->c_str() : "<special>", token_logits[id]);
++            line += buf;
++        }
++        const std::string * chosen =
++            (best < static_cast<int>(bias.pieces.size())) ? bias.pieces[static_cast<size_t>(best)] : nullptr;
++        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "phrase-trace: pick %s |%s", chosen != nullptr ? chosen->c_str() : "?",
++                line.c_str());
++    }
++    return best;
++}
++
+ }  // namespace
+ 
+ // ---------------------------------------------------------------------------
+@@ -1020,7 +1193,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+                                     int                        T_enc,
+                                     int                        d_enc,
+                                     int                        n_threads,
+-                                    std::vector<TdtToken> &    out_tokens) {
++                                    std::vector<TdtToken> &    out_tokens,
++                                    PhraseBias *               bias) {
+     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
+         return TRANSCRIBE_ERR_INVALID_ARG;
+     }
+@@ -1081,6 +1255,13 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+     std::vector<float> scratch_probs;
+     std::vector<float> logits;
+ 
++    // Phrase bias (nullptr / empty = the unbiased decode, unchanged).
++    std::vector<int>               scratch_top;
++    std::unique_ptr<PhraseMatcher> matcher;
++    if (bias != nullptr && !bias->targets.empty()) {
++        matcher = std::make_unique<PhraseMatcher>(*bias);
++    }
++
+     int last_token  = -1;  // sentinel: no previous token (start state)
+     int step        = 0;
+     int new_symbols = 0;
+@@ -1131,10 +1312,21 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+         const float * token_logits    = logits.data();
+         const float * duration_logits = logits.data() + n_token_cls;
+ 
+-        const int pred_token = argmax_range(token_logits, n_token_cls);
++        int       pred_token = argmax_range(token_logits, n_token_cls);
+         const int decision   = argmax_range(duration_logits, n_dur);
+         const int duration   = w.tdt_durations[static_cast<size_t>(decision)];
+ 
++        // Phrase bias: re-rank only a step the model already chose to emit.
++        // token_logits is not modified, so token_confidence below and the
++        // blank/duration decisions stay acoustic.
++        if (matcher) {
++            matcher->tick(step);
++            if (pred_token != blank_id) {
++                pred_token = phrase_biased_token(token_logits, n_token_cls, blank_id, pred_token, *bias, *matcher,
++                                                 scratch_top);
++            }
++        }
++
+         // Optional dump of the first decode step (start state, encoder
+         // frame 0): embed input, per-layer LSTM h, joint logits. Mirrors
+         // the Python reference dumper's decode subcommand.
+@@ -1168,6 +1360,12 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+             tok.step_at_emit    = step;
+             tok.duration_frames = duration;
+             out_tokens.push_back(tok);
++            if (matcher) {
++                const std::string * piece = (pred_token < static_cast<int>(bias->pieces.size())) ?
++                                                bias->pieces[static_cast<size_t>(pred_token)] :
++                                                nullptr;
++                matcher->advance(piece != nullptr ? *piece : std::string(), step + duration);
++            }
+ 
+             last_token = pred_token;
+             std::swap(state, next_state);  // commit
+@@ -1214,6 +1412,12 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+             iter, static_cast<int>(out_tokens.size()), T_enc, t_enc_proj_us / 1000.0, t_pred_us / 1000.0,
+             t_joint_us / 1000.0, t_conf_us / 1000.0, (t_enc_proj_us + t_pred_us + t_joint_us + t_conf_us) / 1000.0,
+             static_cast<double>(t_pred_us + t_joint_us) / std::max(iter, 1));
++    if (matcher) {
++        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
++                "parakeet phrase bias: %d target(s), bonus=%.2f top_k=%d gap=%d, boosted steps=%d, flips=%d",
++                static_cast<int>(bias->targets.size()), bias->bonus, bias->top_k, bias->max_gap_frames,
++                bias->boosted_steps, bias->flips);
++    }
+ 
+     if (iter >= max_iters && !global_budget) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+diff --git a/src/arch/parakeet/decoder.h b/src/arch/parakeet/decoder.h
+index e7cb70a..9b81fe4 100644
+--- a/src/arch/parakeet/decoder.h
++++ b/src/arch/parakeet/decoder.h
+@@ -203,6 +203,31 @@ struct TdtToken {
+     int   duration_frames = 0;
+ };
+ 
++// Optional phrase bias for decode_tdt_greedy (RunOptions::vocabulary).
++//
++// Bounded shallow fusion over SentencePiece piece text, not token ids (the
++// SentencePiece tokenizer has no encoder here, and a phrase can be spelled by
++// several piece sequences). At a step where the acoustic argmax is NOT blank,
++// the top_k acoustic tokens are re-ranked: a token whose raw piece continues a
++// target (or starts one at a word boundary) gets `bonus` added to its logit.
++// Blank decisions, durations and the reported entropy confidence all come from
++// the unbiased logits, so the bias can only change WHICH token is emitted at a
++// step the model already chose to emit, and only among its own top_k guesses
++// within `bonus` logits of the best one. A partial match is dropped after
++// `max_gap_frames` encoder frames without progress or at a word boundary that
++// does not continue it.
++struct PhraseBias {
++    std::vector<std::string>         targets;  // raw form: U+2581 + words joined by U+2581
++    std::vector<const std::string *> pieces;   // raw piece per token id; nullptr = never boosted
++    float                            bonus          = 4.0f;  // logits (2026-11-08 sweep: 4 = 6 > 2 on accepted fixes)
++    int                              top_k          = 8;
++    int                              max_gap_frames = 3;
++    bool                             trace          = false;  // log every biased step (evaluation only)
++    // Telemetry (written by the decoder).
++    int boosted_steps = 0;  // steps where at least one candidate got the bonus
++    int flips         = 0;  // steps where the emitted token differs from the acoustic argmax
++};
++
+ // Run TDT greedy decode end-to-end against an encoder output buffer.
+ //
+ // Inputs:
+@@ -223,7 +248,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+                                     int                        T_enc,
+                                     int                        d_enc,
+                                     int                        n_threads,
+-                                    std::vector<TdtToken> &    out_tokens);
++                                    std::vector<TdtToken> &    out_tokens,
++                                    PhraseBias *               bias = nullptr);
+ 
+ // Run RNNT greedy decode end-to-end. Same predictor + joint code as TDT,
+ // but the joint emits `vocab+1` logits (no duration extras) and the step
+diff --git a/src/arch/parakeet/model.cpp b/src/arch/parakeet/model.cpp
+index a877781..c3b8127 100644
+--- a/src/arch/parakeet/model.cpp
++++ b/src/arch/parakeet/model.cpp
+@@ -587,6 +587,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
+         return st;
+     }
+ 
++    // RunOptions::vocabulary drives the bounded phrase bias of the offline
++    // TDT greedy decoder (decoder.h PhraseBias). Other heads ignore it.
++    if (m->host_decoder.head_kind == HostHeadKind::TDT) {
++        transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_VOCABULARY, true);
++    }
++
+     // Multitalker bundle post-load: fuse the diarizer conformer's BN (needs
+     // uploaded data), build its ceil-framed mel frontend, and publish the
+     // DIARIZATION capability — for a bundle it is a property of the file.
+@@ -789,6 +795,61 @@ static double parakeet_ms_per_enc_frame(const ParakeetHParams & hp) {
+            static_cast<double>(hp.fe_sample_rate);
+ }
+ 
++// PhraseBias for one run from RunOptions::vocabulary: each term becomes a raw
++// SentencePiece target ("Claude Code" -> U+2581 "Claude" U+2581 "Code"), and
++// every non-special piece of the vocabulary can be boosted. Tuning overrides
++// for evaluation only: TRANSCRIBE_PARAKEET_BIAS_BONUS / _TOPK / _GAP.
++static bool build_phrase_bias(const ParakeetModel * pm, const transcribe_run_params * params, PhraseBias & out) {
++    if (params == nullptr || params->vocabulary == nullptr || params->n_vocabulary <= 0) {
++        return false;
++    }
++    constexpr const char k_marker[] = "\xE2\x96\x81";
++    for (int32_t i = 0; i < params->n_vocabulary; ++i) {
++        const char * term = params->vocabulary[i];
++        if (term == nullptr) {
++            continue;
++        }
++        std::string target;
++        bool        at_word_start = true;
++        for (const char * c = term; *c != '\0'; ++c) {
++            if (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') {
++                at_word_start = true;
++                continue;
++            }
++            if (at_word_start) {
++                target += k_marker;
++                at_word_start = false;
++            }
++            target += *c;
++        }
++        if (!target.empty()) {
++            out.targets.push_back(std::move(target));
++        }
++    }
++    if (out.targets.empty()) {
++        return false;
++    }
++    const transcribe::Tokenizer & tok = pm->tok;
++    const int                     n   = tok.n_tokens();
++    out.pieces.assign(static_cast<size_t>(std::max(n, 0)), nullptr);
++    for (int id = 0; id < n; ++id) {
++        if (!is_strippable_special(tok, id)) {
++            out.pieces[static_cast<size_t>(id)] = &tok.token(id);
++        }
++    }
++    if (const char * v = transcribe::env::str("TRANSCRIBE_PARAKEET_BIAS_BONUS")) {
++        out.bonus = static_cast<float>(std::atof(v));
++    }
++    if (const char * v = transcribe::env::str("TRANSCRIBE_PARAKEET_BIAS_TOPK")) {
++        out.top_k = std::max(1, std::atoi(v));
++    }
++    if (const char * v = transcribe::env::str("TRANSCRIBE_PARAKEET_BIAS_GAP")) {
++        out.max_gap_frames = std::max(0, std::atoi(v));
++    }
++    out.trace = transcribe::env::flag("TRANSCRIBE_PARAKEET_BIAS_TRACE");
++    return true;
++}
++
+ // Host-side TDT/RNNT/CTC decode + public result-hierarchy build for one
+ // utterance's encoder output. `enc` is the row-major [T_enc, d_enc]
+ // activation for ONE utterance; utt_index >= 0 tags the per-utterance
+@@ -826,9 +887,13 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
+     {
+         transcribe_status st = TRANSCRIBE_OK;
+         switch (pm->host_decoder.head_kind) {
+-            case HostHeadKind::TDT:
+-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
++            case HostHeadKind::TDT: {
++                PhraseBias bias;
++                const bool biased = build_phrase_bias(pm, params, bias);
++                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens,
++                                       biased ? &bias : nullptr);
+                 break;
++            }
+             case HostHeadKind::RNNT:
+                 st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                 break;
+-- 
+2.49.0.windows.1
+

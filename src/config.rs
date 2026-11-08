@@ -79,6 +79,16 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub parakeet_recheck: bool,
 
+    /// Names and terms Parakeet should spell exactly, e.g.
+    /// `["Jonathan", "Qwen = Quan, Quen", "Hemingway = Hemengwe, Megway"]`.
+    /// After `=` come spoken forms: spellings Parakeet tends to write for the
+    /// term (from your own history). Only words Parakeet was unsure of are
+    /// checked, and a term is written only when a second, term-biased decode of
+    /// the same audio spells it (or a spoken form) over those words, or when
+    /// the words are exactly a listed spoken form. Empty: no change.
+    #[serde(default)]
+    pub parakeet_phrases: Vec<String>,
+
     /// User-facing model tier. Used when `model` is not explicitly set.
     #[serde(default = "default_model_tier")]
     pub model_tier: String,
@@ -180,6 +190,7 @@ impl Default for Config {
             parakeet_model: default_parakeet_model(),
             cpu_threads: 0,
             parakeet_recheck: true,
+            parakeet_phrases: Vec::new(),
             model_tier: default_model_tier(),
             auto_select_model: default_auto_select_model(),
             model: default_model(),
@@ -230,7 +241,7 @@ impl Config {
                     "config_version", "hotkey", "history_hotkey", "language",
                     "add_trailing_space", "capitalize_first", "idle_unload_seconds",
                     "show_notifications", "history_max_entries", "use_gpu",
-                    "engine", "parakeet_model", "cpu_threads", "parakeet_recheck", "model_tier", "auto_select_model", "model", "model_path",
+                    "engine", "parakeet_model", "cpu_threads", "parakeet_recheck", "parakeet_phrases", "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
                     "require_gpu", "audio_retention_count", "legacy_prompt", "quantization",
                     "streaming", "segment_min_seconds", "segment_max_seconds",

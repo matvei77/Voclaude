@@ -11,6 +11,7 @@ mod config;
 mod history;
 mod hotkey;
 mod inference;
+mod profile;
 mod session;
 mod tray;
 mod ui;
@@ -62,8 +63,9 @@ fn main() {
 
     // Inference child process (spawned by the app itself).
     if args.len() > 1 && args[1] == "--worker" {
+        // VOCLAUDE_WORKER_PROFILE=1: DEBUG logs and timing records (src/profile.rs).
         tracing_subscriber::fmt()
-            .with_max_level(Level::INFO)
+            .with_max_level(if profile::enabled() { Level::DEBUG } else { Level::INFO })
             .with_target(false)
             .with_ansi(false)
             .without_time()
