@@ -494,8 +494,12 @@ impl App {
         // E-4: Keep sentinel receiver alive so send() doesn't immediately error
         let mut _sentinel_rx: Option<Receiver<InferenceCommand>> = None;
 
-        // Settings watcher cancellation flag
-        let mut settings_watcher_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // Settings watcher: config.toml is reloaded whenever it changes on disk
+        // (Edit Settings, `voclaude phrases add`, any editor), for the whole run.
+        let settings_watcher_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        if let Some(path) = Config::config_path() {
+            spawn_settings_watcher(path, self.event_tx.clone(), Arc::clone(&settings_watcher_cancel));
+        }
 
         // Main event loop - runs on main thread with Windows message pump
         while self.is_running {
@@ -1250,54 +1254,10 @@ impl App {
                             idle_unload_requested = false;
                             match ensure_config_file() {
                                 Ok(path) => {
+                                    // The always-on settings watcher (started with the
+                                    // event loop) applies the saved changes.
                                     if let Err(err) = open_text_file(&path) {
                                         warn!("Failed to open config file: {}", err);
-                                    } else {
-                                        // Validate config after user potentially edits it.
-                                        // Spawn a background thread to poll for file changes
-                                        // and validate when the modification time updates.
-                                        let event_tx_clone = self.event_tx.clone();
-                                        let config_path = path.clone();
-                                        let original_mtime = std::fs::metadata(&config_path)
-                                            .and_then(|m| m.modified())
-                                            .ok();
-                                        // BUG 16: cancel any previous watcher, then arm a fresh flag
-                                        settings_watcher_cancel.store(true, Ordering::Relaxed);
-                                        settings_watcher_cancel = Arc::new(AtomicBool::new(false));
-                                        let cancel = Arc::clone(&settings_watcher_cancel);
-                                        thread::spawn(move || {
-                                            // Wait up to 5 minutes for the user to save
-                                            let deadline = Instant::now() + Duration::from_secs(300);
-                                            while Instant::now() < deadline {
-                                                // BUG 16: check cancellation at top of each iteration
-                                                if cancel.load(Ordering::Relaxed) {
-                                                    break;
-                                                }
-                                                thread::sleep(Duration::from_secs(2));
-                                                if cancel.load(Ordering::Relaxed) {
-                                                    break;
-                                                }
-                                                let current_mtime = std::fs::metadata(&config_path)
-                                                    .and_then(|m| m.modified())
-                                                    .ok();
-                                                // BUG 46: removed last_check dead code — just check mtime
-                                                if current_mtime != original_mtime {
-                                                    // File was modified — validate
-                                                    match Config::load() {
-                                                        Ok(new_config) => {
-                                                            // E-8/S-7: Send the new config so it's actually applied
-                                                            info!("Config reloaded successfully after edit");
-                                                            let _ = event_tx_clone.send(AppEvent::ConfigReloaded(new_config));
-                                                            break;
-                                                        }
-                                                        Err(err) => {
-                                                            warn!("Config validation failed: {}", err);
-                                                            // Don't break — user might fix and re-save
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
                                     }
                                 }
                                 Err(err) => {
@@ -1385,6 +1345,7 @@ impl App {
                             self.config.parakeet_model = new_config.parakeet_model.clone();
                             self.config.cpu_threads = new_config.cpu_threads;
                             self.config.parakeet_phrases = new_config.parakeet_phrases.clone();
+                            self.config.parakeet_unsure_log = new_config.parakeet_unsure_log;
                             self.config.quantization = new_config.quantization.clone();
                             self.config.adaptive_max_new_tokens = new_config.adaptive_max_new_tokens;
                             self.config.max_chunk_seconds = new_config.max_chunk_seconds;
@@ -1614,6 +1575,38 @@ fn ensure_config_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
         Config::load()?;
     }
     Ok(path)
+}
+
+/// Reload config.toml whenever its modification time changes, for the whole
+/// run: every 3 s, one `metadata` call. A file that fails to load is reported
+/// once per change and the running settings stay as they are.
+fn spawn_settings_watcher(path: PathBuf, event_tx: Sender<AppEvent>, cancel: Arc<AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let mtime = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut seen = mtime(&path);
+    let spawned = thread::Builder::new().name("settings-watcher".into()).spawn(move || loop {
+        thread::sleep(Duration::from_secs(3));
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = mtime(&path);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        match Config::load() {
+            Ok(new_config) => {
+                info!("Config reloaded after a change on disk");
+                if event_tx.send(AppEvent::ConfigReloaded(new_config)).is_err() {
+                    break;
+                }
+            }
+            Err(err) => warn!("Config change not applied (invalid settings): {}", err),
+        }
+    });
+    if let Err(err) = spawned {
+        warn!("Could not start the settings watcher: {}", err);
+    }
 }
 
 fn shorten_error_message(input: &str, max_chars: usize) -> String {

@@ -8,6 +8,7 @@ mod qwen;
 pub mod whisper_engine;
 
 pub use parakeet::ParakeetEngine;
+pub(crate) use parakeet::{letter_similarity, parse_phrases, unsure_log_path, word_core, Phrase};
 pub use qwen::{load_audio_file, QwenEngine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

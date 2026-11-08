@@ -89,6 +89,12 @@ pub struct Config {
     #[serde(default)]
     pub parakeet_phrases: Vec<String>,
 
+    /// With a phrase list, keep the words Parakeet was unsure of (the word, its
+    /// confidence, the term it became) in data/unsure-words.jsonl, at most
+    /// ~1 MB, for `voclaude phrases suggest`. Words only, never sentences.
+    #[serde(default = "default_true")]
+    pub parakeet_unsure_log: bool,
+
     /// User-facing model tier. Used when `model` is not explicitly set.
     #[serde(default = "default_model_tier")]
     pub model_tier: String,
@@ -191,6 +197,7 @@ impl Default for Config {
             cpu_threads: 0,
             parakeet_recheck: true,
             parakeet_phrases: Vec::new(),
+            parakeet_unsure_log: true,
             model_tier: default_model_tier(),
             auto_select_model: default_auto_select_model(),
             model: default_model(),
@@ -241,7 +248,7 @@ impl Config {
                     "config_version", "hotkey", "history_hotkey", "language",
                     "add_trailing_space", "capitalize_first", "idle_unload_seconds",
                     "show_notifications", "history_max_entries", "use_gpu",
-                    "engine", "parakeet_model", "cpu_threads", "parakeet_recheck", "parakeet_phrases", "model_tier", "auto_select_model", "model", "model_path",
+                    "engine", "parakeet_model", "cpu_threads", "parakeet_recheck", "parakeet_phrases", "parakeet_unsure_log", "model_tier", "auto_select_model", "model", "model_path",
                     "max_new_tokens", "adaptive_max_new_tokens", "max_chunk_seconds",
                     "require_gpu", "audio_retention_count", "legacy_prompt", "quantization",
                     "streaming", "segment_min_seconds", "segment_max_seconds",
@@ -340,7 +347,7 @@ impl Config {
     /// Write `contents` to `path` through a temp file and a rename, so a crash
     /// or power cut never leaves a half-written config. The app never
     /// serializes `Config` back to disk: the user's file keeps its comments.
-    fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

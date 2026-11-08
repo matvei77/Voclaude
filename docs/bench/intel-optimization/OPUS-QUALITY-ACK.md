@@ -183,6 +183,22 @@ Select-String "voclaude-profile " profile.log                                   
 python -I make_results.py
 ```
 
+## Merged and installed (2026-11-08)
+
+- **PR #5** (squash `76e4bdb` on master): the evaluated candidate on 0.6.0.
+- **Desktop install:** the PR #5 build first, then the PR 2 build below.
+  - The draft phrase list (13 entries) is in the desktop user's config.
+  - `audio_retention_count = 500` keeps recordings for checks.
+  - The previous exe, DLL and config are backed up in `D:\voclaude-eval\install-backup-2026-11-08`.
+- **PR 2, tooling** (adds a new file `src/phrases.rs` and edits `app.rs`, `config.rs`, `inference/parakeet.rs` and `inference/mod.rs`):
+  - `voclaude phrases list|add|remove|suggest|check`. It edits only the `parakeet_phrases` array, comments kept.
+  - An always-on settings watcher: config.toml reloads within ~3 s of any save.
+  - New setting `parakeet_unsure_log` (default true). With a phrase list, the worker appends the words it was unsure of to
+    `data\unsure-words.jsonl`: word, confidence and the term it became, never sentences, about 1 MB at most.
+  - **For harness runs with phrases, pass `"parakeet_unsure_log": false`**, so nothing is written to the
+    machine user's data folder. Transcription outputs are unchanged: pieces with phrases are byte-identical to
+    the evaluated build.
+
 ## Repository note
 
 `QUALITY-PERF-HANDOFF.md` and `PERF-STATUS.md` are laptop-authored. They stay untracked here, so the laptop

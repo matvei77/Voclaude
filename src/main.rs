@@ -11,6 +11,7 @@ mod config;
 mod history;
 mod hotkey;
 mod inference;
+mod phrases;
 mod profile;
 mod session;
 mod tray;
@@ -83,6 +84,12 @@ fn main() {
     if args.len() > 1 && args[1] == "transcribe" {
         attach_console_for_cli();
         std::process::exit(api::cli_transcribe(&args[2..]));
+    }
+
+    // `voclaude phrases ...`: manage and check the parakeet_phrases list
+    if args.len() > 1 && args[1] == "phrases" {
+        attach_console_for_cli();
+        std::process::exit(phrases::cli(&args[2..]));
     }
 
     if args.iter().any(|a| a == "--list-models") {
