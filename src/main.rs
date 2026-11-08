@@ -140,11 +140,16 @@ fn main() {
 
     // Normal mode. One tray app per profile: a second launch (Start menu,
     // desktop icon) opens the running app's window instead.
-    let _instance = match instance::acquire() {
-        Some(instance) => instance,
-        None => {
-            instance::signal_open();
-            return;
+    // `--validate` only checks and exits, so it runs beside the tray app.
+    let _instance = if validate_mode {
+        None
+    } else {
+        match instance::acquire() {
+            Some(instance) => Some(instance),
+            None => {
+                instance::signal_open();
+                return;
+            }
         }
     };
 
