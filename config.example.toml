@@ -4,7 +4,7 @@
 # Hotkey to toggle recording
 hotkey = "F4"
 
-# Hotkey to toggle history window
+# Hotkey to open the Voclaude window
 history_hotkey = "Ctrl+Shift+H"
 
 # Language hint (comment out for auto-detect)
@@ -14,11 +14,11 @@ history_hotkey = "Ctrl+Shift+H"
 add_trailing_space = true
 capitalize_first = true
 
-# Unload model after N seconds idle (saves VRAM).
-# Model also unloads immediately after each transcription.
+# Unload the model after N seconds idle (frees GPU and RAM; the next
+# dictation loads it again in 1 to 2 s).
 idle_unload_seconds = 60
 
-# Show OS notifications
+# OS notifications (macOS and Linux only; on Windows Voclaude shows none)
 show_notifications = true
 
 # Maximum history entries
@@ -59,10 +59,10 @@ parakeet_recheck = true
 # The biased decode needs the patched transcribe.dll (vocabulary support for
 # Parakeet); with the official DLL only exact spoken forms apply. Empty: off.
 # parakeet_phrases = ["Hemingway = Hemengwe, Hemengway, Megway", "Qwen = Quan, Quen", "Codex = codecs"]
-# Manage the list from a terminal: `voclaude phrases add Qwen Quan`, `voclaude
-# phrases suggest` (spellings to add, from your history and the unsure-word
-# log), `voclaude phrases check` (what the list changes on your recent
-# recordings). Saved changes apply within a few seconds, without a restart.
+# Manage the list in the Voclaude window (Names tab; or click a misspelled
+# word on the Dictations tab), or from a terminal: `voclaude phrases add Qwen
+# Quan`, `voclaude phrases suggest`, `voclaude phrases check`. Saved changes
+# apply within a few seconds, without a restart.
 parakeet_phrases = []
 
 # With a phrase list, keep the words Parakeet was unsure of (word, confidence,

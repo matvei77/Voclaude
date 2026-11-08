@@ -1,8 +1,14 @@
-# Roadmap and assessment (2026-10-29)
+# Roadmap and assessment (2026-10-29, updated 2026-11-08)
 
 This document records where Voclaude stands after the Parakeet Ultra switch and
 which improvements are worth the effort. Every claim with a number points to a
 measurement in `docs/bench/` or to the live app's logs. Estimates are marked.
+
+**Done since 2026-10-29:** names spelled right (`parakeet_phrases`, PR #5 and
+#6); the Voclaude window with Dictations, Names, Model, Settings, API and Log
+tabs, run as its own process (item 3 below); a one-click installer (v0.7.0).
+**Next:** tray-process memory and paged history,
+[issue #7](https://github.com/matvei77/Voclaude/issues/7).
 
 ## Where the app stands
 
@@ -24,8 +30,9 @@ and could not tell in 54. Mixed Russian and English inside one recording is
 the feature that no cloud model handles reliably, and that is what the
 segmenter plus `parakeet_recheck` are built for.
 
-**The tray is the only Windows feedback surface.** Notifications are debug
-logs on Windows. The History window shows status, but only when open.
+**Feedback without pop-ups.** Voclaude shows no notifications on Windows, by
+choice. The tray icon shows the state; the window's status strip shows what is
+happening and every error, including a `config.toml` that could not be applied.
 
 ## Improvements, in the order they pay off
 
@@ -66,16 +73,13 @@ the previous clipboard content. One config switch (`paste_on_finish`) and one
 tray check item. Risk: terminals and some editors map Ctrl+V differently; keep
 the switch off by default for the first release.
 
-### 3. Settings window
+### 3. Settings window (done 2026-11-08)
 
-The 2026-09 priority list asked for a small control panel. The History window
-already runs as a deferred egui viewport, so a second viewport with the same
-pattern is the cheapest route. Fields: record hotkey, history hotkey, engine,
-GPU or CPU, Parakeet quantization (Q4_K_M, Q6_K, Q8_0), `parakeet_recheck`,
-capitalization and trailing space, streaming, API enabled and port, idle
-unload, start with Windows (the `Run` registry key the installer writes).
-Save writes `config.toml` and sends `ConfigReloaded`, which the app already
-applies without a restart for most fields.
+Done as the Voclaude window (`src/console/`), a separate process so the tray
+process stays small. The Model tab shows only the selected engine's settings;
+Settings has Start with Windows, hotkeys (applied without a restart),
+formatting, live transcription and storage. Changes go to `config.toml`
+through `config_edit`, so the file, the CLI and the window agree.
 
 ### 4. API for other programs
 
@@ -85,7 +89,7 @@ and other desktop tools:
 - `GET /v1/live` as server-sent events: every transcribed segment of the
   current dictation as it finishes, plus the final text. This is the "hook my
   own tool into dictation" case.
-- `GET /v1/history?limit=N`: the entries the History window shows.
+- `GET /v1/history?limit=N`: the entries Dictations shows.
 - Optional LAN binding (`api_bind = "0.0.0.0"`) with `api_token` required when
   the bind address is not loopback, so a laptop can use the desktop's GPU.
 
